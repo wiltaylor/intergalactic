@@ -38,6 +38,10 @@ struct RunOpts {
     /// How to make peer names resolvable on this machine.
     #[arg(long, value_enum, default_value_t = DnsMode::Auto)]
     dns: DnsMode,
+    /// Offer to forward traffic for devices registered on this host's LANs.
+    /// The lighthouse picks one gateway per device and fails over when it leaves.
+    #[arg(long)]
+    gateway: bool,
     /// Internal: started by the Windows Service Control Manager.
     #[arg(long, hide = true)]
     service: bool,
@@ -126,6 +130,9 @@ fn main() -> anyhow::Result<()> {
                         if opts.relay_only {
                             launch.push("--relay-only".into());
                         }
+                        if opts.gateway {
+                            launch.push("--gateway".into());
+                        }
                         if let Some(h) = &opts.hostname {
                             launch.push("--hostname".into());
                             launch.push(h.clone());
@@ -209,6 +216,7 @@ async fn run(
             memberships: state.memberships.clone(),
             persistent_keepalive: Some(25),
             relay_only: opts.relay_only,
+            gateway: opts.gateway,
         },
         Arc::new(NoProtector),
     )
@@ -220,6 +228,8 @@ async fn run(
     // Interfaces we created, by network. Reconciled on every membership change.
     let mut tuns: HashMap<NetworkId, (Membership, String)> = HashMap::new();
     reconcile(&engine, &mut tuns, engine.memberships(), dns_mode);
+    let mut gateway_prefixes = (Vec::new(), Vec::new());
+    reconcile_gateway(&engine, opts.gateway, &mut gateway_prefixes);
     dns_os::apply_hosts(dns_mode, &engine.status());
 
     let ipc_engine = engine.clone();
@@ -247,6 +257,7 @@ async fn run(
                         }
                         reconcile(&engine, &mut tuns, list, dns_mode);
                         dns_os::apply_hosts(dns_mode, &engine.status());
+                        reconcile_gateway(&engine, opts.gateway, &mut gateway_prefixes);
                     }
                     EngineEvent::PeersChanged => {
                         dns_os::apply_hosts(dns_mode, &engine.status());
@@ -264,10 +275,57 @@ async fn run(
     engine.shutdown().await;
     tracing::debug!("shutdown: resolver cleanup");
     dns_os::cleanup(dns_mode);
+    if opts.gateway {
+        ig_node::gateway_os::remove();
+    }
     tracing::debug!("shutdown: firewall cleanup");
     ig_node::firewall::remove_all();
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Enable or disable kernel forwarding for the networks in which this node is
+/// the active gateway of at least one device.
+fn reconcile_gateway(
+    engine: &Engine,
+    enabled: bool,
+    current: &mut (
+        Vec<ipnet::Ipv4Net>,
+        Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
+    ),
+) {
+    if !enabled {
+        return;
+    }
+    let me = engine.node_id();
+    let memberships = engine.memberships();
+    let mut prefixes: Vec<ipnet::Ipv4Net> = memberships
+        .iter()
+        .filter(|m| !m.network.my_devices(&me).is_empty())
+        .map(|m| m.network.cidr)
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+    let mut devices: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> = memberships
+        .iter()
+        .flat_map(|m| {
+            m.network
+                .my_devices(&me)
+                .into_iter()
+                .map(|d| (d.address, d.target))
+        })
+        .collect();
+    devices.sort();
+    let wanted = (prefixes, devices);
+    if wanted != *current {
+        for m in &memberships {
+            for d in m.network.my_devices(&me) {
+                tracing::info!(network = %m.network.name, device = %d.name, target = %d.target, "acting as gateway");
+            }
+        }
+        ig_node::gateway_os::apply(&wanted.0, &wanted.1);
+        *current = wanted;
+    }
 }
 
 /// Create TUNs for new memberships, drop TUNs for memberships that went away,

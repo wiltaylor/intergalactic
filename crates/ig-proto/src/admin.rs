@@ -42,6 +42,21 @@ pub enum AdminRequest {
     NodeList {
         network: Option<String>,
     },
+    /// Register a device reachable through gateway nodes. `gateways` orders the
+    /// preferred nodes; empty means any gateway-capable node on the device's LAN.
+    DeviceAdd {
+        network: String,
+        name: String,
+        target: Ipv4Addr,
+        gateways: Vec<NodeId>,
+    },
+    DeviceList {
+        network: String,
+    },
+    DeviceRemove {
+        network: String,
+        name: String,
+    },
     NodeRemove {
         network: String,
         node: NodeId,
@@ -57,6 +72,23 @@ pub enum AdminResponse {
     Invite { invite: String, invite_id: String },
     Invites(Vec<InviteSummary>),
     Nodes(Vec<NodeSummary>),
+    Devices(Vec<DeviceSummary>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceSummary {
+    pub network: NetworkId,
+    pub network_name: String,
+    pub name: String,
+    pub dns_name: String,
+    pub address: Ipv4Addr,
+    pub target: Ipv4Addr,
+    /// Preferred gateways in order; empty = automatic.
+    pub gateways: Vec<NodeId>,
+    /// Currently active gateway and its hostname.
+    pub active: Option<(NodeId, String)>,
+    /// Online gateway-capable nodes that could serve this device right now.
+    pub candidates: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

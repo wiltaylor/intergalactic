@@ -2,14 +2,16 @@
 
 use crate::store::{now_secs, InviteRecord, Store, StoreError};
 use ig_proto::admin::{
-    AdminRequest, AdminResponse, InviteSummary, LighthouseInfo, NetworkSummary, NodeSummary,
+    AdminRequest, AdminResponse, DeviceSummary, InviteSummary, LighthouseInfo, NetworkSummary,
+    NodeSummary,
 };
 use ig_proto::control::{
-    ClientHello, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
+    ClientHello, DeviceInfo, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
 };
 use ig_proto::noise::NoiseStream;
 use ig_proto::udp::{bind_dual_stack, canonical, reachable, to_wire};
 use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, RelayLimit, PROTOCOL_VERSION};
+use ipnet::Ipv4Net;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -25,6 +27,10 @@ const UDP_ADDR_TTL: Duration = Duration::from_secs(90);
 /// Coalescing window for state broadcasts.
 const BROADCAST_DEBOUNCE: Duration = Duration::from_millis(150);
 const MAX_RELAY_PAYLOAD: usize = 2048;
+/// A control session that stays silent this long is considered dead. Nodes ping
+/// every 15 s, so this catches a laptop that vanished without closing TCP and
+/// lets gateway failover happen within a minute.
+const SESSION_IDLE: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Debug)]
 pub struct LighthouseConfig {
@@ -48,6 +54,10 @@ struct Session {
     token: [u8; 32],
     tx: mpsc::Sender<FromLighthouse>,
     local_endpoints: RwLock<Vec<SocketAddr>>,
+    /// LAN prefixes the node reported; empty unless it offered to be a gateway.
+    subnets: RwLock<Vec<Ipv4Net>>,
+    gateway: bool,
+    last_seen: Mutex<Instant>,
     abort: tokio::sync::Notify,
 }
 
@@ -61,6 +71,9 @@ struct Inner {
     udp_nodes: RwLock<HashMap<SocketAddr, NodeId>>,
     udp: UdpSocket,
     dual_stack: bool,
+    /// Active gateway per (network, device name). Kept so a device does not
+    /// hop between equally good gateways on every state push.
+    active_gateways: Mutex<HashMap<(NetworkId, String), NodeId>>,
     /// Relay token buckets: per (network, node) and per network.
     buckets: Mutex<Buckets>,
     dirty: Mutex<HashSet<NetworkId>>,
@@ -92,6 +105,7 @@ impl Lighthouse {
             udp_nodes: RwLock::new(HashMap::new()),
             udp,
             dual_stack,
+            active_gateways: Mutex::new(HashMap::new()),
             buckets: Mutex::new(Buckets::default()),
             dirty: Mutex::new(HashSet::new()),
             dirty_notify: tokio::sync::Notify::new(),
@@ -102,7 +116,8 @@ impl Lighthouse {
         let t2 = tokio::spawn(udp_loop(inner.clone()));
         let t3 = tokio::spawn(broadcast_loop(inner.clone()));
         let t4 = tokio::spawn(housekeeping(inner.clone()));
-        inner.tasks.lock().extend([t1, t2, t3, t4]);
+        let t5 = tokio::spawn(reap_idle_sessions(inner.clone()));
+        inner.tasks.lock().extend([t1, t2, t3, t4, t5]);
         tracing::info!(addr = %tcp_addr, dual_stack, key = %inner.config.keypair.public, dns_domain = %inner.config.dns_domain, "lighthouse listening");
         Ok(Lighthouse { inner, tcp_addr })
     }
@@ -228,6 +243,81 @@ impl Inner {
         let _ = self.udp.try_send_to(data, to_wire(to, self.dual_stack));
     }
 
+    /// Who should gateway each device right now. Prefers the current gateway
+    /// while it still qualifies; otherwise the first qualifying candidate.
+    fn resolve_devices(&self, net: &crate::store::Network) -> Vec<DeviceInfo> {
+        let sessions = self.sessions.read();
+        let mut active = self.active_gateways.lock();
+        let mut out = Vec::new();
+        for d in net.devices.values() {
+            let candidates = self.gateway_candidates(net, d, &sessions);
+            let key = (net.id, d.name.clone());
+            let chosen = match active.get(&key) {
+                Some(cur) if candidates.contains(cur) => Some(*cur),
+                _ => candidates.first().copied(),
+            };
+            match chosen {
+                Some(n) => {
+                    if active.insert(key, n) != Some(n) {
+                        tracing::info!(network = %net.name, device = %d.name, gateway = %n.short(), "gateway selected");
+                    }
+                }
+                None => {
+                    if active.remove(&key).is_some() {
+                        tracing::warn!(network = %net.name, device = %d.name, "no gateway available");
+                    }
+                }
+            }
+            out.push(DeviceInfo {
+                name: d.name.clone(),
+                dns_name: d.dns_name.clone(),
+                address: d.address,
+                target: d.target,
+                gateway: chosen,
+            });
+        }
+        out
+    }
+
+    /// Online, gateway-capable members that can reach the device, in preference order.
+    fn gateway_candidates(
+        &self,
+        net: &crate::store::Network,
+        d: &crate::store::Device,
+        sessions: &HashMap<NodeId, Arc<Session>>,
+    ) -> Vec<NodeId> {
+        let qualifies = |id: &NodeId, need_subnet: bool| -> bool {
+            if !net.members.contains_key(id) {
+                return false;
+            }
+            let Some(s) = sessions.get(id) else {
+                return false;
+            };
+            if !s.gateway {
+                return false;
+            }
+            !need_subnet || s.subnets.read().iter().any(|n| n.contains(&d.target))
+        };
+        if !d.gateways.is_empty() {
+            // Explicit list: the admin vouches that these nodes can reach the
+            // device, so only membership, presence and capability are checked.
+            return d
+                .gateways
+                .iter()
+                .filter(|id| qualifies(id, false))
+                .copied()
+                .collect();
+        }
+        let mut v: Vec<NodeId> = net
+            .members
+            .keys()
+            .filter(|id| qualifies(id, true))
+            .copied()
+            .collect();
+        v.sort();
+        v
+    }
+
     fn network_info(&self, net: &crate::store::Network, m: &crate::store::Member) -> NetworkInfo {
         NetworkInfo {
             id: net.id,
@@ -240,6 +330,7 @@ impl Inner {
             dns_domain: self.config.dns_domain.clone(),
             dns_name: m.dns_name.clone(),
             relay_limit: self.effective_limit(net),
+            devices: self.resolve_devices(net),
         }
     }
 
@@ -338,6 +429,7 @@ impl Inner {
 
     fn handle_control(&self, session: &Arc<Session>, msg: ToLighthouse) {
         let node = session.node;
+        *session.last_seen.lock() = Instant::now();
         match msg {
             ToLighthouse::Join { network, token } => {
                 let result = {
@@ -386,12 +478,15 @@ impl Inner {
                     }
                 }
             }
-            ToLighthouse::Endpoints { local } => {
+            ToLighthouse::Endpoints { local, subnets } => {
                 let mut local: Vec<SocketAddr> = local.into_iter().take(10).collect();
                 local.dedup();
-                let changed = *session.local_endpoints.read() != local;
+                let subnets: Vec<Ipv4Net> = subnets.into_iter().take(16).collect();
+                let changed =
+                    *session.local_endpoints.read() != local || *session.subnets.read() != subnets;
                 if changed {
                     *session.local_endpoints.write() = local;
+                    *session.subnets.write() = subnets;
                     self.mark_dirty_for_node(&node);
                 }
             }
@@ -682,6 +777,45 @@ impl Inner {
                 }
                 Ok(AdminResponse::Nodes(out))
             }
+            AdminRequest::DeviceAdd {
+                network,
+                name,
+                target,
+                gateways,
+            } => {
+                let mut store = self.store.lock();
+                let id = store.resolve(&network)?;
+                let label = ig_proto::control::dns_label(&name);
+                if label != name.to_ascii_lowercase() || name.is_empty() {
+                    anyhow::bail!("device names use letters, digits and dashes only");
+                }
+                let dev = store.add_device(id, &name, target, gateways)?;
+                self.persist(&store);
+                let summary = self.device_summary(&store, id, &dev);
+                drop(store);
+                self.mark_dirty([id]);
+                Ok(AdminResponse::Devices(vec![summary]))
+            }
+            AdminRequest::DeviceList { network } => {
+                let store = self.store.lock();
+                let id = store.resolve(&network)?;
+                let list = store.networks[&id]
+                    .devices
+                    .values()
+                    .map(|d| self.device_summary(&store, id, d))
+                    .collect();
+                Ok(AdminResponse::Devices(list))
+            }
+            AdminRequest::DeviceRemove { network, name } => {
+                let mut store = self.store.lock();
+                let id = store.resolve(&network)?;
+                store.remove_device(id, &name)?;
+                self.persist(&store);
+                drop(store);
+                self.active_gateways.lock().remove(&(id, name));
+                self.mark_dirty([id]);
+                Ok(AdminResponse::Ok)
+            }
             AdminRequest::NodeRemove { network, node } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
@@ -698,6 +832,43 @@ impl Inner {
                 self.mark_dirty([id]);
                 Ok(AdminResponse::Ok)
             }
+        }
+    }
+
+    fn device_summary(
+        &self,
+        store: &Store,
+        id: NetworkId,
+        d: &crate::store::Device,
+    ) -> DeviceSummary {
+        let net = &store.networks[&id];
+        let active = self
+            .resolve_devices(net)
+            .into_iter()
+            .find(|x| x.name == d.name)
+            .and_then(|x| x.gateway);
+        let sessions = self.sessions.read();
+        let candidates = self.gateway_candidates(net, d, &sessions);
+        let hostname = |n: &NodeId| {
+            store
+                .nodes
+                .get(n)
+                .map(|r| r.hostname.clone())
+                .unwrap_or_default()
+        };
+        DeviceSummary {
+            network: id,
+            network_name: net.name.clone(),
+            name: d.name.clone(),
+            dns_name: d.dns_name.clone(),
+            address: d.address,
+            target: d.target,
+            gateways: d.gateways.clone(),
+            active: active.map(|n| (n, hostname(&n))),
+            candidates: candidates
+                .iter()
+                .map(|n| format!("{} ({})", hostname(n), n.short()))
+                .collect(),
         }
     }
 
@@ -769,6 +940,9 @@ async fn handle_connection(
         token,
         tx,
         local_endpoints: RwLock::new(Vec::new()),
+        subnets: RwLock::new(Vec::new()),
+        gateway: hello.gateway,
+        last_seen: Mutex::new(Instant::now()),
         abort: tokio::sync::Notify::new(),
     });
     {
@@ -784,7 +958,7 @@ async fn handle_connection(
         old.abort.notify_one();
     }
     inner.mark_dirty_for_node(&node);
-    tracing::info!(node = %node.short(), hostname = %hello.hostname, os = %hello.os, %from, "node connected");
+    tracing::info!(node = %node.short(), hostname = %hello.hostname, os = %hello.os, gateway = hello.gateway, %from, "node connected");
 
     let (mut noise_tx, mut noise_rx) = noise.into_parts();
     let writer = tokio::spawn(async move {
@@ -850,6 +1024,25 @@ async fn broadcast_loop(inner: Arc<Inner>) {
         let nets: Vec<NetworkId> = inner.dirty.lock().drain().collect();
         for n in nets {
             inner.broadcast(n);
+        }
+    }
+}
+
+/// Drop control sessions that went silent so their networks learn quickly.
+async fn reap_idle_sessions(inner: Arc<Inner>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tick.tick().await;
+        let idle: Vec<Arc<Session>> = inner
+            .sessions
+            .read()
+            .values()
+            .filter(|s| s.last_seen.lock().elapsed() > SESSION_IDLE)
+            .cloned()
+            .collect();
+        for s in idle {
+            tracing::info!(node = %s.node.short(), "control session idle, dropping");
+            s.abort.notify_one();
         }
     }
 }

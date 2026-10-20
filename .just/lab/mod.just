@@ -34,9 +34,14 @@ flat-linux: require-vmlab
 flat-windows: require-vmlab
 	cd lab/flat && vmlab script scripts/windows.ws
 
-# Run both flat scenarios
+# Run the gateway-device scenario against the flat lab (after flat-windows)
 [group('lab')]
-flat-test: flat-linux flat-windows
+flat-gateway: require-vmlab
+	cd lab/flat && vmlab script scripts/gateway.ws
+
+# Run all flat scenarios
+[group('lab')]
+flat-test: flat-linux flat-windows flat-gateway
 
 # Stop the flat lab, keeping the clones
 [group('lab')]

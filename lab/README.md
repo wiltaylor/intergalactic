@@ -37,6 +37,13 @@ the path becomes `direct`; forward and reverse DNS through the resolver; HTTP ov
 and IPv6 by name; the `game` policy (icmp only) lets ping through and blocks TCP; a `dev`
 address is unreachable through the `game` interface; leaving a network removes the peer.
 
+`gateway.ws` (run after the two above) checks gateway devices: alpha and bravo restart with
+`--gateway`; the lighthouse VM itself (not a member) is registered as device `lhbox`; the
+active gateway installs `ip_forward` and the `ig_gateway` nftables table; the Windows node
+fetches a file from the device by name through the gateway; alpha's link goes down and within
+the 45 s idle timeout the device moves to bravo while Windows keeps working; bravo reaches its
+own device through the kernel DNAT; alpha returns and the active gateway stays with bravo.
+
 `windows.ws` checks: `ig-node service install` registers and starts the service as
 LocalSystem; the Wintun adapter carries both addresses; ping to a Linux peer over IPv4
 and IPv6; NRPT rules exist and `Resolve-DnsName` answers; the Linux peer reaches Windows
@@ -87,7 +94,7 @@ its name; the lighthouse lists both members.
 
 ## Results on 2026-10-20
 
-All four scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
+All five scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
 Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by these labs:
 
 - The Windows service did not exit on stop: the tokio runtime waited forever during

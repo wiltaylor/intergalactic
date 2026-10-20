@@ -155,6 +155,7 @@ impl MobileEngine {
             // Mobile radios: let sessions idle instead of waking every 25 s.
             persistent_keepalive: None,
             relay_only: false,
+            gateway: false,
         };
         let protector = Arc::new(Protector(callbacks.clone()));
         let (engine, mut events) = rt.block_on(Engine::start(config, protector)).map_err(err)?;

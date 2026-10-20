@@ -91,6 +91,7 @@ async fn node_with_key(
             memberships,
             persistent_keepalive: Some(25),
             relay_only,
+            gateway: false,
         },
         Arc::new(NoProtector),
     )
@@ -653,5 +654,137 @@ async fn restart_resumes_memberships_and_admin_can_kick() {
     }
     a2.engine.shutdown().await;
     b.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_translates_device_traffic_and_fails_over() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "office", "10.99.0.0/24", None);
+    let inv = invite(&lh, "office", 5);
+
+    // alpha and bravo offer to be gateways; charlie is a plain member.
+    let mk = |name: &'static str, gateway: bool| async move {
+        let (engine, events) = Engine::start(
+            EngineConfig {
+                keypair: Keypair::generate(),
+                hostname: name.into(),
+                os: "test".into(),
+                udp_port: 0,
+                memberships: vec![],
+                persistent_keepalive: Some(25),
+                relay_only: false,
+                gateway,
+            },
+            Arc::new(NoProtector),
+        )
+        .await
+        .unwrap();
+        Node {
+            engine,
+            events,
+            keypair: Keypair::generate(),
+        }
+    };
+    let alpha = mk("alpha", true).await;
+    let bravo = mk("bravo", true).await;
+    let charlie = mk("charlie", false).await;
+    let (ia, mut os_a) = join_with_tun(&alpha, &inv).await;
+    let (ib, mut os_b) = join_with_tun(&bravo, &inv).await;
+    let (ic, mut os_c) = join_with_tun(&charlie, &inv).await;
+    wait_for("peers visible", || charlie.engine.status().peers.len() == 2).await;
+
+    // Register a printer on a LAN this host is on (the test process reports its
+    // real interfaces), preferring alpha then bravo explicitly.
+    let target: std::net::Ipv4Addr = "192.0.2.50".parse().unwrap();
+    let r = lh.admin(AdminRequest::DeviceAdd {
+        network: "office".into(),
+        name: "printer".into(),
+        target,
+        gateways: vec![alpha.engine.node_id(), bravo.engine.node_id()],
+    });
+    let dev_addr = match r {
+        AdminResponse::Devices(list) => list[0].address,
+        other => panic!("{other:?}"),
+    };
+    wait_for("device pushed with alpha as gateway", || {
+        charlie.engine.status().networks[0]
+            .info
+            .devices
+            .first()
+            .is_some_and(|d| d.gateway == Some(alpha.engine.node_id()))
+    })
+    .await;
+
+    // charlie -> printer: arrives at alpha's TUN with the physical destination.
+    let q = build_udp(v4(&ic), 4000, IpAddr::V4(dev_addr), 9100, b"print this");
+    let got = deliver(&os_c, &mut os_a, q).await;
+    let f = ig_core::packet::parse_flow(&got).unwrap();
+    assert_eq!((f.src, f.dst, f.dport), (v4(&ic), IpAddr::V4(target), 9100));
+    // The printer's reply comes back from alpha's kernel with the physical
+    // source; charlie sees the overlay address.
+    let reply = build_udp(IpAddr::V4(target), 9100, v4(&ic), 4000, b"ok");
+    let got = deliver(&os_a, &mut os_c, reply).await;
+    let f = ig_core::packet::parse_flow(&got).unwrap();
+    assert_eq!(
+        (f.src, f.dst, f.sport),
+        (IpAddr::V4(dev_addr), v4(&ic), 9100)
+    );
+
+    // bravo (also a gateway, but not active) reaches the printer through alpha.
+    let q = build_udp(v4(&ib), 4001, IpAddr::V4(dev_addr), 9100, b"from bravo");
+    let got = deliver(&os_b, &mut os_a, q).await;
+    assert_eq!(ig_core::packet::dst(&got), Some(IpAddr::V4(target)));
+
+    // DNS: the device has a name.
+    let dns4 = IpAddr::V4(ic.dns_server_v4());
+    os_c.to_tun
+        .send(build_udp(
+            v4(&ic),
+            5300,
+            dns4,
+            53,
+            &dns_query("printer.office.ig.test", 1),
+        ))
+        .await
+        .unwrap();
+    let ans = recv_packet(&mut os_c, Duration::from_secs(2))
+        .await
+        .expect("dns reply");
+    assert_eq!(&ans[ans.len() - 4..], &dev_addr.octets());
+
+    // alpha goes away: bravo takes over.
+    alpha.engine.shutdown().await;
+    wait_for("failover to bravo", || {
+        charlie.engine.status().networks[0]
+            .info
+            .devices
+            .first()
+            .is_some_and(|d| d.gateway == Some(bravo.engine.node_id()))
+    })
+    .await;
+    let q = build_udp(v4(&ic), 4002, IpAddr::V4(dev_addr), 9100, b"after failover");
+    let got = deliver(&os_c, &mut os_b, q).await;
+    assert_eq!(ig_core::packet::dst(&got), Some(IpAddr::V4(target)));
+    // bravo talks to its own device: hairpin through its TUN with the physical address.
+    os_b.to_tun
+        .send(build_udp(
+            v4(&ib),
+            4003,
+            IpAddr::V4(dev_addr),
+            9100,
+            b"local",
+        ))
+        .await
+        .unwrap();
+    let hp = recv_packet(&mut os_b, Duration::from_secs(2))
+        .await
+        .expect("hairpin");
+    assert_eq!(ig_core::packet::dst(&hp), Some(IpAddr::V4(target)));
+
+    let _ = ia;
+    bravo.engine.shutdown().await;
+    charlie.engine.shutdown().await;
     lh.shutdown().await;
 }

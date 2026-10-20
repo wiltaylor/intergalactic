@@ -35,6 +35,33 @@ pub fn local_candidates(
     out
 }
 
+/// IPv4 prefixes of the LANs this host is attached to, excluding overlay
+/// prefixes. Used by the lighthouse to pick gateways for registered devices.
+pub fn local_subnets(exclude4: &[Ipv4Net]) -> Vec<Ipv4Net> {
+    let mut out: Vec<Ipv4Net> = Vec::new();
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for iface in ifaces {
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
+        if !usable_v4(v4.ip) || exclude4.iter().any(|n| n.contains(&v4.ip)) {
+            continue;
+        }
+        let Ok(net) = Ipv4Net::with_netmask(v4.ip, v4.netmask) else {
+            continue;
+        };
+        let net = net.trunc();
+        if net.prefix_len() == 32 || out.contains(&net) {
+            continue;
+        }
+        out.push(net);
+    }
+    out.truncate(16);
+    out
+}
+
 fn usable_v4(ip: Ipv4Addr) -> bool {
     !(ip.is_loopback()
         || ip.is_link_local()

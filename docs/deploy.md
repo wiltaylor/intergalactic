@@ -58,6 +58,33 @@ sudo ig-lighthouse network relay-limit game
 
 Limits apply only to traffic relayed through the lighthouse. Direct paths are never limited.
 
+## Gateway devices
+
+A device that cannot run Intergalactic (a printer, a NAS, a lab box) can still be a member
+of a network through one or more **gateway nodes** on its LAN.
+
+```sh
+# On the nodes that sit on the device's LAN (Linux or Windows):
+sudo ig-node run --gateway            # or: ig-node.exe service install --gateway
+# On the lighthouse:
+sudo ig-lighthouse device add dev printer 192.168.1.50
+sudo ig-lighthouse device add dev nas 192.168.1.60 --via <node-id-a> --via <node-id-b>
+sudo ig-lighthouse device list dev
+```
+
+The device gets an overlay address from the network and a name (`printer.dev.ig.internal`).
+Without `--via`, any online `--gateway` member whose LAN contains the device's address can
+serve it; with `--via`, only the listed nodes, in that order. The lighthouse keeps the current
+gateway while it qualifies and switches when it disconnects, stops reporting that LAN, or is
+removed. A node that vanishes without closing its connection is noticed within 45 seconds.
+
+On the gateway, the engine rewrites the device's overlay address to its physical address and
+the kernel forwards the packet with source NAT onto the LAN. Linux: `ip_forward` plus an
+nftables table `ig_gateway` (masquerade and an output DNAT so the gateway reaches its own
+devices too). Windows: IP forwarding plus a `NetNat` for the overlay prefix; the local
+hairpin is not available there. Network policies apply to device traffic the same way they
+apply to the gateway itself. Android nodes cannot be gateways.
+
 ## Node on Linux
 
 ```sh

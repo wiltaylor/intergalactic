@@ -41,7 +41,24 @@ pub struct Network {
     pub members: BTreeMap<NodeId, Member>,
     #[serde(default)]
     pub invites: Vec<InviteRecord>,
+    /// Devices on physical LANs reachable through gateway members, by name.
+    #[serde(default)]
+    pub devices: BTreeMap<String, Device>,
     pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Device {
+    pub name: String,
+    pub dns_name: String,
+    /// Overlay address, allocated from the network like a member's.
+    pub address: Ipv4Addr,
+    /// Physical address on the gateways' LAN.
+    pub target: Ipv4Addr,
+    /// Preferred gateways in order. Empty: any gateway-capable member whose LAN
+    /// contains `target`.
+    #[serde(default)]
+    pub gateways: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +107,10 @@ pub enum StoreError {
     NoSuchInvite(String),
     #[error("node is not a member")]
     NotMember,
+    #[error("a device named `{0}` already exists in this network")]
+    DuplicateDevice(String),
+    #[error("device not found: {0}")]
+    NoSuchDevice(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("state file is corrupt: {0}")]
@@ -116,8 +137,12 @@ impl Network {
     /// Unique DNS label for a hostname within this network.
     fn unique_label(&self, hostname: &str) -> String {
         let base = dns_label(hostname);
-        let taken: std::collections::HashSet<&str> =
-            self.members.values().map(|m| m.dns_name.as_str()).collect();
+        let taken: std::collections::HashSet<&str> = self
+            .members
+            .values()
+            .map(|m| m.dns_name.as_str())
+            .chain(self.devices.values().map(|d| d.dns_name.as_str()))
+            .collect();
         if !taken.contains(base.as_str()) {
             return base;
         }
@@ -141,6 +166,7 @@ impl Network {
             .members
             .values()
             .map(|m| u32::from(m.address))
+            .chain(self.devices.values().map(|d| u32::from(d.address)))
             .collect();
         (lo..=hi).find(|a| !used.contains(a)).map(Ipv4Addr::from)
     }
@@ -213,6 +239,7 @@ impl Store {
             cidr6: cidr6.map(|c| c.trunc()),
             policy: Policy::allow_all(),
             relay_limit: RelayLimit::unlimited(),
+            devices: BTreeMap::new(),
             members: BTreeMap::new(),
             invites: Vec::new(),
             created_at: now_secs(),
@@ -283,6 +310,44 @@ impl Store {
             changed.push(net.id);
         }
         changed
+    }
+
+    pub fn add_device(
+        &mut self,
+        network: NetworkId,
+        name: &str,
+        target: Ipv4Addr,
+        gateways: Vec<NodeId>,
+    ) -> Result<Device, StoreError> {
+        let net = self
+            .networks
+            .get_mut(&network)
+            .ok_or_else(|| StoreError::NoSuchNetwork(network.to_string()))?;
+        if net.devices.contains_key(name) {
+            return Err(StoreError::DuplicateDevice(name.to_string()));
+        }
+        let address = net.allocate().ok_or(StoreError::Full)?;
+        let dns_name = net.unique_label(name);
+        let dev = Device {
+            name: name.to_string(),
+            dns_name,
+            address,
+            target,
+            gateways,
+        };
+        net.devices.insert(name.to_string(), dev.clone());
+        Ok(dev)
+    }
+
+    pub fn remove_device(&mut self, network: NetworkId, name: &str) -> Result<(), StoreError> {
+        let net = self
+            .networks
+            .get_mut(&network)
+            .ok_or_else(|| StoreError::NoSuchNetwork(network.to_string()))?;
+        net.devices
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| StoreError::NoSuchDevice(name.to_string()))
     }
 
     pub fn remove_member(&mut self, network: NetworkId, node: &NodeId) -> Result<(), StoreError> {
@@ -414,6 +479,20 @@ mod tests {
         );
         assert!(s.share_network(&b, &c));
         assert!(!s.share_network(&a, &b));
+        // Devices take addresses from the same pool and unique labels.
+        let d = s
+            .add_device(id, "laptop", "192.168.1.9".parse().unwrap(), vec![])
+            .unwrap();
+        assert_eq!(d.address, "10.90.0.4".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            d.dns_name, "laptop",
+            "alpha left, so the base label is free again"
+        );
+        assert!(matches!(
+            s.add_device(id, "laptop", "192.168.1.9".parse().unwrap(), vec![]),
+            Err(StoreError::DuplicateDevice(_))
+        ));
+        s.remove_device(id, "laptop").unwrap();
     }
 
     #[test]

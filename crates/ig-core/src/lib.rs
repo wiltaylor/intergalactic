@@ -16,6 +16,7 @@ pub mod dns;
 pub mod endpoints;
 pub mod engine;
 pub mod filter;
+pub mod nat;
 pub mod packet;
 pub mod peer;
 pub mod state;

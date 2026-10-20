@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             let st = status(&cli.socket).await?;
             print_header(&st);
             print_networks(&st);
+            print_devices(&st);
             println!();
             print_peers(&st);
             Ok(())
@@ -164,6 +165,50 @@ fn print_networks(st: &StatusReport) {
                 " (disconnected)"
             }
         );
+    }
+}
+
+fn print_devices(st: &StatusReport) {
+    let me = st.node;
+    let mut any = false;
+    for n in &st.networks {
+        for d in &n.info.devices {
+            if !any {
+                println!();
+                println!(
+                    "{:<12} {:<16} {:<16} {:<16} {:<30} GATEWAY",
+                    "NETWORK", "DEVICE", "ADDRESS", "TARGET", "DNS NAME"
+                );
+                any = true;
+            }
+            let gw = match d.gateway {
+                Some(g) if Some(g) == me => "this node".to_string(),
+                Some(g) => st
+                    .peers
+                    .iter()
+                    .find(|p| p.node == g)
+                    .map(|p| p.hostname.clone())
+                    .unwrap_or_else(|| g.short()),
+                None => "none (unreachable)".into(),
+            };
+            println!(
+                "{:<12} {:<16} {:<16} {:<16} {:<30} {}",
+                truncate(&n.info.name, 12),
+                truncate(&d.name, 16),
+                d.address.to_string(),
+                d.target.to_string(),
+                truncate(
+                    &format!(
+                        "{}.{}.{}",
+                        d.dns_name,
+                        ig_proto::control::dns_label(&n.info.name),
+                        n.info.dns_domain
+                    ),
+                    30
+                ),
+                gw
+            );
+        }
     }
 }
 

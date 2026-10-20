@@ -179,6 +179,7 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         version: PROTOCOL_VERSION,
         hostname: inner.hostname.clone(),
         os: inner.os.clone(),
+        gateway: inner.gateway,
     };
     let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -367,6 +368,7 @@ async fn send_endpoints(
     if force || current != *last {
         tx.send(&ToLighthouse::Endpoints {
             local: current.clone(),
+            subnets: inner.local_subnets(),
         })
         .await?;
         *last = current;

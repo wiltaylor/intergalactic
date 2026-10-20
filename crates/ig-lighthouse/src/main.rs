@@ -76,6 +76,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+    /// Manage devices reached through gateway nodes.
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Register a device: `device add dev printer 192.168.1.50`. Members reach it at an
+    /// overlay address through a node started with `--gateway` on the same LAN.
+    Add {
+        network: String,
+        name: String,
+        target: std::net::Ipv4Addr,
+        /// Preferred gateway nodes in order (node ids). Default: any capable node on the LAN.
+        #[arg(long = "via")]
+        via: Vec<NodeId>,
+    },
+    List {
+        network: String,
+    },
+    Remove {
+        network: String,
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,6 +338,35 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
             ),
         },
+        Cmd::Device { cmd } => match cmd {
+            DeviceCmd::Add {
+                network,
+                name,
+                target,
+                via,
+            } => {
+                let r = admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::DeviceAdd {
+                        network,
+                        name,
+                        target,
+                        gateways: via,
+                    },
+                )
+                .await?;
+                print_devices(r)
+            }
+            DeviceCmd::List { network } => {
+                let r = admin_socket::request(&admin_sock, &AdminRequest::DeviceList { network })
+                    .await?;
+                print_devices(r)
+            }
+            DeviceCmd::Remove { network, name } => expect_ok(
+                admin_socket::request(&admin_sock, &AdminRequest::DeviceRemove { network, name })
+                    .await?,
+            ),
+        },
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List { network } => {
                 let r =
@@ -425,6 +480,35 @@ fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
                     n.online,
                     n.relay_limit.to_string(),
                     policy
+                );
+            }
+            Ok(())
+        }
+        other => fail(other),
+    }
+}
+
+fn print_devices(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Devices(list) => {
+            println!(
+                "{:<12} {:<16} {:<16} {:<16} {:<24} {:<22} CANDIDATES",
+                "NETWORK", "DEVICE", "ADDRESS", "TARGET", "DNS NAME", "ACTIVE GATEWAY"
+            );
+            for d in list {
+                let active = d
+                    .active
+                    .map(|(n, h)| format!("{} ({})", h, n.short()))
+                    .unwrap_or_else(|| "none".into());
+                println!(
+                    "{:<12} {:<16} {:<16} {:<16} {:<24} {:<22} {}",
+                    truncate(&d.network_name, 12),
+                    truncate(&d.name, 16),
+                    d.address.to_string(),
+                    d.target.to_string(),
+                    truncate(&format!("{}.{}.", d.dns_name, d.network_name), 24),
+                    truncate(&active, 22),
+                    d.candidates.join(", ")
                 );
             }
             Ok(())

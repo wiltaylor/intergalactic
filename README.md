@@ -52,6 +52,7 @@ sudo ig-lighthouse network create dev  10.90.0.0/24 --ipv6 fd42:9a:1::/64
 sudo ig-lighthouse network create game 10.91.0.0/24
 sudo ig-lighthouse network policy game --allow udp:27015-27030 --allow icmp
 sudo ig-lighthouse network relay-limit game --per-node-kbps 2000 --total-kbps 20000
+sudo ig-lighthouse device add dev printer 192.168.1.50      # reachable via any `--gateway` node on 192.168.1.0/24
 sudo ig-lighthouse invite create dev --uses 5 --ttl 7d --label laptops
 ```
 
@@ -90,6 +91,7 @@ See `docs/architecture.md` for the full design. In short:
 - **Windows service**: `ig-node service install` registers the daemon with the Service Control Manager and starts it at boot.
 - **Relay rate limits** per network (per member and total), with a lighthouse-wide default. Direct peer-to-peer traffic is never limited.
 - **Policies** per network: allow lists of inbound flows, stateful, so an untrusted network can be restricted to a game's ports.
+- **Gateway devices**: register a printer, NAS or any machine on a physical LAN and members reach it at an overlay address and name. Nodes started with `--gateway` on that LAN forward and translate for it; the lighthouse picks one and fails over within a minute when it leaves.
 
 ## Verification
 

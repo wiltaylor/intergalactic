@@ -127,6 +127,30 @@ limited by the network the traffic belongs to. Networks without a limit use the 
 default (`serve --relay-limit-*`). Direct peer-to-peer traffic never touches the lighthouse and
 is never limited. Limits are shown to members in `ig status`.
 
+## Gateway devices
+
+A **device** is a record in a network: name, overlay address (from the network's pool),
+physical address, and an optional ordered list of preferred gateways. Nodes started with
+`--gateway` set a flag in their hello and report the IPv4 prefixes of their LANs with their
+endpoints. For each device the lighthouse computes the **active gateway**: the current one if
+it still qualifies, else the first qualifying candidate (online, gateway-capable member; on the
+device's LAN unless the admin listed it explicitly). The result rides in `NetworkInfo.devices`,
+so every member learns the mapping on the same push as everything else.
+
+Members treat a device address as one more address of the active gateway peer: it is routed
+to that peer and accepted as a source from it. The gateway itself, on receiving a packet for a
+device, rewrites the destination to the physical address (`ig_core::nat`, incremental checksum
+update) and writes it to its TUN. The kernel forwards it with source NAT; the reply returns
+through the TUN with the physical source, which the engine rewrites back to the overlay
+address before encrypting it to the member. The gateway's own traffic to its devices is
+handled by a kernel output DNAT rule, because Linux refuses a TUN packet whose source is one of
+the host's own addresses.
+
+Failover needs the lighthouse to notice a dead gateway. Sessions that stay silent for 45 s are
+dropped (nodes ping every 15 s), the networks of that node are re-pushed, and the device moves
+to the next candidate. Members already hold WireGuard sessions with every peer, so the switch
+is one route change.
+
 ## Persistence
 
 - Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, invite hashes) in the

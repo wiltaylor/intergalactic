@@ -1008,6 +1008,7 @@ dependencies = [
  "ig-core",
  "ig-proto",
  "interprocess",
+ "ipnet",
  "serde_json",
  "tokio",
  "tracing",

@@ -2,6 +2,7 @@
 
 pub mod dns_os;
 pub mod firewall;
+pub mod gateway_os;
 pub mod ipc;
 pub mod paths;
 pub mod tun;

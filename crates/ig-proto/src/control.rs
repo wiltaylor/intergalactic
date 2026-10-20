@@ -13,6 +13,10 @@ pub struct ClientHello {
     pub hostname: String,
     /// Free-form OS tag ("linux", "windows", "android").
     pub os: String,
+    /// The node is willing to act as a gateway for registered devices on the
+    /// LANs it is attached to (`ig-node run --gateway`).
+    #[serde(default)]
+    pub gateway: bool,
 }
 
 /// Payload of the second Noise handshake message (lighthouse -> node).
@@ -43,8 +47,12 @@ pub enum ToLighthouse {
     Resume,
     /// Local candidate endpoints (LAN addresses + UDP port). The lighthouse adds
     /// the reflexive address it observes on UDP and shares the union with peers.
+    /// `subnets` are the IPv4 prefixes of the LANs this node sits on; the
+    /// lighthouse uses them to pick gateways for registered devices.
     Endpoints {
         local: Vec<SocketAddr>,
+        #[serde(default)]
+        subnets: Vec<Ipv4Net>,
     },
     /// Ask the lighthouse to tell `target` to start sending towards us so both
     /// NATs open at the same time.
@@ -117,9 +125,43 @@ pub struct NetworkInfo {
     pub dns_name: String,
     #[serde(default)]
     pub relay_limit: RelayLimit,
+    /// Devices registered in this network and who currently gateways them.
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// A device on a physical LAN that members reach through a gateway node. The
+/// gateway translates `address` (overlay) to `target` (physical) and back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub name: String,
+    /// DNS label, unique in the network among members and devices.
+    pub dns_name: String,
+    /// Overlay address members use.
+    pub address: Ipv4Addr,
+    /// Physical address on the gateway's LAN.
+    pub target: Ipv4Addr,
+    /// Node currently forwarding for this device, if any is online and able.
+    pub gateway: Option<NodeId>,
 }
 
 impl NetworkInfo {
+    /// Devices this node must gateway.
+    pub fn my_devices(&self, me: &NodeId) -> Vec<&DeviceInfo> {
+        self.devices
+            .iter()
+            .filter(|d| d.gateway == Some(*me))
+            .collect()
+    }
+
+    /// Devices a given peer gateways.
+    pub fn devices_via(&self, peer: &NodeId) -> Vec<&DeviceInfo> {
+        self.devices
+            .iter()
+            .filter(|d| d.gateway == Some(*peer))
+            .collect()
+    }
+
     /// Address of the in-engine DNS responder: the first host of the prefix.
     /// It is never assigned to a member.
     pub fn dns_server_v4(&self) -> Ipv4Addr {

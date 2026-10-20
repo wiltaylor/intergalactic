@@ -209,6 +209,9 @@ pub fn build_ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Ve
     if proto == PROTO_UDP && payload.len() >= 8 {
         let c = l4_checksum(IpAddr::V4(src), IpAddr::V4(dst), proto, &p[20..]);
         p[26..28].copy_from_slice(&c.to_be_bytes());
+    } else if proto == PROTO_TCP && payload.len() >= 20 {
+        let c = l4_checksum(IpAddr::V4(src), IpAddr::V4(dst), proto, &p[20..]);
+        p[36..38].copy_from_slice(&c.to_be_bytes());
     }
     p
 }
@@ -222,9 +225,14 @@ pub fn build_ipv6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, payload: &[u8]) -> Ve
     p[8..24].copy_from_slice(&src.octets());
     p[24..40].copy_from_slice(&dst.octets());
     p[40..].copy_from_slice(payload);
-    if (proto == PROTO_UDP && payload.len() >= 8) || (proto == PROTO_ICMPV6 && payload.len() >= 4) {
+    let csum_off = match proto {
+        PROTO_UDP if payload.len() >= 8 => Some(46),
+        PROTO_TCP if payload.len() >= 20 => Some(56),
+        PROTO_ICMPV6 if payload.len() >= 4 => Some(42),
+        _ => None,
+    };
+    if let Some(off) = csum_off {
         let c = l4_checksum(IpAddr::V6(src), IpAddr::V6(dst), proto, &p[40..]);
-        let off = if proto == PROTO_UDP { 46 } else { 42 };
         p[off..off + 2].copy_from_slice(&c.to_be_bytes());
     }
     p
