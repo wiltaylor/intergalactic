@@ -55,6 +55,11 @@ pub struct Device {
     pub address: Ipv4Addr,
     /// Physical address on the gateways' LAN.
     pub target: Ipv4Addr,
+    /// IPv6 overlay address (same host number as `address`) and physical address.
+    #[serde(default)]
+    pub address6: Option<Ipv6Addr>,
+    #[serde(default)]
+    pub target6: Option<Ipv6Addr>,
     /// Preferred gateways in order. Empty: any gateway-capable member whose LAN
     /// contains `target`.
     #[serde(default)]
@@ -317,6 +322,7 @@ impl Store {
         network: NetworkId,
         name: &str,
         target: Ipv4Addr,
+        target6: Option<Ipv6Addr>,
         gateways: Vec<NodeId>,
     ) -> Result<Device, StoreError> {
         let net = self
@@ -328,11 +334,18 @@ impl Store {
         }
         let address = net.allocate().ok_or(StoreError::Full)?;
         let dns_name = net.unique_label(name);
+        let address6 = if target6.is_some() {
+            net.address6_for(address)
+        } else {
+            None
+        };
         let dev = Device {
             name: name.to_string(),
             dns_name,
             address,
             target,
+            address6,
+            target6,
             gateways,
         };
         net.devices.insert(name.to_string(), dev.clone());
@@ -481,15 +494,26 @@ mod tests {
         assert!(!s.share_network(&a, &b));
         // Devices take addresses from the same pool and unique labels.
         let d = s
-            .add_device(id, "laptop", "192.168.1.9".parse().unwrap(), vec![])
+            .add_device(
+                id,
+                "laptop",
+                "192.168.1.9".parse().unwrap(),
+                Some("fd70::9".parse().unwrap()),
+                vec![],
+            )
             .unwrap();
+        assert_eq!(
+            d.address6,
+            Some("fd42::4".parse().unwrap()),
+            "same host number as the IPv4 address"
+        );
         assert_eq!(d.address, "10.90.0.4".parse::<Ipv4Addr>().unwrap());
         assert_eq!(
             d.dns_name, "laptop",
             "alpha left, so the base label is free again"
         );
         assert!(matches!(
-            s.add_device(id, "laptop", "192.168.1.9".parse().unwrap(), vec![]),
+            s.add_device(id, "laptop", "192.168.1.9".parse().unwrap(), None, vec![]),
             Err(StoreError::DuplicateDevice(_))
         ));
         s.remove_device(id, "laptop").unwrap();

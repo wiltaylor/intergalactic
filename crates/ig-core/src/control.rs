@@ -369,6 +369,7 @@ async fn send_endpoints(
         tx.send(&ToLighthouse::Endpoints {
             local: current.clone(),
             subnets: inner.local_subnets(),
+            subnets6: inner.local_subnets6(),
         })
         .await?;
         *last = current;

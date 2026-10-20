@@ -195,8 +195,14 @@ fn print_devices(st: &StatusReport) {
                 "{:<12} {:<16} {:<16} {:<16} {:<30} {}",
                 truncate(&n.info.name, 12),
                 truncate(&d.name, 16),
-                d.address.to_string(),
-                d.target.to_string(),
+                match d.address6 {
+                    Some(a6) => format!("{} {}", d.address, a6),
+                    None => d.address.to_string(),
+                },
+                match d.target6 {
+                    Some(t6) => format!("{} {}", d.target, t6),
+                    None => d.target.to_string(),
+                },
                 truncate(
                     &format!(
                         "{}.{}.{}",

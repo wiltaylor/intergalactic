@@ -472,33 +472,36 @@ impl Inner {
         crate::endpoints::local_subnets(&v4)
     }
 
-    /// Device we gateway whose overlay address is `dst`, with its network.
-    fn my_device_for(&self, dst: &IpAddr) -> Option<(NetworkId, ig_proto::control::DeviceInfo)> {
-        let IpAddr::V4(v4) = dst else { return None };
+    pub fn local_subnets6(&self) -> Vec<Ipv6Net> {
+        if !self.gateway {
+            return Vec::new();
+        }
+        let (_, v6) = self.overlay_cidrs();
+        crate::endpoints::local_subnets6(&v6)
+    }
+
+    /// Device we gateway whose overlay address is `dst`: (network, physical address).
+    fn my_device_for(&self, dst: &IpAddr) -> Option<(NetworkId, IpAddr)> {
         let me = self.keypair.public;
         let nets = self.networks.read();
         for e in nets.values() {
             for d in e.membership.network.my_devices(&me) {
-                if d.address == *v4 {
-                    return Some((e.membership.network.id, d.clone()));
+                if let Some(t) = d.target_for(dst) {
+                    return Some((e.membership.network.id, t));
                 }
             }
         }
         None
     }
 
-    /// Device we gateway whose physical address is `src`, with its network.
-    fn my_device_by_target(
-        &self,
-        src: &IpAddr,
-    ) -> Option<(NetworkId, ig_proto::control::DeviceInfo)> {
-        let IpAddr::V4(v4) = src else { return None };
+    /// Device we gateway whose physical address is `src`: (network, overlay address).
+    fn my_device_by_target(&self, src: &IpAddr) -> Option<(NetworkId, IpAddr)> {
         let me = self.keypair.public;
         let nets = self.networks.read();
         for e in nets.values() {
             for d in e.membership.network.my_devices(&me) {
-                if d.target == *v4 {
-                    return Some((e.membership.network.id, d.clone()));
+                if let Some(o) = d.overlay_for(src) {
+                    return Some((e.membership.network.id, o));
                 }
             }
         }
@@ -529,7 +532,7 @@ impl Inner {
                     &d.dns_name,
                     &ig_proto::control::dns_label(&n.name),
                     &n.dns_domain,
-                    &[IpAddr::V4(d.address)],
+                    &d.addresses(),
                 );
             }
         }
@@ -725,7 +728,7 @@ impl Inner {
             p.online = pi.online;
             let mut addrs = pi.addresses();
             for d in info.devices_via(&pi.node) {
-                addrs.push(IpAddr::V4(d.address));
+                addrs.extend(d.addresses());
             }
             p.addresses.insert(info.id, addrs);
             p.dns_names.insert(info.id, pi.dns_name.clone());
@@ -882,13 +885,13 @@ impl Inner {
         let mut owned: Vec<u8>;
         let mut pkt = pkt;
         let mut src = src;
-        if let Some((_, d)) = self.my_device_by_target(&src) {
+        if let Some((_, overlay)) = self.my_device_by_target(&src) {
             owned = pkt.to_vec();
-            if !crate::nat::rewrite_src(&mut owned, d.address) {
+            if !crate::nat::rewrite_src(&mut owned, overlay) {
                 return;
             }
             pkt = &owned;
-            src = IpAddr::V4(d.address);
+            src = overlay;
             // Reply to ourselves (we talked to our own device): hairpin.
             if self.is_my_address(&dst) {
                 let _ = dev.send(pkt);
@@ -896,7 +899,7 @@ impl Inner {
             }
         }
         // Gateway: traffic from this host to a device we front ourselves.
-        if let Some((net, d)) = self.my_device_for(&dst) {
+        if let Some((net, target)) = self.my_device_for(&dst) {
             let policy_ok = {
                 let nets = self.networks.read();
                 nets.get(&net)
@@ -906,7 +909,7 @@ impl Inner {
                 return;
             }
             let mut translated = pkt.to_vec();
-            if crate::nat::rewrite_dst(&mut translated, d.target) {
+            if crate::nat::rewrite_dst(&mut translated, target) {
                 let _ = dev.send(&translated);
             }
             return;
@@ -941,7 +944,7 @@ impl Inner {
                 n.addresses().contains(&src)
                     || n.my_devices(&self.keypair.public)
                         .iter()
-                        .any(|d| IpAddr::V4(d.address) == src)
+                        .any(|d| d.addresses().contains(&src))
             })
         };
         if !src_ok {
@@ -1092,8 +1095,7 @@ impl Inner {
             .network
             .my_devices(&self.keypair.public)
             .into_iter()
-            .find(|d| IpAddr::V4(d.address) == dst)
-            .cloned();
+            .find_map(|d| d.target_for(&dst));
         if device.is_none() && !entry.membership.network.addresses().contains(&dst) {
             tracing::trace!(%dst, network = %entry.membership.network.name, "packet not addressed to us in this network");
             return false;
@@ -1113,11 +1115,11 @@ impl Inner {
             },
         };
         drop(nets);
-        if let Some(d) = device {
+        if let Some(target) = device {
             // Gateway: hand the packet to the kernel addressed to the physical
             // device; the kernel masquerades it onto the LAN.
             let mut translated = pkt.to_vec();
-            if !crate::nat::rewrite_dst(&mut translated, d.target) {
+            if !crate::nat::rewrite_dst(&mut translated, target) {
                 return false;
             }
             if let Err(e) = dev.send(&translated) {

@@ -228,7 +228,7 @@ async fn run(
     // Interfaces we created, by network. Reconciled on every membership change.
     let mut tuns: HashMap<NetworkId, (Membership, String)> = HashMap::new();
     reconcile(&engine, &mut tuns, engine.memberships(), dns_mode);
-    let mut gateway_prefixes = (Vec::new(), Vec::new());
+    let mut gateway_prefixes = GatewayState::default();
     reconcile_gateway(&engine, opts.gateway, &mut gateway_prefixes);
     dns_os::apply_hosts(dns_mode, &engine.status());
 
@@ -286,46 +286,57 @@ async fn run(
 
 /// Enable or disable kernel forwarding for the networks in which this node is
 /// the active gateway of at least one device.
-fn reconcile_gateway(
-    engine: &Engine,
-    enabled: bool,
-    current: &mut (
-        Vec<ipnet::Ipv4Net>,
-        Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
-    ),
-) {
+fn reconcile_gateway(engine: &Engine, enabled: bool, current: &mut GatewayState) {
     if !enabled {
         return;
     }
     let me = engine.node_id();
     let memberships = engine.memberships();
-    let mut prefixes: Vec<ipnet::Ipv4Net> = memberships
-        .iter()
-        .filter(|m| !m.network.my_devices(&me).is_empty())
-        .map(|m| m.network.cidr)
-        .collect();
-    prefixes.sort();
-    prefixes.dedup();
-    let mut devices: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> = memberships
-        .iter()
-        .flat_map(|m| {
-            m.network
-                .my_devices(&me)
-                .into_iter()
-                .map(|d| (d.address, d.target))
-        })
-        .collect();
-    devices.sort();
-    let wanted = (prefixes, devices);
+    let mut wanted = GatewayState::default();
+    for m in &memberships {
+        let mine = m.network.my_devices(&me);
+        if mine.is_empty() {
+            continue;
+        }
+        wanted.prefixes.push(m.network.cidr);
+        if mine.iter().any(|d| d.address6.is_some()) {
+            if let Some(c6) = m.network.cidr6 {
+                wanted.prefixes6.push(c6);
+            }
+        }
+        for d in mine {
+            wanted.devices.push((
+                std::net::IpAddr::V4(d.address),
+                std::net::IpAddr::V4(d.target),
+            ));
+            if let (Some(a6), Some(t6)) = (d.address6, d.target6) {
+                wanted
+                    .devices
+                    .push((std::net::IpAddr::V6(a6), std::net::IpAddr::V6(t6)));
+            }
+        }
+    }
+    wanted.prefixes.sort();
+    wanted.prefixes.dedup();
+    wanted.prefixes6.sort();
+    wanted.prefixes6.dedup();
+    wanted.devices.sort();
     if wanted != *current {
         for m in &memberships {
             for d in m.network.my_devices(&me) {
-                tracing::info!(network = %m.network.name, device = %d.name, target = %d.target, "acting as gateway");
+                tracing::info!(network = %m.network.name, device = %d.name, target = %d.target, target6 = ?d.target6, "acting as gateway");
             }
         }
-        ig_node::gateway_os::apply(&wanted.0, &wanted.1);
+        ig_node::gateway_os::apply(&wanted.prefixes, &wanted.prefixes6, &wanted.devices);
         *current = wanted;
     }
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct GatewayState {
+    prefixes: Vec<ipnet::Ipv4Net>,
+    prefixes6: Vec<ipnet::Ipv6Net>,
+    devices: Vec<(std::net::IpAddr, std::net::IpAddr)>,
 }
 
 /// Create TUNs for new memberships, drop TUNs for memberships that went away,

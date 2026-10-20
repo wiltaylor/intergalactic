@@ -137,6 +137,11 @@ it still qualifies, else the first qualifying candidate (online, gateway-capable
 device's LAN unless the admin listed it explicitly). The result rides in `NetworkInfo.devices`,
 so every member learns the mapping on the same push as everything else.
 
+A device can carry an IPv6 pair as well (`--ipv6`): the overlay IPv6 address shares the host
+number with the IPv4 one, and the gateway qualifies for the device when either of its LAN
+prefixes contains the matching target. Translation is per family; the IPv6 header has no
+checksum, but the TCP, UDP and ICMPv6 checksums cover the addresses and are updated.
+
 Members treat a device address as one more address of the active gateway peer: it is routed
 to that peer and accepted as a source from it. The gateway itself, on receiving a packet for a
 device, rewrites the destination to the physical address (`ig_core::nat`, incremental checksum

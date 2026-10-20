@@ -91,6 +91,9 @@ enum DeviceCmd {
         network: String,
         name: String,
         target: std::net::Ipv4Addr,
+        /// The device's IPv6 address on the LAN. The network needs an IPv6 prefix.
+        #[arg(long = "ipv6")]
+        target6: Option<std::net::Ipv6Addr>,
         /// Preferred gateway nodes in order (node ids). Default: any capable node on the LAN.
         #[arg(long = "via")]
         via: Vec<NodeId>,
@@ -343,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 network,
                 name,
                 target,
+                target6,
                 via,
             } => {
                 let r = admin_socket::request(
@@ -351,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
                         network,
                         name,
                         target,
+                        target6,
                         gateways: via,
                     },
                 )
@@ -504,8 +509,14 @@ fn print_devices(r: AdminResponse) -> anyhow::Result<()> {
                     "{:<12} {:<16} {:<16} {:<16} {:<24} {:<22} {}",
                     truncate(&d.network_name, 12),
                     truncate(&d.name, 16),
-                    d.address.to_string(),
-                    d.target.to_string(),
+                    match d.address6 {
+                        Some(a6) => format!("{} {}", d.address, a6),
+                        None => d.address.to_string(),
+                    },
+                    match d.target6 {
+                        Some(t6) => format!("{} {}", d.target, t6),
+                        None => d.target.to_string(),
+                    },
                     truncate(&format!("{}.{}.", d.dns_name, d.network_name), 24),
                     truncate(&active, 22),
                     d.candidates.join(", ")

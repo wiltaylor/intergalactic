@@ -68,11 +68,13 @@ of a network through one or more **gateway nodes** on its LAN.
 sudo ig-node run --gateway            # or: ig-node.exe service install --gateway
 # On the lighthouse:
 sudo ig-lighthouse device add dev printer 192.168.1.50
-sudo ig-lighthouse device add dev nas 192.168.1.60 --via <node-id-a> --via <node-id-b>
+sudo ig-lighthouse device add dev nas 192.168.1.60 --ipv6 fd00:1::60 --via <node-id-a> --via <node-id-b>
 sudo ig-lighthouse device list dev
 ```
 
 The device gets an overlay address from the network and a name (`printer.dev.ig.internal`).
+With `--ipv6` it also gets an overlay IPv6 address (same host number, in the network's IPv6
+prefix) and an AAAA record; the network must have been created with `--ipv6`.
 Without `--via`, any online `--gateway` member whose LAN contains the device's address can
 serve it; with `--via`, only the listed nodes, in that order. The lighthouse keeps the current
 gateway while it qualifies and switches when it disconnects, stops reporting that LAN, or is
@@ -80,10 +82,11 @@ removed. A node that vanishes without closing its connection is noticed within 4
 
 On the gateway, the engine rewrites the device's overlay address to its physical address and
 the kernel forwards the packet with source NAT onto the LAN. Linux: `ip_forward` plus an
-nftables table `ig_gateway` (masquerade and an output DNAT so the gateway reaches its own
-devices too). Windows: IP forwarding plus a `NetNat` for the overlay prefix; the local
-hairpin is not available there. Network policies apply to device traffic the same way they
-apply to the gateway itself. Android nodes cannot be gateways.
+nftables tables `ig_gateway` in the `ip` and `ip6` families (masquerade, and an output DNAT
+so the gateway reaches its own devices too). Windows: IP forwarding plus a `NetNat` for the
+overlay prefix; Windows NAT is IPv4 only and the local hairpin is not available there, so a
+Windows gateway serves IPv4 devices to other members only. Network policies apply to device
+traffic the same way they apply to the gateway itself. Android nodes cannot be gateways.
 
 ## Node on Linux
 

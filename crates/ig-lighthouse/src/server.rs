@@ -56,6 +56,7 @@ struct Session {
     local_endpoints: RwLock<Vec<SocketAddr>>,
     /// LAN prefixes the node reported; empty unless it offered to be a gateway.
     subnets: RwLock<Vec<Ipv4Net>>,
+    subnets6: RwLock<Vec<ipnet::Ipv6Net>>,
     gateway: bool,
     last_seen: Mutex<Instant>,
     abort: tokio::sync::Notify,
@@ -273,6 +274,8 @@ impl Inner {
                 dns_name: d.dns_name.clone(),
                 address: d.address,
                 target: d.target,
+                address6: d.address6,
+                target6: d.target6,
                 gateway: chosen,
             });
         }
@@ -296,7 +299,13 @@ impl Inner {
             if !s.gateway {
                 return false;
             }
-            !need_subnet || s.subnets.read().iter().any(|n| n.contains(&d.target))
+            if !need_subnet {
+                return true;
+            }
+            // On the device's LAN: the IPv4 target's prefix, or the IPv6 target's.
+            s.subnets.read().iter().any(|n| n.contains(&d.target))
+                || d.target6
+                    .is_some_and(|t6| s.subnets6.read().iter().any(|n| n.contains(&t6)))
         };
         if !d.gateways.is_empty() {
             // Explicit list: the admin vouches that these nodes can reach the
@@ -478,15 +487,22 @@ impl Inner {
                     }
                 }
             }
-            ToLighthouse::Endpoints { local, subnets } => {
+            ToLighthouse::Endpoints {
+                local,
+                subnets,
+                subnets6,
+            } => {
                 let mut local: Vec<SocketAddr> = local.into_iter().take(10).collect();
                 local.dedup();
                 let subnets: Vec<Ipv4Net> = subnets.into_iter().take(16).collect();
-                let changed =
-                    *session.local_endpoints.read() != local || *session.subnets.read() != subnets;
+                let subnets6: Vec<ipnet::Ipv6Net> = subnets6.into_iter().take(16).collect();
+                let changed = *session.local_endpoints.read() != local
+                    || *session.subnets.read() != subnets
+                    || *session.subnets6.read() != subnets6;
                 if changed {
                     *session.local_endpoints.write() = local;
                     *session.subnets.write() = subnets;
+                    *session.subnets6.write() = subnets6;
                     self.mark_dirty_for_node(&node);
                 }
             }
@@ -781,6 +797,7 @@ impl Inner {
                 network,
                 name,
                 target,
+                target6,
                 gateways,
             } => {
                 let mut store = self.store.lock();
@@ -789,7 +806,10 @@ impl Inner {
                 if label != name.to_ascii_lowercase() || name.is_empty() {
                     anyhow::bail!("device names use letters, digits and dashes only");
                 }
-                let dev = store.add_device(id, &name, target, gateways)?;
+                if target6.is_some() && store.networks[&id].cidr6.is_none() {
+                    anyhow::bail!("network has no IPv6 prefix; create it with --ipv6 to register IPv6 devices");
+                }
+                let dev = store.add_device(id, &name, target, target6, gateways)?;
                 self.persist(&store);
                 let summary = self.device_summary(&store, id, &dev);
                 drop(store);
@@ -863,6 +883,8 @@ impl Inner {
             dns_name: d.dns_name.clone(),
             address: d.address,
             target: d.target,
+            address6: d.address6,
+            target6: d.target6,
             gateways: d.gateways.clone(),
             active: active.map(|n| (n, hostname(&n))),
             candidates: candidates
@@ -941,6 +963,7 @@ async fn handle_connection(
         tx,
         local_endpoints: RwLock::new(Vec::new()),
         subnets: RwLock::new(Vec::new()),
+        subnets6: RwLock::new(Vec::new()),
         gateway: hello.gateway,
         last_seen: Mutex::new(Instant::now()),
         abort: tokio::sync::Notify::new(),

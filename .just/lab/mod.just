@@ -39,9 +39,14 @@ flat-windows: require-vmlab
 flat-gateway: require-vmlab
 	cd lab/flat && vmlab script scripts/gateway.ws
 
+# Run the IPv6-device and Windows-gateway scenario (after flat-gateway)
+[group('lab')]
+flat-gateway-more: require-vmlab
+	cd lab/flat && vmlab script scripts/gateway-more.ws
+
 # Run all flat scenarios
 [group('lab')]
-flat-test: flat-linux flat-windows flat-gateway
+flat-test: flat-linux flat-windows flat-gateway flat-gateway-more
 
 # Stop the flat lab, keeping the clones
 [group('lab')]

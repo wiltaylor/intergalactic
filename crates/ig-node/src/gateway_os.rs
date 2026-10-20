@@ -4,8 +4,8 @@
 //! into the TUN. Linux: sysctl + an nftables masquerade table. Windows: IP
 //! forwarding plus a NetNat for the overlay prefix (best effort).
 
-use ipnet::Ipv4Net;
-use std::net::Ipv4Addr;
+use ipnet::{Ipv4Net, Ipv6Net};
+use std::net::IpAddr;
 use std::process::Command;
 
 fn run(cmd: &str, args: &[&str]) -> bool {
@@ -28,16 +28,19 @@ fn run(cmd: &str, args: &[&str]) -> bool {
 /// a packet from the TUN whose source is the host's own address, so the local
 /// case is a plain DNAT in the output hook instead. Idempotent; call with the
 /// full current set on every change.
-pub fn apply(prefixes: &[Ipv4Net], devices: &[(Ipv4Addr, Ipv4Addr)]) {
-    if prefixes.is_empty() {
+pub fn apply(prefixes: &[Ipv4Net], prefixes6: &[Ipv6Net], devices: &[(IpAddr, IpAddr)]) {
+    if prefixes.is_empty() && prefixes6.is_empty() {
         remove();
         return;
     }
     if cfg!(target_os = "linux") {
         run("sysctl", &["-q", "-w", "net.ipv4.ip_forward=1"]);
+        run("sysctl", &["-q", "-w", "net.ipv6.conf.all.forwarding=1"]);
         let mut script = String::from(
             "table ip ig_gateway\n\
              delete table ip ig_gateway\n\
+             table ip6 ig_gateway\n\
+             delete table ip6 ig_gateway\n\
              table ip ig_gateway {\n\
              \tchain post { type nat hook postrouting priority 100; policy accept;\n",
         );
@@ -48,7 +51,22 @@ pub fn apply(prefixes: &[Ipv4Net], devices: &[(Ipv4Addr, Ipv4Addr)]) {
         }
         script.push_str("\t}\n\tchain out { type nat hook output priority -100; policy accept;\n");
         for (addr, target) in devices {
-            script.push_str(&format!("\t\tip daddr {addr} dnat to {target}\n"));
+            if let (IpAddr::V4(a), IpAddr::V4(t)) = (addr, target) {
+                script.push_str(&format!("\t\tip daddr {a} dnat to {t}\n"));
+            }
+        }
+        script.push_str("\t}\n}\n");
+        script.push_str("table ip6 ig_gateway {\n\tchain post { type nat hook postrouting priority 100; policy accept;\n");
+        for p in prefixes6 {
+            script.push_str(&format!(
+                "\t\tip6 saddr {p} oifname != \"ig-*\" masquerade\n"
+            ));
+        }
+        script.push_str("\t}\n\tchain out { type nat hook output priority -100; policy accept;\n");
+        for (addr, target) in devices {
+            if let (IpAddr::V6(a), IpAddr::V6(t)) = (addr, target) {
+                script.push_str(&format!("\t\tip6 daddr {a} dnat to {t}\n"));
+            }
         }
         script.push_str("\t}\n}\n");
         let path = std::env::temp_dir().join("ig-gateway.nft");
@@ -58,8 +76,11 @@ pub fn apply(prefixes: &[Ipv4Net], devices: &[(Ipv4Addr, Ipv4Addr)]) {
             }
             Err(e) => tracing::warn!(error = %e, "cannot write nft script"),
         }
-        tracing::info!(?prefixes, "gateway forwarding enabled");
+        tracing::info!(?prefixes, ?prefixes6, "gateway forwarding enabled");
     } else if cfg!(windows) {
+        if !prefixes6.is_empty() {
+            tracing::warn!("Windows NetNat is IPv4 only; IPv6 devices will not be reachable through this gateway");
+        }
         let mut ps = String::from(
             "Get-NetIPInterface -AddressFamily IPv4 | Where-Object InterfaceAlias -like 'ig-*' | Set-NetIPInterface -Forwarding Enabled; \
              Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.ConnectionState -eq 'Connected' } | Set-NetIPInterface -Forwarding Enabled; ",
@@ -85,6 +106,9 @@ pub fn remove() {
     if cfg!(target_os = "linux") {
         let _ = Command::new("nft")
             .args(["delete", "table", "ip", "ig_gateway"])
+            .output();
+        let _ = Command::new("nft")
+            .args(["delete", "table", "ip6", "ig_gateway"])
             .output();
     } else if cfg!(windows) {
         run(

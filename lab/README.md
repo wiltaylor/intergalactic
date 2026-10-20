@@ -44,6 +44,13 @@ fetches a file from the device by name through the gateway; alpha's link goes do
 the 45 s idle timeout the device moves to bravo while Windows keeps working; bravo reaches its
 own device through the kernel DNAT; alpha returns and the active gateway stays with bravo.
 
+`gateway-more.ws` (after `gateway.ws`) adds IPv6 ULA addresses to the LAN and re-registers the
+device with `--ipv6`: the active Linux gateway gets an `ip6` nftables table, the device
+resolves with an AAAA record, and it is reached over IPv6 from the other gateway, from the
+active gateway itself and from Windows. It then reinstalls the Windows service with `--gateway`,
+registers a second device `--via` the Windows node, and alpha fetches from it through Windows
+NetNat.
+
 `windows.ws` checks: `ig-node service install` registers and starts the service as
 LocalSystem; the Wintun adapter carries both addresses; ping to a Linux peer over IPv4
 and IPv6; NRPT rules exist and `Resolve-DnsName` answers; the Linux peer reaches Windows
@@ -94,7 +101,7 @@ its name; the lighthouse lists both members.
 
 ## Results on 2026-10-20
 
-All five scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
+All six scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
 Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by these labs:
 
 - The Windows service did not exit on stop: the tokio runtime waited forever during

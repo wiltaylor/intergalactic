@@ -702,6 +702,7 @@ async fn gateway_translates_device_traffic_and_fails_over() {
         network: "office".into(),
         name: "printer".into(),
         target,
+        target6: None,
         gateways: vec![alpha.engine.node_id(), bravo.engine.node_id()],
     });
     let dev_addr = match r {
@@ -786,5 +787,108 @@ async fn gateway_translates_device_traffic_and_fails_over() {
     let _ = ia;
     bravo.engine.shutdown().await;
     charlie.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
+async fn ipv6_devices_are_translated_too() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "lab", "10.98.0.0/24", Some("fd98::/64"));
+    let inv = invite(&lh, "lab", 5);
+    let mk = |name: &'static str, gateway: bool| async move {
+        let (engine, events) = Engine::start(
+            EngineConfig {
+                keypair: Keypair::generate(),
+                hostname: name.into(),
+                os: "test".into(),
+                udp_port: 0,
+                memberships: vec![],
+                persistent_keepalive: Some(25),
+                relay_only: false,
+                gateway,
+            },
+            Arc::new(NoProtector),
+        )
+        .await
+        .unwrap();
+        Node {
+            engine,
+            events,
+            keypair: Keypair::generate(),
+        }
+    };
+    let gw = mk("gw", true).await;
+    let client = mk("client", false).await;
+    let (_ig, mut os_gw) = join_with_tun(&gw, &inv).await;
+    let (ic, mut os_c) = join_with_tun(&client, &inv).await;
+    wait_for("peer visible", || client.engine.status().peers.len() == 1).await;
+
+    // IPv6 devices need the network's IPv6 prefix; the overlay v6 address gets
+    // the same host number as the v4 one.
+    let target6: std::net::Ipv6Addr = "fd70::60".parse().unwrap();
+    let r = lh.admin(AdminRequest::DeviceAdd {
+        network: "lab".into(),
+        name: "nas".into(),
+        target: "192.0.2.60".parse().unwrap(),
+        target6: Some(target6),
+        gateways: vec![gw.engine.node_id()],
+    });
+    let (addr4, addr6) = match r {
+        AdminResponse::Devices(list) => (
+            list[0].address,
+            list[0].address6.expect("v6 overlay address"),
+        ),
+        other => panic!("{other:?}"),
+    };
+    let host = u32::from(addr4) - u32::from("10.98.0.0".parse::<std::net::Ipv4Addr>().unwrap());
+    assert_eq!(u128::from(addr6) & 0xffff_ffff, host as u128);
+    wait_for("device pushed", || {
+        client.engine.status().networks[0]
+            .info
+            .devices
+            .first()
+            .is_some_and(|d| d.gateway.is_some())
+    })
+    .await;
+
+    // client -> nas over IPv6 arrives at the gateway with the physical v6 destination.
+    let q = build_udp(v6(&ic), 4000, IpAddr::V6(addr6), 445, b"smb");
+    let got = deliver(&os_c, &mut os_gw, q).await;
+    let f = ig_core::packet::parse_flow(&got).unwrap();
+    assert_eq!((f.src, f.dst, f.dport), (v6(&ic), IpAddr::V6(target6), 445));
+    // Reply from the physical address comes back with the overlay v6 source.
+    let reply = build_udp(IpAddr::V6(target6), 445, v6(&ic), 4000, b"ok");
+    let got = deliver(&os_gw, &mut os_c, reply).await;
+    let f = ig_core::packet::parse_flow(&got).unwrap();
+    assert_eq!((f.src, f.dst), (IpAddr::V6(addr6), v6(&ic)));
+    // AAAA for the device name.
+    let dns6 = IpAddr::V6(ic.dns_server_v6().unwrap());
+    os_c.to_tun
+        .send(build_udp(
+            v6(&ic),
+            5300,
+            dns6,
+            53,
+            &dns_query("nas.lab.ig.test", 28),
+        ))
+        .await
+        .unwrap();
+    let ans = recv_packet(&mut os_c, Duration::from_secs(2))
+        .await
+        .expect("dns reply");
+    assert_eq!(&ans[ans.len() - 16..], &addr6.octets());
+    // A network without an IPv6 prefix refuses IPv6 devices.
+    create_network(&lh, "v4only", "10.97.0.0/24", None);
+    let r = lh.admin(AdminRequest::DeviceAdd {
+        network: "v4only".into(),
+        name: "x".into(),
+        target: "192.0.2.1".parse().unwrap(),
+        target6: Some(target6),
+        gateways: vec![],
+    });
+    assert!(matches!(r, AdminResponse::Error { .. }));
+    gw.engine.shutdown().await;
+    client.engine.shutdown().await;
     lh.shutdown().await;
 }

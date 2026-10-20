@@ -53,6 +53,8 @@ pub enum ToLighthouse {
         local: Vec<SocketAddr>,
         #[serde(default)]
         subnets: Vec<Ipv4Net>,
+        #[serde(default)]
+        subnets6: Vec<Ipv6Net>,
     },
     /// Ask the lighthouse to tell `target` to start sending towards us so both
     /// NATs open at the same time.
@@ -141,8 +143,42 @@ pub struct DeviceInfo {
     pub address: Ipv4Addr,
     /// Physical address on the gateway's LAN.
     pub target: Ipv4Addr,
+    /// IPv6 pair, when the network has an IPv6 prefix and the device has an IPv6 address.
+    #[serde(default)]
+    pub address6: Option<Ipv6Addr>,
+    #[serde(default)]
+    pub target6: Option<Ipv6Addr>,
     /// Node currently forwarding for this device, if any is online and able.
     pub gateway: Option<NodeId>,
+}
+
+impl DeviceInfo {
+    /// Overlay addresses of the device.
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        let mut v = vec![IpAddr::V4(self.address)];
+        if let Some(a6) = self.address6 {
+            v.push(IpAddr::V6(a6));
+        }
+        v
+    }
+
+    /// Physical address for an overlay address of this device, if it is one.
+    pub fn target_for(&self, overlay: &IpAddr) -> Option<IpAddr> {
+        match overlay {
+            IpAddr::V4(a) if *a == self.address => Some(IpAddr::V4(self.target)),
+            IpAddr::V6(a) if Some(*a) == self.address6 => self.target6.map(IpAddr::V6),
+            _ => None,
+        }
+    }
+
+    /// Overlay address for a physical address of this device, if it is one.
+    pub fn overlay_for(&self, physical: &IpAddr) -> Option<IpAddr> {
+        match physical {
+            IpAddr::V4(a) if *a == self.target => Some(IpAddr::V4(self.address)),
+            IpAddr::V6(a) if Some(*a) == self.target6 => self.address6.map(IpAddr::V6),
+            _ => None,
+        }
+    }
 }
 
 impl NetworkInfo {

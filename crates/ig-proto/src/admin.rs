@@ -48,6 +48,7 @@ pub enum AdminRequest {
         network: String,
         name: String,
         target: Ipv4Addr,
+        target6: Option<Ipv6Addr>,
         gateways: Vec<NodeId>,
     },
     DeviceList {
@@ -83,6 +84,8 @@ pub struct DeviceSummary {
     pub dns_name: String,
     pub address: Ipv4Addr,
     pub target: Ipv4Addr,
+    pub address6: Option<Ipv6Addr>,
+    pub target6: Option<Ipv6Addr>,
     /// Preferred gateways in order; empty = automatic.
     pub gateways: Vec<NodeId>,
     /// Currently active gateway and its hostname.

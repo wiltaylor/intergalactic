@@ -62,6 +62,33 @@ pub fn local_subnets(exclude4: &[Ipv4Net]) -> Vec<Ipv4Net> {
     out
 }
 
+/// IPv6 prefixes of the LANs this host is attached to (global and ULA), excluding
+/// overlay prefixes.
+pub fn local_subnets6(exclude6: &[Ipv6Net]) -> Vec<Ipv6Net> {
+    let mut out: Vec<Ipv6Net> = Vec::new();
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for iface in ifaces {
+        let if_addrs::IfAddr::V6(v6) = iface.addr else {
+            continue;
+        };
+        if !usable_v6(v6.ip) || exclude6.iter().any(|n| n.contains(&v6.ip)) {
+            continue;
+        }
+        let Ok(net) = Ipv6Net::with_netmask(v6.ip, v6.netmask) else {
+            continue;
+        };
+        let net = net.trunc();
+        if net.prefix_len() == 128 || out.contains(&net) {
+            continue;
+        }
+        out.push(net);
+    }
+    out.truncate(16);
+    out
+}
+
 fn usable_v4(ip: Ipv4Addr) -> bool {
     !(ip.is_loopback()
         || ip.is_link_local()
