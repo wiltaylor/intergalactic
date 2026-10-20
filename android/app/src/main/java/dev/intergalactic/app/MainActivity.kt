@@ -53,13 +53,22 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
         val engine = EngineHolder.ensureStarted(this)
         nodeId.text = "node ${engine.nodeId()}"
 
-        toggle.setOnClickListener {
-            if (IgVpnService.running) {
-                IgVpnService.stop(this)
-            } else {
-                val prep: Intent? = VpnService.prepare(this)
-                if (prep != null) vpnPermission.launch(prep) else IgVpnService.start(this)
+        // Automation and deep links: `am start ... --es invite ig1:... --ez connect true`.
+        intent?.getStringExtra(EXTRA_INVITE)?.let { inv ->
+            invite.setText(inv)
+            val connect = intent.getBooleanExtra(EXTRA_CONNECT, false)
+            scope.launch {
+                val result = withContext(Dispatchers.IO) { runCatching { engine.join(inv) } }
+                result.onSuccess {
+                    message.text = "joined ${it.name} as ${it.address}"
+                    if (connect) startVpn()
+                }.onFailure { message.text = it.message ?: "join failed" }
+                render()
             }
+        }
+
+        toggle.setOnClickListener {
+            if (IgVpnService.running) IgVpnService.stop(this) else startVpn()
             handler.postDelayed({ render() }, 300)
         }
 
@@ -80,6 +89,16 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
                 }.onFailure { message.text = it.message ?: "join failed" }
             }
         }
+    }
+
+    private fun startVpn() {
+        val prep: Intent? = VpnService.prepare(this)
+        if (prep != null) vpnPermission.launch(prep) else IgVpnService.start(this)
+    }
+
+    companion object {
+        const val EXTRA_INVITE = "invite"
+        const val EXTRA_CONNECT = "connect"
     }
 
     override fun onStart() {

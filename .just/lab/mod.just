@@ -43,13 +43,28 @@ flat-test: flat-linux flat-windows
 flat-down: require-vmlab
 	cd lab/flat && vmlab down
 
-# Run the NAT scenario (host lighthouse, two NAT'd nodes)
+# Bring the NAT lab up (lighthouse on a WAN, two router VMs, two nodes)
+[group('lab')]
+nat-up: require-vmlab
+	cd lab/nat && vmlab up
+
+# Run the NAT scenario: hole punching through two netfilter NATs, then relay-only
 [group('lab')]
 nat-test: require-vmlab
-	./lab/nat/run.sh
+	cd lab/nat && vmlab script scripts/nat.ws
 
-# Stop the NAT lab and the host lighthouse
+# Stop the NAT lab, keeping the clones
 [group('lab')]
 nat-down: require-vmlab
 	cd lab/nat && vmlab down
-	pkill -f 'ig-lighthouse --state-dir .lh' || true
+
+# Run the Android emulator scenario (needs ANDROID_HOME with an AVD named "ig" and a built debug APK)
+[group('lab')]
+android-test: require-vmlab
+	./lab/android/run.sh
+
+# Stop the Android lab and the host lighthouse
+[group('lab')]
+android-down: require-vmlab
+	cd lab/android && vmlab down
+	pkill -x ig-lighthouse || true

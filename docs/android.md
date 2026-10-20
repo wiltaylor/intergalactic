@@ -32,8 +32,20 @@ and runs `uniffi-bindgen` to produce `dev.intergalactic.core` Kotlin bindings. B
 its metadata from a host debug build of the same crate, because the stripped Android release
 libraries carry none.
 
-Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assembles. The app
-has not yet been run on a device or emulator.
+Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assembles, and
+`lab/android/run.sh` runs it on an API 35 x86_64 emulator against a lighthouse and a Linux
+node: VPN up, IPv4 and IPv6 traffic both ways, peer DNS inside the VPN.
+
+## Automation
+
+The activity accepts an invite as an intent extra and can connect at once:
+
+```sh
+adb shell am start -n dev.intergalactic.app/.MainActivity --es invite "ig1:..." --ez connect true
+```
+
+The VPN consent dialog still appears the first time; `lab/android/run.sh` accepts it with
+uiautomator.
 
 The Gradle wrapper jar is not committed. Run `gradle wrapper` once, or open the project in
 Android Studio, which generates it.

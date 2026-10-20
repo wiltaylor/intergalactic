@@ -25,6 +25,25 @@ enum Cmd {
     Peers,
     /// List joined networks only.
     Networks,
+    /// Inspect or rewrite invite strings (no daemon needed).
+    Invite {
+        #[command(subcommand)]
+        cmd: InviteCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum InviteCmd {
+    /// Show what an invite contains.
+    Show { invite: String },
+    /// Print the same invite with a different lighthouse host (and optional port),
+    /// for a lighthouse that is reachable under another name from where you are.
+    Rehost {
+        invite: String,
+        host: String,
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[tokio::main]
@@ -67,6 +86,24 @@ async fn main() -> anyhow::Result<()> {
             print_networks(&st);
             Ok(())
         }
+        Cmd::Invite { cmd } => match cmd {
+            InviteCmd::Show { invite } => {
+                let inv: ig_proto::Invite = invite.parse()?;
+                println!("lighthouse {}:{}", inv.host, inv.port);
+                println!("key        {}", inv.lighthouse);
+                println!("network    {} ({})", inv.network_name, inv.network);
+                Ok(())
+            }
+            InviteCmd::Rehost { invite, host, port } => {
+                let mut inv: ig_proto::Invite = invite.parse()?;
+                inv.host = host;
+                if let Some(p) = port {
+                    inv.port = p;
+                }
+                println!("{}", inv.encode());
+                Ok(())
+            }
+        },
     }
 }
 

@@ -1,5 +1,5 @@
 bin/
-nat/scripts/nat.ws
-.lh/
-.lh.sock
 .vmlab/
+android/invite.txt
+android/.lh/
+android/.lh.sock

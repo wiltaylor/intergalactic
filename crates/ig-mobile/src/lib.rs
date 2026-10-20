@@ -213,6 +213,9 @@ impl MobileEngine {
     /// Attach the `VpnService` TUN file descriptor. The engine takes ownership
     /// of a duplicate; the app may close its own copy.
     pub fn attach_tun(&self, fd: i32) -> Result<(), MobileError> {
+        // Called from the Android main thread: enter the runtime so the engine
+        // can spawn its reader task and register the fd with tokio.
+        let _guard = self.rt.enter();
         let dev = tun::FdTun::from_fd(fd).map_err(err)?;
         self.engine
             .attach_tun(TunScope::All, Arc::new(dev))
@@ -220,12 +223,14 @@ impl MobileEngine {
     }
 
     pub fn detach_tun(&self) {
+        let _guard = self.rt.enter();
         self.engine.detach_tun(TunScope::All);
     }
 
     /// Call when connectivity changes (Wi-Fi to cellular) so lighthouses learn
     /// the new addresses quickly.
     pub fn network_changed(&self) {
+        let _guard = self.rt.enter();
         self.engine.refresh_endpoints();
     }
 

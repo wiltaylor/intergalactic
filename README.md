@@ -95,11 +95,12 @@ See `docs/architecture.md` for the full design. In short:
 
 `cargo test` covers the protocol and the engine with in-memory TUN devices over loopback.
 `lab/` holds vmlab labs that run the real binaries on QEMU/KVM guests: Ubuntu and Windows
-Server nodes with real TUN/Wintun devices, the OS resolvers, the Windows service, and two
-nodes behind separate NATs. See `lab/README.md` for what each lab checks and the results.
+Server nodes with real TUN/Wintun devices, the OS resolvers, the Windows service, hole
+punching through two netfilter NATs, and the Android app on an emulator. See
+`lab/README.md` for what each lab checks and the results.
 
 ## Status and limits
 
-- The Android APK builds (see `docs/android.md`) but has not been run on a device or emulator yet.
+- The Android app has been verified on an emulator (see `lab/README.md`), not yet on a physical phone.
 - The lighthouse itself must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
 - Hostnames that collide inside one network get a numeric suffix (`laptop`, `laptop-2`).

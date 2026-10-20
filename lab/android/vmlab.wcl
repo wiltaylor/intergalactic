@@ -1,0 +1,19 @@
+// Android lab: one Linux node on a NAT'd segment. The lighthouse runs on the
+// host (run.sh) so that both this node and an Android emulator reach it.
+import <vmlab.wcl>
+
+lab "ig-android" {
+
+  segment "lan" {
+    subnet = "10.83.0.0/24"
+    nat    = true
+  }
+
+  vm "alpha" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "lan" ip = "10.83.0.11" }
+  }
+}

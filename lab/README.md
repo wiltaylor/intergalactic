@@ -43,24 +43,52 @@ and IPv6; NRPT rules exist and `Resolve-DnsName` answers; the Linux peer reaches
 by address and by name (the daemon adds a firewall rule for its interface); `service
 stop` then `service start`; the restarted node is reachable again within a second.
 
-## nat: two nodes behind two NATs
+## nat: two nodes behind two real NATs
 
-`lab/nat`: `alpha` and `bravo` each on their own NAT'd segment, with the lighthouse on
-the host so both reach it the way they would reach a VPS.
+`lab/nat`: a lighthouse VM on a `wan` segment, two Ubuntu router VMs (`rta`, `rtb`) that
+masquerade between their LAN and the WAN with nftables and drop unsolicited WAN input,
+and one node behind each router.
 
 ```sh
-./lab/nat/run.sh                  # starts the host lighthouse, brings the lab up, runs scripts/nat.ws
+cd lab/nat
+vmlab up
+vmlab script scripts/nat.ws
+vmlab down
 ```
 
-The vmlab NAT is not full-cone, so this lab does not produce a direct path; it shows both
-nodes falling back to the relay and exchanging IPv4 traffic, HTTP and DNS through it, then
-repeats the exchange with `--relay-only`. Direct paths across NATs are exercised by the
-`flat` lab (same segment) and by the loopback tests in `crates/ig-tests`.
+Phase 1 proves hole punching: both nodes reach each other and `ig peers` shows `direct`
+with the other router's WAN address and NAT-assigned port as the endpoint. Phase 2 restarts
+both nodes with `--relay-only` and checks traffic still flows through the lighthouse. Phase
+3 removes the flag and checks the direct path comes back.
+
+Finding: with a router that accepts unsolicited WAN packets into its own input path (no
+firewall), the early punch from one side confirms a stray conntrack entry that occupies the
+other side's port mapping, and the punch from that side leaves on a different port. Real
+home routers drop such packets before conntrack confirms them, which is what `router.sh`
+does, and then both NATs keep the port and the punch succeeds.
+
+## android: the app on an emulator
+
+`lab/android`: one Linux node on a NAT'd segment plus the Android app on an x86_64 emulator.
+The lighthouse runs on the host; the node reaches it through the vmlab NAT and the emulator
+reaches it as `10.0.2.2`.
+
+```sh
+export ANDROID_HOME=...   # with emulator, platform-tools and an AVD named "ig" (API 35, x86_64)
+cargo build --release -p ig-lighthouse -p ig-cli
+./lab/android/run.sh
+```
+
+The script installs the debug APK, launches the activity with the invite as an intent
+extra (`--es invite ... --ez connect true`), accepts the VPN consent dialog, and then checks:
+`tun0` carries both addresses; ping from the emulator to the node over IPv4 and IPv6; the
+node's name resolves through the VPN's DNS server; the node pings the emulator and resolves
+its name; the lighthouse lists both members.
 
 ## Results on 2026-10-20
 
-All three scripts pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
-Windows Server 2025 templates). Bugs found and fixed by these labs:
+All four scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
+Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by these labs:
 
 - The Windows service did not exit on stop: the tokio runtime waited forever during
   teardown. Shutdown is now bounded, the service reports StopPending, and a watchdog exits
@@ -74,3 +102,6 @@ Windows Server 2025 templates). Bugs found and fixed by these labs:
   new endpoints.
 - Two networks with the same name (for example after a lighthouse was re-keyed) collided
   on the interface name. Names now get a numeric suffix when taken.
+- On Android, `attachTun` was called from the main thread outside the tokio runtime and
+  the app crashed when the VPN came up. The mobile bindings now enter the runtime for
+  every call that touches the engine.
