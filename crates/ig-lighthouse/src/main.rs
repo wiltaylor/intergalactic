@@ -9,11 +9,18 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ig-lighthouse", version, about = "Intergalactic lighthouse: coordination, NAT traversal and relay")]
+#[command(
+    name = "ig-lighthouse",
+    version,
+    about = "Intergalactic lighthouse: coordination, NAT traversal and relay"
+)]
 struct Cli {
     /// Directory holding the key, state and admin socket.
     #[arg(long, env = "IG_LIGHTHOUSE_STATE", default_value = default_state_dir())]
     state_dir: PathBuf,
+    /// Admin socket path (defaults to `<state-dir>/admin.sock`).
+    #[arg(long, env = "IG_LIGHTHOUSE_ADMIN_SOCKET")]
+    admin_socket: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -62,9 +69,14 @@ enum Cmd {
 #[derive(Subcommand)]
 enum NetworkCmd {
     /// Create a network, e.g. `network create dev 10.90.0.0/24`.
-    Create { name: String, cidr: Ipv4Net },
+    Create {
+        name: String,
+        cidr: Ipv4Net,
+    },
     List,
-    Delete { network: String },
+    Delete {
+        network: String,
+    },
     /// Set the inbound policy. Without --allow the network allows everything.
     Policy {
         network: String,
@@ -88,8 +100,13 @@ enum InviteCmd {
         #[arg(long, default_value = "")]
         label: String,
     },
-    List { network: String },
-    Revoke { network: String, invite_id: String },
+    List {
+        network: String,
+    },
+    Revoke {
+        network: String,
+        invite_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -103,13 +120,22 @@ enum NodeCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let cli = Cli::parse();
-    let admin_sock = cli.state_dir.join("admin.sock");
+    let admin_sock = cli
+        .admin_socket
+        .clone()
+        .unwrap_or_else(|| cli.state_dir.join("admin.sock"));
 
     match cli.cmd {
-        Cmd::Serve { listen, public_host, public_port } => {
+        Cmd::Serve {
+            listen,
+            public_host,
+            public_port,
+        } => {
             std::fs::create_dir_all(&cli.state_dir)
                 .with_context(|| format!("creating {}", cli.state_dir.display()))?;
             let keypair = load_or_create_key(&cli.state_dir.join("lighthouse.key"))?;
@@ -136,7 +162,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("invite host  {}:{}", i.public_host, i.port);
                 println!("networks     {}", i.networks);
                 println!("nodes online {}", i.nodes_online);
-                println!("uptime       {}", humantime::format_duration(std::time::Duration::from_secs(i.uptime_secs)));
+                println!(
+                    "uptime       {}",
+                    humantime::format_duration(std::time::Duration::from_secs(i.uptime_secs))
+                );
                 Ok(())
             } else {
                 fail(r)
@@ -144,26 +173,45 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Create { name, cidr } => {
-                let r = admin_socket::request(&admin_sock, &AdminRequest::NetworkCreate { name, cidr }).await?;
+                let r =
+                    admin_socket::request(&admin_sock, &AdminRequest::NetworkCreate { name, cidr })
+                        .await?;
                 print_networks(r)
             }
             NetworkCmd::List => {
                 let r = admin_socket::request(&admin_sock, &AdminRequest::NetworkList).await?;
                 print_networks(r)
             }
-            NetworkCmd::Delete { network } => {
-                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NetworkDelete { network }).await?)
-            }
+            NetworkCmd::Delete { network } => expect_ok(
+                admin_socket::request(&admin_sock, &AdminRequest::NetworkDelete { network })
+                    .await?,
+            ),
             NetworkCmd::Policy { network, allow } => {
                 let policy = Policy { rules: allow };
-                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NetworkSetPolicy { network, policy }).await?)
+                expect_ok(
+                    admin_socket::request(
+                        &admin_sock,
+                        &AdminRequest::NetworkSetPolicy { network, policy },
+                    )
+                    .await?,
+                )
             }
         },
         Cmd::Invite { cmd } => match cmd {
-            InviteCmd::Create { network, uses, ttl, label } => {
+            InviteCmd::Create {
+                network,
+                uses,
+                ttl,
+                label,
+            } => {
                 let r = admin_socket::request(
                     &admin_sock,
-                    &AdminRequest::InviteCreate { network, uses, ttl_secs: ttl.as_secs(), label },
+                    &AdminRequest::InviteCreate {
+                        network,
+                        uses,
+                        ttl_secs: ttl.as_secs(),
+                        label,
+                    },
                 )
                 .await?;
                 match r {
@@ -176,7 +224,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             InviteCmd::List { network } => {
-                let r = admin_socket::request(&admin_sock, &AdminRequest::InviteList { network }).await?;
+                let r = admin_socket::request(&admin_sock, &AdminRequest::InviteList { network })
+                    .await?;
                 match r {
                     AdminResponse::Invites(list) => {
                         println!("{:<10} {:<8} {:<20} LABEL", "ID", "USES", "EXPIRES");
@@ -187,7 +236,12 @@ async fn main() -> anyhow::Result<()> {
                                 "{:<10} {:<8} {:<20} {}",
                                 i.id,
                                 i.uses_left,
-                                format!("in {}", humantime::format_duration(std::time::Duration::from_secs(left))),
+                                format!(
+                                    "in {}",
+                                    humantime::format_duration(std::time::Duration::from_secs(
+                                        left
+                                    ))
+                                ),
                                 i.label
                             );
                         }
@@ -196,26 +250,40 @@ async fn main() -> anyhow::Result<()> {
                     other => fail(other),
                 }
             }
-            InviteCmd::Revoke { network, invite_id } => {
-                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::InviteRevoke { network, invite_id }).await?)
-            }
+            InviteCmd::Revoke { network, invite_id } => expect_ok(
+                admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::InviteRevoke { network, invite_id },
+                )
+                .await?,
+            ),
         },
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List { network } => {
-                let r = admin_socket::request(&admin_sock, &AdminRequest::NodeList { network }).await?;
+                let r =
+                    admin_socket::request(&admin_sock, &AdminRequest::NodeList { network }).await?;
                 match r {
                     AdminResponse::Nodes(nodes) => {
-                        println!("{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} ENDPOINTS", "NODE", "HOSTNAME", "OS", "ADDRESS", "NETWORK", "STATE");
+                        println!(
+                            "{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} ENDPOINTS",
+                            "NODE", "HOSTNAME", "OS", "ADDRESS", "NETWORK", "STATE"
+                        );
                         for n in nodes {
                             let state = if n.online {
                                 "online".to_string()
                             } else {
                                 match n.last_seen_secs_ago {
-                                    Some(s) => format!("{}ago", humantime::format_duration(std::time::Duration::from_secs(s.min(86400 * 365)))),
+                                    Some(s) => format!(
+                                        "{}ago",
+                                        humantime::format_duration(std::time::Duration::from_secs(
+                                            s.min(86400 * 365)
+                                        ))
+                                    ),
                                     None => "never".into(),
                                 }
                             };
-                            let eps: Vec<String> = n.endpoints.iter().map(|e| e.to_string()).collect();
+                            let eps: Vec<String> =
+                                n.endpoints.iter().map(|e| e.to_string()).collect();
                             println!(
                                 "{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} {}",
                                 n.node.short(),
@@ -232,9 +300,10 @@ async fn main() -> anyhow::Result<()> {
                     other => fail(other),
                 }
             }
-            NodeCmd::Remove { network, node } => {
-                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NodeRemove { network, node }).await?)
-            }
+            NodeCmd::Remove { network, node } => expect_ok(
+                admin_socket::request(&admin_sock, &AdminRequest::NodeRemove { network, node })
+                    .await?,
+            ),
         },
     }
 }
@@ -242,7 +311,8 @@ async fn main() -> anyhow::Result<()> {
 fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<Keypair> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let key: PrivateKey = serde_json::from_slice(&bytes).context("parsing lighthouse.key")?;
+            let key: PrivateKey =
+                serde_json::from_slice(&bytes).context("parsing lighthouse.key")?;
             Ok(Keypair::from_private(key))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -263,14 +333,30 @@ fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<Keypair> {
 fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
     match r {
         AdminResponse::Networks(list) => {
-            println!("{:<16} {:<16} {:<18} {:<8} {:<7} POLICY", "ID", "NAME", "CIDR", "MEMBERS", "ONLINE");
+            println!(
+                "{:<16} {:<16} {:<18} {:<8} {:<7} POLICY",
+                "ID", "NAME", "CIDR", "MEMBERS", "ONLINE"
+            );
             for n in list {
                 let policy = if n.policy.is_allow_all() {
                     "allow all".to_string()
                 } else {
-                    n.policy.rules.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ")
+                    n.policy
+                        .rules
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 };
-                println!("{:<16} {:<16} {:<18} {:<8} {:<7} {}", n.id, truncate(&n.name, 16), n.cidr, n.members, n.online, policy);
+                println!(
+                    "{:<16} {:<16} {:<18} {:<8} {:<7} {}",
+                    n.id.to_string(),
+                    truncate(&n.name, 16),
+                    n.cidr.to_string(),
+                    n.members,
+                    n.online,
+                    policy
+                );
             }
             Ok(())
         }

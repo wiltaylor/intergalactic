@@ -68,7 +68,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
         let reply: R = postcard::from_bytes(&buf[..n])?;
         let transport = hs.into_transport_mode()?;
         Ok((
-            NoiseStream { io, transport, remote: *remote_public, scratch: buf },
+            NoiseStream {
+                io,
+                transport,
+                remote: *remote_public,
+                scratch: buf,
+            },
             reply,
         ))
     }
@@ -101,7 +106,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
         let n = hs.write_message(&payload, &mut buf)?;
         write_frame(&mut io, &buf[..n]).await?;
         let transport = hs.into_transport_mode()?;
-        Ok((NoiseStream { io, transport, remote, scratch: buf }, hello))
+        Ok((
+            NoiseStream {
+                io,
+                transport,
+                remote,
+                scratch: buf,
+            },
+            hello,
+        ))
     }
 
     pub fn remote(&self) -> NodeId {
@@ -118,7 +131,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
             return Err(NoiseError::TooLarge(plain.len()));
         }
         // Build the whole wire image first so one message is one write.
-        let mut wire = Vec::with_capacity(4 + plain.len() + 2 * (plain.len() / MAX_PLAINTEXT + 1) * (TAG_LEN + 2));
+        let mut wire = Vec::with_capacity(
+            4 + plain.len() + 2 * (plain.len() / MAX_PLAINTEXT + 1) * (TAG_LEN + 2),
+        );
         wire.extend_from_slice(&(plain.len() as u32).to_be_bytes());
         let mut chunks = plain.chunks(MAX_PLAINTEXT).peekable();
         if chunks.peek().is_none() {
@@ -173,8 +188,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NoiseStream<S> {
         let (rd, wr) = self.io.split_io();
         let (send_state, recv_state) = DirectionalState::split(self.transport);
         (
-            NoiseSender { io: wr, state: send_state, scratch: vec![0u8; MAX_FRAME], remote: self.remote },
-            NoiseReceiver { io: rd, state: recv_state, scratch: vec![0u8; MAX_FRAME], remote: self.remote },
+            NoiseSender {
+                io: wr,
+                state: send_state,
+                scratch: vec![0u8; MAX_FRAME],
+                remote: self.remote,
+            },
+            NoiseReceiver {
+                io: rd,
+                state: recv_state,
+                scratch: vec![0u8; MAX_FRAME],
+                remote: self.remote,
+            },
         )
     }
 }

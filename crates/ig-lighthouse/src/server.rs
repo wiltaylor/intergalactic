@@ -1,8 +1,12 @@
 //! Lighthouse runtime: control sessions, UDP disco/relay, broadcasts and admin.
 
 use crate::store::{now_secs, InviteRecord, Store, StoreError};
-use ig_proto::admin::{AdminRequest, AdminResponse, InviteSummary, LighthouseInfo, NetworkSummary, NodeSummary};
-use ig_proto::control::{ClientHello, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse};
+use ig_proto::admin::{
+    AdminRequest, AdminResponse, InviteSummary, LighthouseInfo, NetworkSummary, NodeSummary,
+};
+use ig_proto::control::{
+    ClientHello, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
+};
 use ig_proto::noise::NoiseStream;
 use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, PROTOCOL_VERSION};
 use parking_lot::{Mutex, RwLock};
@@ -109,7 +113,13 @@ impl Lighthouse {
         for t in self.inner.tasks.lock().drain(..) {
             t.abort();
         }
-        let sessions: Vec<_> = self.inner.sessions.write().drain().map(|(_, s)| s).collect();
+        let sessions: Vec<_> = self
+            .inner
+            .sessions
+            .write()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for s in sessions {
             s.abort.notify_one();
         }
@@ -154,7 +164,12 @@ impl Inner {
     }
 
     /// Build the NetworkState for one member. Excludes the member itself.
-    fn network_state_for(&self, store: &Store, network: NetworkId, me: &NodeId) -> Option<FromLighthouse> {
+    fn network_state_for(
+        &self,
+        store: &Store,
+        network: NetworkId,
+        me: &NodeId,
+    ) -> Option<FromLighthouse> {
         let net = store.networks.get(&network)?;
         let my_addr = net.members.get(me)?.address;
         let sessions = self.sessions.read();
@@ -164,7 +179,11 @@ impl Inner {
             .filter(|(id, _)| *id != me)
             .map(|(id, m)| PeerInfo {
                 node: *id,
-                hostname: store.nodes.get(id).map(|n| n.hostname.clone()).unwrap_or_default(),
+                hostname: store
+                    .nodes
+                    .get(id)
+                    .map(|n| n.hostname.clone())
+                    .unwrap_or_default(),
                 address: m.address,
                 endpoints: self.endpoints_of(id),
                 online: sessions.contains_key(id),
@@ -184,7 +203,9 @@ impl Inner {
 
     fn broadcast(&self, network: NetworkId) {
         let store = self.store.lock();
-        let Some(net) = store.networks.get(&network) else { return };
+        let Some(net) = store.networks.get(&network) else {
+            return;
+        };
         let members: Vec<NodeId> = net.members.keys().copied().collect();
         let sessions = self.sessions.read();
         for m in members {
@@ -213,18 +234,25 @@ impl Inner {
                     if r.is_ok() {
                         self.persist(&store);
                     }
-                    r.map(|_| ())
-                        .and_then(|_| self.network_info_for(&store, network, &node).ok_or(StoreError::NotMember))
+                    r.map(|_| ()).and_then(|_| {
+                        self.network_info_for(&store, network, &node)
+                            .ok_or(StoreError::NotMember)
+                    })
                 };
                 match result {
                     Ok(info) => {
                         tracing::info!(node = %node.short(), network = %info.name, address = %info.address, "node joined");
-                        let _ = session.tx.try_send(FromLighthouse::Joined { network: info });
+                        let _ = session
+                            .tx
+                            .try_send(FromLighthouse::Joined { network: info });
                         self.mark_dirty([network]);
                     }
                     Err(e) => {
                         tracing::info!(node = %node.short(), %network, error = %e, "join refused");
-                        let _ = session.tx.try_send(FromLighthouse::JoinFailed { network, reason: e.to_string() });
+                        let _ = session.tx.try_send(FromLighthouse::JoinFailed {
+                            network,
+                            reason: e.to_string(),
+                        });
                     }
                 }
             }
@@ -247,7 +275,8 @@ impl Inner {
                 }
             }
             ToLighthouse::Endpoints { local } => {
-                let mut local: Vec<SocketAddr> = local.into_iter().filter(|a| a.is_ipv4()).take(8).collect();
+                let mut local: Vec<SocketAddr> =
+                    local.into_iter().filter(|a| a.is_ipv4()).take(8).collect();
                 local.dedup();
                 let changed = *session.local_endpoints.read() != local;
                 if changed {
@@ -258,14 +287,20 @@ impl Inner {
             ToLighthouse::Punch { network, target } => {
                 let ok = {
                     let store = self.store.lock();
-                    store
-                        .networks
-                        .get(&network)
-                        .is_some_and(|n| n.members.contains_key(&node) && n.members.contains_key(&target))
+                    store.networks.get(&network).is_some_and(|n| {
+                        n.members.contains_key(&node) && n.members.contains_key(&target)
+                    })
                 };
                 if ok {
                     let endpoints = self.endpoints_of(&node);
-                    self.send_to(&target, FromLighthouse::PunchRequest { network, from: node, endpoints });
+                    self.send_to(
+                        &target,
+                        FromLighthouse::PunchRequest {
+                            network,
+                            from: node,
+                            endpoints,
+                        },
+                    );
                 }
             }
             ToLighthouse::Ping { nonce } => {
@@ -274,19 +309,34 @@ impl Inner {
         }
     }
 
-    fn network_info_for(&self, store: &Store, network: NetworkId, node: &NodeId) -> Option<NetworkInfo> {
+    fn network_info_for(
+        &self,
+        store: &Store,
+        network: NetworkId,
+        node: &NodeId,
+    ) -> Option<NetworkInfo> {
         let net = store.networks.get(&network)?;
         let m = net.members.get(node)?;
-        Some(NetworkInfo { id: net.id, name: net.name.clone(), cidr: net.cidr, address: m.address, policy: net.policy.clone() })
+        Some(NetworkInfo {
+            id: net.id,
+            name: net.name.clone(),
+            cidr: net.cidr,
+            address: m.address,
+            policy: net.policy.clone(),
+        })
     }
 
     // ---- udp ------------------------------------------------------------------
 
     fn handle_udp(&self, data: &[u8], from: SocketAddr) {
-        let Some(frame) = disco::decode(data) else { return };
+        let Some(frame) = disco::decode(data) else {
+            return;
+        };
         match frame {
             disco::Disco::Probe { node, ts } => {
-                let Some(session) = self.sessions.read().get(&node).cloned() else { return };
+                let Some(session) = self.sessions.read().get(&node).cloned() else {
+                    return;
+                };
                 if !disco::verify_mac(data, &session.token) {
                     tracing::debug!(%from, node = %node.short(), "probe with bad mac");
                     return;
@@ -337,7 +387,9 @@ impl Inner {
     fn admin(&self, req: AdminRequest) -> AdminResponse {
         match self.admin_inner(req) {
             Ok(r) => r,
-            Err(e) => AdminResponse::Error { message: e.to_string() },
+            Err(e) => AdminResponse::Error {
+                message: e.to_string(),
+            },
         }
     }
 
@@ -363,7 +415,9 @@ impl Inner {
             }
             AdminRequest::NetworkList => {
                 let store = self.store.lock();
-                Ok(AdminResponse::Networks(store.networks.values().map(|n| self.summarise(n)).collect()))
+                Ok(AdminResponse::Networks(
+                    store.networks.values().map(|n| self.summarise(n)).collect(),
+                ))
             }
             AdminRequest::NetworkDelete { network } => {
                 let mut store = self.store.lock();
@@ -372,7 +426,13 @@ impl Inner {
                 self.persist(&store);
                 drop(store);
                 for m in net.members.keys() {
-                    self.send_to(m, FromLighthouse::Removed { network: id, reason: "network deleted".into() });
+                    self.send_to(
+                        m,
+                        FromLighthouse::Removed {
+                            network: id,
+                            reason: "network deleted".into(),
+                        },
+                    );
                 }
                 Ok(AdminResponse::Ok)
             }
@@ -385,11 +445,19 @@ impl Inner {
                 self.mark_dirty([id]);
                 Ok(AdminResponse::Ok)
             }
-            AdminRequest::InviteCreate { network, uses, ttl_secs, label } => {
+            AdminRequest::InviteCreate {
+                network,
+                uses,
+                ttl_secs,
+                label,
+            } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
                 let token: [u8; 16] = ig_proto::random_array();
-                let invite_id: String = ig_proto::random_array::<4>().iter().map(|b| format!("{b:02x}")).collect();
+                let invite_id: String = ig_proto::random_array::<4>()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 let net = store.networks.get_mut(&id).expect("resolved");
                 net.invites.push(InviteRecord {
                     id: invite_id.clone(),
@@ -407,7 +475,10 @@ impl Inner {
                     token,
                 };
                 self.persist(&store);
-                Ok(AdminResponse::Invite { invite: invite.encode(), invite_id })
+                Ok(AdminResponse::Invite {
+                    invite: invite.encode(),
+                    invite_id,
+                })
             }
             AdminRequest::InviteList { network } => {
                 let store = self.store.lock();
@@ -461,7 +532,13 @@ impl Inner {
                             address: m.address,
                             online,
                             endpoints: self.endpoints_of(id),
-                            last_seen_secs_ago: if online { Some(0) } else if rec.last_seen > 0 { Some(now.saturating_sub(rec.last_seen)) } else { None },
+                            last_seen_secs_ago: if online {
+                                Some(0)
+                            } else if rec.last_seen > 0 {
+                                Some(now.saturating_sub(rec.last_seen))
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
@@ -473,7 +550,13 @@ impl Inner {
                 store.remove_member(id, &node)?;
                 self.persist(&store);
                 drop(store);
-                self.send_to(&node, FromLighthouse::Removed { network: id, reason: "removed by admin".into() });
+                self.send_to(
+                    &node,
+                    FromLighthouse::Removed {
+                        network: id,
+                        reason: "removed by admin".into(),
+                    },
+                );
                 self.mark_dirty([id]);
                 Ok(AdminResponse::Ok)
             }
@@ -487,7 +570,11 @@ impl Inner {
             name: n.name.clone(),
             cidr: n.cidr,
             members: n.members.len(),
-            online: n.members.keys().filter(|m| sessions.contains_key(m)).count(),
+            online: n
+                .members
+                .keys()
+                .filter(|m| sessions.contains_key(m))
+                .count(),
             policy: n.policy.clone(),
         }
     }
@@ -512,16 +599,22 @@ async fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
     }
 }
 
-async fn handle_connection(inner: Arc<Inner>, stream: TcpStream, from: SocketAddr) -> anyhow::Result<()> {
+async fn handle_connection(
+    inner: Arc<Inner>,
+    stream: TcpStream,
+    from: SocketAddr,
+) -> anyhow::Result<()> {
     let _ = stream.set_nodelay(true);
     let token: [u8; 32] = ig_proto::random_array();
     let priv_key = inner.config.keypair.private.0;
     let (noise, hello): (NoiseStream<TcpStream>, ClientHello) = tokio::time::timeout(
         Duration::from_secs(10),
-        NoiseStream::accept(stream, &priv_key, |_node, _hello: &ClientHello| ServerHello {
-            version: PROTOCOL_VERSION,
-            session_token: token,
-            server_time: now_secs(),
+        NoiseStream::accept(stream, &priv_key, |_node, _hello: &ClientHello| {
+            ServerHello {
+                version: PROTOCOL_VERSION,
+                session_token: token,
+                server_time: now_secs(),
+            }
         }),
     )
     .await
@@ -575,7 +668,10 @@ async fn handle_connection(inner: Arc<Inner>, stream: TcpStream, from: SocketAdd
     writer.abort();
     {
         let mut sessions = inner.sessions.write();
-        if sessions.get(&node).is_some_and(|s| Arc::ptr_eq(s, &session)) {
+        if sessions
+            .get(&node)
+            .is_some_and(|s| Arc::ptr_eq(s, &session))
+        {
             sessions.remove(&node);
         }
     }

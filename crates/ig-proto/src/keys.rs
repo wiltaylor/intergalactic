@@ -26,7 +26,11 @@ impl PrivateKey {
 
 impl std::fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PrivateKey(<redacted>, public={})", self.public().short())
+        write!(
+            f,
+            "PrivateKey(<redacted>, public={})",
+            self.public().short()
+        )
     }
 }
 
@@ -67,10 +71,12 @@ mod b64 {
         if d.is_human_readable() {
             let s = String::deserialize(d)?;
             let v = URL_SAFE_NO_PAD.decode(s).map_err(D::Error::custom)?;
-            v.try_into().map_err(|_| D::Error::custom("key must be 32 bytes"))
+            v.try_into()
+                .map_err(|_| D::Error::custom("key must be 32 bytes"))
         } else {
             let v = <Vec<u8>>::deserialize(d)?;
-            v.try_into().map_err(|_| D::Error::custom("key must be 32 bytes"))
+            v.try_into()
+                .map_err(|_| D::Error::custom("key must be 32 bytes"))
         }
     }
 }

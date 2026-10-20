@@ -65,7 +65,10 @@ pub enum EngineEvent {
     MembershipsChanged(Vec<Membership>),
     /// Peer table changed (informational, for UIs).
     PeersChanged,
-    LighthouseStatus { lighthouse: LighthouseAddr, connected: bool },
+    LighthouseStatus {
+        lighthouse: LighthouseAddr,
+        connected: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,8 +165,17 @@ impl Engine {
         let mut networks = HashMap::new();
         let mut by_lighthouse: HashMap<LighthouseAddr, Vec<NetworkId>> = HashMap::new();
         for m in &config.memberships {
-            by_lighthouse.entry(m.lighthouse.clone()).or_default().push(m.network.id);
-            networks.insert(m.network.id, NetworkEntry { membership: m.clone(), tun: None });
+            by_lighthouse
+                .entry(m.lighthouse.clone())
+                .or_default()
+                .push(m.network.id);
+            networks.insert(
+                m.network.id,
+                NetworkEntry {
+                    membership: m.clone(),
+                    tun: None,
+                },
+            );
         }
 
         let inner = Arc::new(Inner {
@@ -223,7 +235,11 @@ impl Engine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         handle
             .cmd
-            .send(ControlCmd::Join { network: invite.network, token: invite.token, reply: tx })
+            .send(ControlCmd::Join {
+                network: invite.network,
+                token: invite.token,
+                reply: tx,
+            })
             .await
             .map_err(|_| EngineError::Stopped)?;
         match tokio::time::timeout(JOIN_TIMEOUT, rx).await {
@@ -231,7 +247,12 @@ impl Engine {
             Ok(Ok(Err(reason))) => Err(EngineError::JoinRejected(reason)),
             Ok(Err(_)) => Err(EngineError::Stopped),
             Err(_) => {
-                let detail = handle.last_error.lock().clone().map(|e| format!(": {e}")).unwrap_or_default();
+                let detail = handle
+                    .last_error
+                    .lock()
+                    .clone()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default();
                 Err(EngineError::JoinTimeout(detail))
             }
         }
@@ -250,7 +271,11 @@ impl Engine {
         let handle = self.inner.lighthouses.lock().get(&lh).cloned();
         if let Some(h) = &handle {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if h.cmd.send(ControlCmd::Leave { network, reply: tx }).await.is_ok() {
+            if h.cmd
+                .send(ControlCmd::Leave { network, reply: tx })
+                .await
+                .is_ok()
+            {
                 let _ = tokio::time::timeout(LEAVE_TIMEOUT, rx).await;
             }
         }
@@ -304,17 +329,28 @@ impl Engine {
     }
 
     pub async fn shutdown(&self) {
-        let handles: Vec<_> = self.inner.lighthouses.lock().drain().map(|(_, h)| h).collect();
+        let handles: Vec<_> = self
+            .inner
+            .lighthouses
+            .lock()
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
         for h in handles {
             let _ = h.cmd.send(ControlCmd::Shutdown).await;
-            if let Some(t) = h.task.lock().take() {
+            let task = h.task.lock().take();
+            if let Some(t) = task {
                 let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
             }
         }
         for t in self.inner.tasks.lock().drain(..) {
             t.abort();
         }
-        self.inner.networks.write().values_mut().for_each(|e| e.tun = None);
+        self.inner
+            .networks
+            .write()
+            .values_mut()
+            .for_each(|e| e.tun = None);
         *self.inner.catch_all.write() = None;
     }
 }
@@ -378,17 +414,29 @@ impl Inner {
     }
 
     pub fn memberships(&self) -> Vec<Membership> {
-        let mut v: Vec<Membership> = self.networks.read().values().map(|e| e.membership.clone()).collect();
+        let mut v: Vec<Membership> = self
+            .networks
+            .read()
+            .values()
+            .map(|e| e.membership.clone())
+            .collect();
         v.sort_by(|a, b| a.network.name.cmp(&b.network.name));
         v
     }
 
     pub fn has_memberships_with(&self, lh: &LighthouseAddr) -> bool {
-        self.networks.read().values().any(|e| e.membership.lighthouse == *lh)
+        self.networks
+            .read()
+            .values()
+            .any(|e| e.membership.lighthouse == *lh)
     }
 
     fn overlay_cidrs(&self) -> Vec<Ipv4Net> {
-        self.networks.read().values().map(|e| e.membership.network.cidr).collect()
+        self.networks
+            .read()
+            .values()
+            .map(|e| e.membership.network.cidr)
+            .collect()
     }
 
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
@@ -410,7 +458,9 @@ impl Inner {
             let mut nets = self.networks.write();
             for other in nets.values() {
                 let c = other.membership.network.cidr;
-                if other.membership.network.id != info.id && (c.contains(&info.cidr) || info.cidr.contains(&c)) {
+                if other.membership.network.id != info.id
+                    && (c.contains(&info.cidr) || info.cidr.contains(&c))
+                {
                     tracing::warn!(
                         new = %info.name, existing = %other.membership.network.name,
                         "network CIDRs overlap; routing between them is ambiguous"
@@ -419,7 +469,13 @@ impl Inner {
             }
             nets.insert(
                 info.id,
-                NetworkEntry { membership: Membership { lighthouse: lh.clone(), network: info.clone() }, tun: None },
+                NetworkEntry {
+                    membership: Membership {
+                        lighthouse: lh.clone(),
+                        network: info.clone(),
+                    },
+                    tun: None,
+                },
             );
         }
         tracing::info!(network = %info.name, address = %info.address, "joined network");
@@ -453,7 +509,12 @@ impl Inner {
     }
 
     /// Full state of one network as pushed by its lighthouse.
-    pub fn network_state(&self, h: &Arc<LighthouseHandle>, info: NetworkInfo, peers: Vec<PeerInfo>) {
+    pub fn network_state(
+        &self,
+        h: &Arc<LighthouseHandle>,
+        info: NetworkInfo,
+        peers: Vec<PeerInfo>,
+    ) {
         let mut membership_changed = false;
         {
             let mut nets = self.networks.write();
@@ -469,7 +530,10 @@ impl Inner {
                     nets.insert(
                         info.id,
                         NetworkEntry {
-                            membership: Membership { lighthouse: h.addr.clone(), network: info.clone() },
+                            membership: Membership {
+                                lighthouse: h.addr.clone(),
+                                network: info.clone(),
+                            },
                             tun: None,
                         },
                     );
@@ -580,7 +644,9 @@ impl Inner {
         if self.relay_only {
             return;
         }
-        let Some(arc) = self.peers.read().by_id.get(from).cloned() else { return };
+        let Some(arc) = self.peers.read().by_id.get(from).cloned() else {
+            return;
+        };
         let mut p = arc.lock();
         p.merge_candidates(endpoints);
         let mut out = vec![0u8; OUT_BUF];
@@ -619,7 +685,10 @@ impl Inner {
                 self.udp_send(b, *c);
             }
             if let (Some(rp), Some(net)) = (&p.relay, p.relay_network) {
-                let _ = rp.cmd.try_send(ControlCmd::Punch { network: net, target: p.id });
+                let _ = rp.cmd.try_send(ControlCmd::Punch {
+                    network: net,
+                    target: p.id,
+                });
             }
         }
     }
@@ -635,8 +704,12 @@ impl Inner {
     }
 
     fn handle_tun_packet(&self, pkt: &[u8], out: &mut [u8]) {
-        let Some(dst) = packet::ipv4_dst(pkt) else { return };
-        let Some(src) = packet::ipv4_src(pkt) else { return };
+        let Some(dst) = packet::ipv4_dst(pkt) else {
+            return;
+        };
+        let Some(src) = packet::ipv4_src(pkt) else {
+            return;
+        };
         let arc = {
             let t = self.peers.read();
             match t.by_addr.get(&dst).and_then(|id| t.by_id.get(id)) {
@@ -648,8 +721,19 @@ impl Inner {
             }
         };
         let mut p = arc.lock();
-        let Some(net) = p.addresses.iter().find(|(_, a)| **a == dst).map(|(n, _)| *n) else { return };
-        let src_ok = self.networks.read().get(&net).is_some_and(|e| e.membership.network.address == src);
+        let Some(net) = p
+            .addresses
+            .iter()
+            .find(|(_, a)| **a == dst)
+            .map(|(n, _)| *n)
+        else {
+            return;
+        };
+        let src_ok = self
+            .networks
+            .read()
+            .get(&net)
+            .is_some_and(|e| e.membership.network.address == src);
         if !src_ok {
             tracing::trace!(%src, %dst, "source address does not belong to the destination's network");
             return;
@@ -671,7 +755,10 @@ impl Inner {
             match disco::decode(data) {
                 Some(disco::Disco::ProbeReply { observed, .. }) => {
                     if let Some(h) = self.is_lighthouse_udp(from) {
-                        let ok = h.session_token.read().is_some_and(|t| disco::verify_mac(data, &t));
+                        let ok = h
+                            .session_token
+                            .read()
+                            .is_some_and(|t| disco::verify_mac(data, &t));
                         if ok {
                             let changed = *h.reflexive.read() != Some(observed);
                             *h.reflexive.write() = Some(observed);
@@ -681,10 +768,10 @@ impl Inner {
                         }
                     }
                 }
-                Some(disco::Disco::Relayed { payload, .. }) => {
-                    if self.is_lighthouse_udp(from).is_some() {
-                        self.handle_wireguard(payload, from, true, out);
-                    }
+                Some(disco::Disco::Relayed { payload, .. })
+                    if self.is_lighthouse_udp(from).is_some() =>
+                {
+                    self.handle_wireguard(payload, from, true, out);
                 }
                 _ => {}
             }
@@ -694,7 +781,9 @@ impl Inner {
     }
 
     fn handle_wireguard(&self, data: &[u8], from: SocketAddr, via_relay: bool, out: &mut [u8]) {
-        let Ok(parsed) = Tunn::parse_incoming_packet(data) else { return };
+        let Ok(parsed) = Tunn::parse_incoming_packet(data) else {
+            return;
+        };
         let mut is_cookie = false;
         let peer_id = match &parsed {
             Packet::HandshakeInit(p) => match parse_handshake_anon(&self.secret, &self.public, p) {
@@ -704,10 +793,12 @@ impl Inner {
                     return;
                 }
             },
-            Packet::HandshakeResponse(p) => match self.peers.read().by_index.get(&(p.receiver_idx >> 8)) {
-                Some(id) => *id,
-                None => return,
-            },
+            Packet::HandshakeResponse(p) => {
+                match self.peers.read().by_index.get(&(p.receiver_idx >> 8)) {
+                    Some(id) => *id,
+                    None => return,
+                }
+            }
             Packet::PacketCookieReply(p) => {
                 is_cookie = true;
                 match self.peers.read().by_index.get(&(p.receiver_idx >> 8)) {
@@ -737,14 +828,9 @@ impl Inner {
                 }
                 self.reply(&mut p, &b, from, via_relay);
                 // Flush packets queued while the handshake was in flight.
-                loop {
-                    match p.tunn.decapsulate(None, &[], out) {
-                        TunnResult::WriteToNetwork(b) => {
-                            let b = b.to_vec();
-                            self.reply(&mut p, &b, from, via_relay);
-                        }
-                        _ => break,
-                    }
+                while let TunnResult::WriteToNetwork(b) = p.tunn.decapsulate(None, &[], out) {
+                    let b = b.to_vec();
+                    self.reply(&mut p, &b, from, via_relay);
                 }
             }
             TunnResult::WriteToTunnelV4(b, src) => {
@@ -776,18 +862,30 @@ impl Inner {
 
     /// Validate a decrypted packet and hand it to the right TUN.
     fn deliver(&self, p: &mut Peer, src: Ipv4Addr, pkt: &[u8]) -> bool {
-        let Some(net) = p.addresses.iter().find(|(_, a)| **a == src).map(|(n, _)| *n) else {
+        let Some(net) = p
+            .addresses
+            .iter()
+            .find(|(_, a)| **a == src)
+            .map(|(n, _)| *n)
+        else {
             tracing::trace!(peer = %p.id.short(), %src, "source not in peer's allowed addresses");
             return false;
         };
-        let Some(dst) = packet::ipv4_dst(pkt) else { return false };
+        let Some(dst) = packet::ipv4_dst(pkt) else {
+            return false;
+        };
         let nets = self.networks.read();
-        let Some(entry) = nets.get(&net) else { return false };
+        let Some(entry) = nets.get(&net) else {
+            return false;
+        };
         if entry.membership.network.address != dst {
             tracing::trace!(%dst, network = %entry.membership.network.name, "packet not addressed to us in this network");
             return false;
         }
-        if !p.filter.allow_inbound(&entry.membership.network.policy, pkt) {
+        if !p
+            .filter
+            .allow_inbound(&entry.membership.network.policy, pkt)
+        {
             tracing::debug!(peer = %p.hostname, network = %entry.membership.network.name, "dropped by policy");
             return false;
         }
@@ -816,10 +914,8 @@ impl Inner {
                     let b = b.to_vec();
                     self.transmit(&mut p, &b);
                 }
-                TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                    if p.direct.take().is_some() {
-                        tracing::debug!(peer = %p.hostname, "session expired, forgetting direct path");
-                    }
+                TunnResult::Err(WireGuardError::ConnectionExpired) if p.direct.take().is_some() => {
+                    tracing::debug!(peer = %p.hostname, "session expired, forgetting direct path");
                 }
                 _ => {}
             }
@@ -827,8 +923,15 @@ impl Inner {
                 tracing::info!(peer = %p.hostname, "direct path went quiet, falling back to relay");
             }
             // While relayed with recent traffic, keep trying for a direct path.
-            let active = p.last_tx.is_some_and(|t| now.duration_since(t) < Duration::from_secs(60));
-            if !self.relay_only && p.direct.is_none() && active && !p.candidates.is_empty() && p.may_punch(now) {
+            let active = p
+                .last_tx
+                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(60));
+            if !self.relay_only
+                && p.direct.is_none()
+                && active
+                && !p.candidates.is_empty()
+                && p.may_punch(now)
+            {
                 if let TunnResult::WriteToNetwork(b) = p.tunn.encapsulate(&[], out) {
                     let b = b.to_vec();
                     for c in p.candidates.clone() {
@@ -836,15 +939,22 @@ impl Inner {
                     }
                 }
                 if let (Some(rp), Some(net)) = (&p.relay, p.relay_network) {
-                    let _ = rp.cmd.try_send(ControlCmd::Punch { network: net, target: p.id });
+                    let _ = rp.cmd.try_send(ControlCmd::Punch {
+                        network: net,
+                        target: p.id,
+                    });
                 }
             }
         }
     }
 
     fn status(&self) -> StatusReport {
-        let lhs: HashMap<LighthouseAddr, bool> =
-            self.lighthouses.lock().iter().map(|(a, h)| (a.clone(), h.is_connected())).collect();
+        let lhs: HashMap<LighthouseAddr, bool> = self
+            .lighthouses
+            .lock()
+            .iter()
+            .map(|(a, h)| (a.clone(), h.is_connected()))
+            .collect();
         let networks: Vec<NetworkStatus> = {
             let nets = self.networks.read();
             let mut v: Vec<NetworkStatus> = nets
@@ -852,7 +962,10 @@ impl Inner {
                 .map(|e| NetworkStatus {
                     info: e.membership.network.clone(),
                     lighthouse: e.membership.lighthouse.host_port(),
-                    lighthouse_connected: lhs.get(&e.membership.lighthouse).copied().unwrap_or(false),
+                    lighthouse_connected: lhs
+                        .get(&e.membership.lighthouse)
+                        .copied()
+                        .unwrap_or(false),
                     interface: e.tun.as_ref().map(|t| t.dev.name()),
                 })
                 .collect();
@@ -866,7 +979,8 @@ impl Inner {
                 .values()
                 .map(|p| {
                     let p = p.lock();
-                    let mut addresses: Vec<(NetworkId, Ipv4Addr)> = p.addresses.iter().map(|(n, a)| (*n, *a)).collect();
+                    let mut addresses: Vec<(NetworkId, Ipv4Addr)> =
+                        p.addresses.iter().map(|(n, a)| (*n, *a)).collect();
                     addresses.sort();
                     PeerStatus {
                         node: p.id,
@@ -875,7 +989,10 @@ impl Inner {
                         addresses,
                         path: p.path(),
                         endpoint: p.direct,
-                        last_handshake_secs_ago: p.tunn.time_since_last_handshake().map(|d| d.as_secs()),
+                        last_handshake_secs_ago: p
+                            .tunn
+                            .time_since_last_handshake()
+                            .map(|d| d.as_secs()),
                         tx_bytes: p.tx_bytes,
                         rx_bytes: p.rx_bytes,
                     }

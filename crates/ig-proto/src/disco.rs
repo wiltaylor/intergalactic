@@ -116,13 +116,19 @@ pub fn decode(datagram: &[u8]) -> Option<Disco<'_>> {
             if body.len() < 32 {
                 return None;
             }
-            Some(Disco::Relay { dst: NodeId(body[..32].try_into().ok()?), payload: &body[32..] })
+            Some(Disco::Relay {
+                dst: NodeId(body[..32].try_into().ok()?),
+                payload: &body[32..],
+            })
         }
         T_RELAYED => {
             if body.len() < 32 {
                 return None;
             }
-            Some(Disco::Relayed { src: NodeId(body[..32].try_into().ok()?), payload: &body[32..] })
+            Some(Disco::Relayed {
+                src: NodeId(body[..32].try_into().ok()?),
+                payload: &body[32..],
+            })
         }
         _ => None,
     }
@@ -162,20 +168,44 @@ mod tests {
         let key = crate::random_array();
         let addr: SocketAddr = "203.0.113.9:40000".parse().unwrap();
         let r = encode_probe_reply(7, addr, &key);
-        assert_eq!(decode(&r), Some(Disco::ProbeReply { ts: 7, observed: addr }));
+        assert_eq!(
+            decode(&r),
+            Some(Disco::ProbeReply {
+                ts: 7,
+                observed: addr
+            })
+        );
         assert!(verify_mac(&r, &key));
         let addr6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
         let r6 = encode_probe_reply(1, addr6, &key);
-        assert_eq!(decode(&r6), Some(Disco::ProbeReply { ts: 1, observed: addr6 }));
+        assert_eq!(
+            decode(&r6),
+            Some(Disco::ProbeReply {
+                ts: 1,
+                observed: addr6
+            })
+        );
     }
 
     #[test]
     fn relay_frames() {
         let a = NodeId(crate::random_array());
         let f = encode_relay(&a, b"wg");
-        assert_eq!(decode(&f), Some(Disco::Relay { dst: a, payload: b"wg" }));
+        assert_eq!(
+            decode(&f),
+            Some(Disco::Relay {
+                dst: a,
+                payload: b"wg"
+            })
+        );
         let g = encode_relayed(&a, b"wg");
-        assert_eq!(decode(&g), Some(Disco::Relayed { src: a, payload: b"wg" }));
+        assert_eq!(
+            decode(&g),
+            Some(Disco::Relayed {
+                src: a,
+                payload: b"wg"
+            })
+        );
         assert!(!is_disco(&[4, 0, 0, 0, 1, 2, 3]));
     }
 }

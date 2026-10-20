@@ -53,7 +53,11 @@ pub mod channel {
             let (to_tun, from_os) = mpsc::channel(1024);
             let (to_os, from_tun) = mpsc::channel(1024);
             (
-                ChannelTun { name: name.to_string(), from_os: tokio::sync::Mutex::new(from_os), to_os },
+                ChannelTun {
+                    name: name.to_string(),
+                    from_os: tokio::sync::Mutex::new(from_os),
+                    to_os,
+                },
                 OsSide { to_tun, from_tun },
             )
         }
@@ -69,7 +73,10 @@ pub mod channel {
                     buf[..n].copy_from_slice(&pkt[..n]);
                     Ok(n)
                 }
-                None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel tun closed")),
+                None => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "channel tun closed",
+                )),
             }
         }
 

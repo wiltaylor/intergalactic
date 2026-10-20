@@ -1,1 +1,427 @@
+//! Mobile-facing API. Kotlin (Android) talks to the engine through these types.
+//!
+//! The app owns the lifecycle: it creates a [`MobileEngine`] with the persisted
+//! state JSON, joins networks, and when the set of networks changes it
+//! re-establishes its `VpnService` interface and hands the new file descriptor to
+//! [`MobileEngine::attach_tun`]. The engine protects its own sockets through the
+//! [`MobileCallbacks::protect_socket`] callback so they bypass the VPN.
 
+use ig_core::tun::TunScope;
+use ig_core::{Engine, EngineConfig, EngineEvent, NodeState, SocketProtector};
+use ig_proto::ipc::PeerPath;
+use ig_proto::Invite;
+use ig_proto::Keypair;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+
+uniffi::setup_scaffolding!();
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MobileError {
+    #[error("{message}")]
+    Failed { message: String },
+}
+
+impl From<anyhow::Error> for MobileError {
+    fn from(e: anyhow::Error) -> Self {
+        MobileError::Failed {
+            message: e.to_string(),
+        }
+    }
+}
+
+fn err<E: std::fmt::Display>(e: E) -> MobileError {
+    MobileError::Failed {
+        message: e.to_string(),
+    }
+}
+
+/// A joined network, with what `VpnService.Builder` needs.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileNetwork {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub prefix_len: u8,
+    pub cidr: String,
+    pub lighthouse: String,
+    pub lighthouse_connected: bool,
+    pub policy_summary: String,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobilePeer {
+    pub node_id: String,
+    pub hostname: String,
+    pub online: bool,
+    /// "network=address" strings.
+    pub addresses: Vec<String>,
+    /// "none", "direct" or "relay".
+    pub path: String,
+    pub endpoint: Option<String>,
+    pub last_handshake_secs_ago: Option<u64>,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileStatus {
+    pub node_id: String,
+    pub hostname: String,
+    pub udp_port: u16,
+    pub networks: Vec<MobileNetwork>,
+    pub peers: Vec<MobilePeer>,
+}
+
+/// Implemented in Kotlin.
+#[uniffi::export(with_foreign)]
+pub trait MobileCallbacks: Send + Sync {
+    /// Called for every socket the engine opens. Must call `VpnService.protect(fd)`.
+    fn protect_socket(&self, fd: i32);
+    /// The joined networks changed. Persist `state_json` and rebuild the VPN
+    /// interface with the given networks, then call `attach_tun` with the new fd.
+    fn on_networks_changed(&self, networks: Vec<MobileNetwork>, state_json: String);
+    fn on_peers_changed(&self);
+    fn on_lighthouse_status(&self, lighthouse: String, connected: bool);
+}
+
+struct Protector(Arc<dyn MobileCallbacks>);
+impl SocketProtector for Protector {
+    fn protect(&self, raw_socket: i64) {
+        self.0.protect_socket(raw_socket as i32);
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct MobileEngine {
+    rt: Runtime,
+    engine: Engine,
+    private_key: ig_proto::PrivateKey,
+}
+
+/// Create a fresh identity. Store the returned JSON; pass it to `MobileEngine::new`.
+#[uniffi::export]
+pub fn generate_state() -> String {
+    serde_json::to_string(&NodeState::generate()).expect("state serializes")
+}
+
+/// Parse an invite so the UI can show what it is before joining.
+#[uniffi::export]
+pub fn describe_invite(invite: String) -> Result<String, MobileError> {
+    let inv: Invite = invite.parse().map_err(err)?;
+    Ok(format!(
+        "network \"{}\" via {}:{}",
+        inv.network_name, inv.host, inv.port
+    ))
+}
+
+#[uniffi::export]
+impl MobileEngine {
+    /// Start the engine from persisted state JSON (see `generate_state`).
+    #[uniffi::constructor]
+    pub fn new(
+        state_json: String,
+        hostname: String,
+        callbacks: Arc<dyn MobileCallbacks>,
+    ) -> Result<Arc<Self>, MobileError> {
+        init_logging();
+        let state: NodeState = serde_json::from_str(&state_json).map_err(err)?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("ig-engine")
+            .build()
+            .map_err(err)?;
+        let keypair = Keypair::from_private(state.private_key.clone());
+        let config = EngineConfig {
+            keypair,
+            hostname,
+            os: "android".into(),
+            udp_port: 0,
+            memberships: state.memberships.clone(),
+            // Mobile radios: let sessions idle instead of waking every 25 s.
+            persistent_keepalive: None,
+            relay_only: false,
+        };
+        let protector = Arc::new(Protector(callbacks.clone()));
+        let (engine, mut events) = rt.block_on(Engine::start(config, protector)).map_err(err)?;
+        let private_key = state.private_key.clone();
+        let cb = callbacks;
+        let pk = private_key.clone();
+        rt.spawn(async move {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    EngineEvent::MembershipsChanged(list) => {
+                        let st = NodeState {
+                            private_key: pk.clone(),
+                            memberships: list.clone(),
+                        };
+                        let json = serde_json::to_string(&st).unwrap_or_default();
+                        let nets = list.iter().map(|m| to_mobile_network(m, false)).collect();
+                        cb.on_networks_changed(nets, json);
+                    }
+                    EngineEvent::PeersChanged => cb.on_peers_changed(),
+                    EngineEvent::LighthouseStatus {
+                        lighthouse,
+                        connected,
+                    } => cb.on_lighthouse_status(lighthouse.host_port(), connected),
+                }
+            }
+        });
+        Ok(Arc::new(MobileEngine {
+            rt,
+            engine,
+            private_key,
+        }))
+    }
+
+    pub fn node_id(&self) -> String {
+        self.engine.node_id().to_string()
+    }
+
+    pub fn join(&self, invite: String) -> Result<MobileNetwork, MobileError> {
+        let inv: Invite = invite.parse().map_err(err)?;
+        let info = self.rt.block_on(self.engine.join(&inv)).map_err(err)?;
+        let lh = ig_core::LighthouseAddr::from_invite(&inv);
+        Ok(to_mobile_network(
+            &ig_core::Membership {
+                lighthouse: lh,
+                network: info,
+            },
+            true,
+        ))
+    }
+
+    pub fn leave(&self, network_id: String) -> Result<(), MobileError> {
+        let id: ig_proto::NetworkId = network_id.parse().map_err(err)?;
+        self.rt.block_on(self.engine.leave(id)).map_err(err)
+    }
+
+    /// Attach the `VpnService` TUN file descriptor. The engine takes ownership
+    /// of a duplicate; the app may close its own copy.
+    pub fn attach_tun(&self, fd: i32) -> Result<(), MobileError> {
+        let dev = tun::FdTun::from_fd(fd).map_err(err)?;
+        self.engine
+            .attach_tun(TunScope::All, Arc::new(dev))
+            .map_err(err)
+    }
+
+    pub fn detach_tun(&self) {
+        self.engine.detach_tun(TunScope::All);
+    }
+
+    /// Call when connectivity changes (Wi-Fi to cellular) so lighthouses learn
+    /// the new addresses quickly.
+    pub fn network_changed(&self) {
+        self.engine.refresh_endpoints();
+    }
+
+    pub fn networks(&self) -> Vec<MobileNetwork> {
+        let st = self.engine.status();
+        st.networks
+            .iter()
+            .map(|n| MobileNetwork {
+                id: n.info.id.to_string(),
+                name: n.info.name.clone(),
+                address: n.info.address.to_string(),
+                prefix_len: n.info.cidr.prefix_len(),
+                cidr: n.info.cidr.to_string(),
+                lighthouse: n.lighthouse.clone(),
+                lighthouse_connected: n.lighthouse_connected,
+                policy_summary: policy_summary(&n.info.policy),
+            })
+            .collect()
+    }
+
+    pub fn status(&self) -> MobileStatus {
+        let st = self.engine.status();
+        let names: std::collections::HashMap<_, _> = st
+            .networks
+            .iter()
+            .map(|n| (n.info.id, n.info.name.clone()))
+            .collect();
+        MobileStatus {
+            node_id: st.node.map(|n| n.to_string()).unwrap_or_default(),
+            hostname: st.hostname.clone(),
+            udp_port: st.udp_port,
+            networks: self.networks(),
+            peers: st
+                .peers
+                .iter()
+                .map(|p| MobilePeer {
+                    node_id: p.node.to_string(),
+                    hostname: p.hostname.clone(),
+                    online: p.online,
+                    addresses: p
+                        .addresses
+                        .iter()
+                        .map(|(n, a)| {
+                            format!(
+                                "{}={}",
+                                names.get(n).cloned().unwrap_or_else(|| n.to_string()),
+                                a
+                            )
+                        })
+                        .collect(),
+                    path: match p.path {
+                        PeerPath::None => "none",
+                        PeerPath::Direct => "direct",
+                        PeerPath::Relay => "relay",
+                    }
+                    .into(),
+                    endpoint: p.endpoint.map(|e| e.to_string()),
+                    last_handshake_secs_ago: p.last_handshake_secs_ago,
+                    tx_bytes: p.tx_bytes,
+                    rx_bytes: p.rx_bytes,
+                })
+                .collect(),
+        }
+    }
+
+    /// Current state JSON, for persistence.
+    pub fn state_json(&self) -> String {
+        let st = NodeState {
+            private_key: self.private_key.clone(),
+            memberships: self.engine.memberships(),
+        };
+        serde_json::to_string(&st).unwrap_or_default()
+    }
+
+    pub fn shutdown(&self) {
+        self.rt.block_on(self.engine.shutdown());
+    }
+}
+
+fn policy_summary(p: &ig_proto::Policy) -> String {
+    if p.is_allow_all() {
+        "allow all".into()
+    } else {
+        p.rules
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn to_mobile_network(m: &ig_core::Membership, connected: bool) -> MobileNetwork {
+    MobileNetwork {
+        id: m.network.id.to_string(),
+        name: m.network.name.clone(),
+        address: m.network.address.to_string(),
+        prefix_len: m.network.cidr.prefix_len(),
+        cidr: m.network.cidr.to_string(),
+        lighthouse: m.lighthouse.host_port(),
+        lighthouse_connected: connected,
+        policy_summary: policy_summary(&m.network.policy),
+    }
+}
+
+fn init_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(target_os = "android")]
+        {
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Info)
+                    .with_tag("intergalactic"),
+            );
+            let _ = tracing_log::LogTracer::init();
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .try_init();
+            // Route tracing events into the Android log through `log`.
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                )
+                .try_init();
+        }
+    });
+}
+
+mod tun {
+    use async_trait::async_trait;
+    use ig_core::TunDevice;
+    use std::io;
+
+    /// TUN backed by a file descriptor handed over by `VpnService`.
+    pub struct FdTun {
+        #[cfg(unix)]
+        dev: tun_rs::AsyncDevice,
+        #[cfg(not(unix))]
+        _fd: i32,
+    }
+
+    impl FdTun {
+        pub fn from_fd(fd: i32) -> io::Result<FdTun> {
+            #[cfg(unix)]
+            {
+                // Duplicate so the Kotlin side can close its ParcelFileDescriptor
+                // without pulling the rug from under us.
+                let dup = unsafe { libc_dup(fd) };
+                if dup < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let dev = unsafe { tun_rs::AsyncDevice::from_fd(dup) }?;
+                Ok(FdTun { dev })
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "fd-based tun needs a unix platform",
+                ))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe fn libc_dup(fd: i32) -> i32 {
+        extern "C" {
+            fn dup(fd: i32) -> i32;
+        }
+        dup(fd)
+    }
+
+    #[async_trait]
+    impl TunDevice for FdTun {
+        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            #[cfg(unix)]
+            {
+                self.dev.recv(buf).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = buf;
+                Err(io::Error::new(io::ErrorKind::Unsupported, "no tun"))
+            }
+        }
+
+        fn send(&self, pkt: &[u8]) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                self.dev.try_send(pkt).map(|_| ())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pkt;
+                Err(io::Error::new(io::ErrorKind::Unsupported, "no tun"))
+            }
+        }
+
+        fn name(&self) -> String {
+            "vpn".into()
+        }
+    }
+}

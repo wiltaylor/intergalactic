@@ -4,5 +4,6 @@ android/.gradle
 android/build
 android/app/build
 android/app/src/main/jniLibs
-android/app/src/main/java/dev/intergalactic/core/generated
+android/app/src/main/generated
 android/local.properties
+tmp/

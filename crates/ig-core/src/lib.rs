@@ -22,8 +22,8 @@ pub mod tun;
 
 mod control;
 
-pub use engine::{Engine, EngineConfig, EngineError, EngineEvent, SocketProtector, NoProtector};
-pub use state::{LighthouseAddr, Membership};
+pub use engine::{Engine, EngineConfig, EngineError, EngineEvent, NoProtector, SocketProtector};
+pub use state::{LighthouseAddr, Membership, NodeState};
 pub use tun::{TunDevice, TunScope};
 
 pub use ig_proto;

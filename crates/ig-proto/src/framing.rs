@@ -15,7 +15,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::
     w.write_all(&buf).await
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, into: &mut Vec<u8>) -> std::io::Result<usize> {
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+    into: &mut Vec<u8>,
+) -> std::io::Result<usize> {
     let mut len = [0u8; 2];
     r.read_exact(&mut len).await?;
     let len = u16::from_be_bytes(len) as usize;

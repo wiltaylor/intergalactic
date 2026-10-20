@@ -9,15 +9,38 @@ use std::net::{Ipv4Addr, SocketAddr};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AdminRequest {
     Info,
-    NetworkCreate { name: String, cidr: Ipv4Net },
+    NetworkCreate {
+        name: String,
+        cidr: Ipv4Net,
+    },
     NetworkList,
-    NetworkDelete { network: String },
-    NetworkSetPolicy { network: String, policy: Policy },
-    InviteCreate { network: String, uses: u32, ttl_secs: u64, label: String },
-    InviteList { network: String },
-    InviteRevoke { network: String, invite_id: String },
-    NodeList { network: Option<String> },
-    NodeRemove { network: String, node: NodeId },
+    NetworkDelete {
+        network: String,
+    },
+    NetworkSetPolicy {
+        network: String,
+        policy: Policy,
+    },
+    InviteCreate {
+        network: String,
+        uses: u32,
+        ttl_secs: u64,
+        label: String,
+    },
+    InviteList {
+        network: String,
+    },
+    InviteRevoke {
+        network: String,
+        invite_id: String,
+    },
+    NodeList {
+        network: Option<String>,
+    },
+    NodeRemove {
+        network: String,
+        node: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

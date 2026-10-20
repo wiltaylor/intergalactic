@@ -10,7 +10,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub fn socket_name(path: &Path) -> std::io::Result<Name<'static>> {
     if cfg!(windows) {
-        let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("ig-lighthouse");
+        let base = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ig-lighthouse");
         format!("ig-lighthouse-{base}").to_ns_name::<GenericNamespaced>()
     } else {
         path.to_path_buf().to_fs_name::<GenericFilePath>()
@@ -25,7 +28,9 @@ pub async fn serve(lh: Lighthouse, path: PathBuf) -> std::io::Result<()> {
         }
         let _ = std::fs::remove_file(path);
     }
-    let listener = ListenerOptions::new().name(socket_name(path)?).create_tokio()?;
+    let listener = ListenerOptions::new()
+        .name(socket_name(path)?)
+        .create_tokio()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -49,7 +54,9 @@ pub async fn serve(lh: Lighthouse, path: PathBuf) -> std::io::Result<()> {
             }
             let resp = match serde_json::from_str::<AdminRequest>(&line) {
                 Ok(req) => lh.admin(req),
-                Err(e) => AdminResponse::Error { message: format!("bad request: {e}") },
+                Err(e) => AdminResponse::Error {
+                    message: format!("bad request: {e}"),
+                },
             };
             let mut out = serde_json::to_vec(&resp).unwrap_or_default();
             out.push(b'\n');
@@ -62,7 +69,10 @@ pub async fn serve(lh: Lighthouse, path: PathBuf) -> std::io::Result<()> {
 /// Client side used by the CLI.
 pub async fn request(path: &Path, req: &AdminRequest) -> anyhow::Result<AdminResponse> {
     let conn = Stream::connect(socket_name(path)?).await.map_err(|e| {
-        anyhow::anyhow!("cannot reach lighthouse admin socket at {}: {e}. Is `ig-lighthouse serve` running?", path.display())
+        anyhow::anyhow!(
+            "cannot reach lighthouse admin socket at {}: {e}. Is `ig-lighthouse serve` running?",
+            path.display()
+        )
     })?;
     let mut w = &conn;
     let mut line = serde_json::to_vec(req)?;

@@ -1,0 +1,21 @@
+[Unit]
+Description=Intergalactic lighthouse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Replace lighthouse.example.com with the public DNS name or IP of this VPS.
+ExecStart=/usr/local/bin/ig-lighthouse serve --listen 0.0.0.0:7777 --public-host lighthouse.example.com
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+StateDirectory=intergalactic/lighthouse
+Environment=IG_LIGHTHOUSE_STATE=/var/lib/intergalactic/lighthouse
+Environment=RUST_LOG=info
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

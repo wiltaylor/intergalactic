@@ -3,5 +3,16 @@ name = "ig-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Intergalactic command line: join and leave networks, show status"
+
+[[bin]]
+name = "ig"
+path = "src/main.rs"
 
 [dependencies]
+ig-proto.workspace = true
+ig-node.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+humantime.workspace = true

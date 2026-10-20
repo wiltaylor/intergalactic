@@ -51,7 +51,13 @@ impl PeerFilter {
             PROTO_ICMP => (f.sport, 8),
             _ => (f.sport, f.dport),
         };
-        Key { proto: f.proto, local: f.src, lport, remote: f.dst, rport }
+        Key {
+            proto: f.proto,
+            local: f.src,
+            lport,
+            remote: f.dst,
+            rport,
+        }
     }
 
     fn key_inbound(f: &Flow) -> Key {
@@ -59,12 +65,19 @@ impl PeerFilter {
             PROTO_ICMP => (f.sport, 8),
             _ => (f.dport, f.sport),
         };
-        Key { proto: f.proto, local: f.dst, lport, remote: f.src, rport }
+        Key {
+            proto: f.proto,
+            local: f.dst,
+            lport,
+            remote: f.src,
+            rport,
+        }
     }
 
     fn touch(&mut self, key: Key, now: Instant) {
         if self.flows.len() >= SWEEP_AT {
-            self.flows.retain(|k, t| now.duration_since(*t) < Self::idle_for(k.proto));
+            self.flows
+                .retain(|k, t| now.duration_since(*t) < Self::idle_for(k.proto));
         }
         self.flows.insert(key, now);
     }
@@ -122,7 +135,10 @@ impl PeerFilter {
 }
 
 fn rule_allows(policy: &Policy, proto: Proto, port: u16) -> bool {
-    policy.rules.iter().any(|r| r.proto == proto && (proto == Proto::Icmp || r.matches_port(port)))
+    policy
+        .rules
+        .iter()
+        .any(|r| r.proto == proto && (proto == Proto::Icmp || r.matches_port(port)))
 }
 
 #[cfg(test)]
@@ -139,13 +155,18 @@ mod tests {
     }
 
     fn policy(rules: &[&str]) -> Policy {
-        Policy { rules: rules.iter().map(|r| r.parse::<Rule>().unwrap()).collect() }
+        Policy {
+            rules: rules.iter().map(|r| r.parse::<Rule>().unwrap()).collect(),
+        }
     }
 
     #[test]
     fn allow_all_passes_everything() {
         let mut f = PeerFilter::new();
-        assert!(f.allow_inbound(&Policy::allow_all(), &build_tcp(peer(), 1, me(), 2, TCP_ACK)));
+        assert!(f.allow_inbound(
+            &Policy::allow_all(),
+            &build_tcp(peer(), 1, me(), 2, TCP_ACK)
+        ));
     }
 
     #[test]

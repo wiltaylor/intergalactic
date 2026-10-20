@@ -54,7 +54,14 @@ pub fn parse_flow(pkt: &[u8]) -> Option<Flow> {
     let l4 = &pkt[ihl..];
     // Non-first fragments carry no transport header; treat as ports 0.
     if frag_offset != 0 {
-        return Some(Flow { src, dst, proto, sport: 0, dport: 0, tcp_flags: 0 });
+        return Some(Flow {
+            src,
+            dst,
+            proto,
+            sport: 0,
+            dport: 0,
+            tcp_flags: 0,
+        });
     }
     match proto {
         PROTO_TCP => {
@@ -93,9 +100,23 @@ pub fn parse_flow(pkt: &[u8]) -> Option<Flow> {
             } else {
                 0
             };
-            Some(Flow { src, dst, proto, sport: id, dport: icmp_type as u16, tcp_flags: 0 })
+            Some(Flow {
+                src,
+                dst,
+                proto,
+                sport: id,
+                dport: icmp_type as u16,
+                tcp_flags: 0,
+            })
         }
-        _ => Some(Flow { src, dst, proto, sport: 0, dport: 0, tcp_flags: 0 }),
+        _ => Some(Flow {
+            src,
+            dst,
+            proto,
+            sport: 0,
+            dport: 0,
+            tcp_flags: 0,
+        }),
     }
 }
 
@@ -161,7 +182,10 @@ mod tests {
         let b = Ipv4Addr::new(10, 1, 0, 2);
         let udp = build_udp(a, 5000, b, 53, b"hi");
         let f = parse_flow(&udp).unwrap();
-        assert_eq!((f.src, f.dst, f.proto, f.sport, f.dport), (a, b, PROTO_UDP, 5000, 53));
+        assert_eq!(
+            (f.src, f.dst, f.proto, f.sport, f.dport),
+            (a, b, PROTO_UDP, 5000, 53)
+        );
         assert_eq!(ipv4_dst(&udp), Some(b));
         let tcp = build_tcp(a, 40000, b, 22, TCP_SYN);
         let f = parse_flow(&tcp).unwrap();

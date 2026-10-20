@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Intergalactic</string>
+    <string name="invite_hint">Paste invite (ig1:…)</string>
+    <string name="join">Join</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="notification_channel">Intergalactic tunnel</string>
+    <string name="notification_title">Intergalactic is connected</string>
+</resources>

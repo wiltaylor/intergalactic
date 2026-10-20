@@ -28,5 +28,9 @@ pub fn local_candidates(port: u16, exclude: &[Ipv4Net]) -> Vec<SocketAddr> {
 }
 
 fn usable(ip: Ipv4Addr) -> bool {
-    !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
+    !(ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast())
 }

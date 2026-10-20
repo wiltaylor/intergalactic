@@ -55,7 +55,11 @@ pub struct Rule {
 
 impl Rule {
     pub fn matches_port(&self, port: u16) -> bool {
-        self.ports.is_empty() || self.ports.iter().any(|(lo, hi)| (*lo..=*hi).contains(&port))
+        self.ports.is_empty()
+            || self
+                .ports
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&port))
     }
 }
 
@@ -108,7 +112,10 @@ impl FromStr for Rule {
                     continue;
                 }
                 let (lo, hi) = match part.split_once('-') {
-                    Some((a, b)) => (a.trim().parse().map_err(|_| err())?, b.trim().parse().map_err(|_| err())?),
+                    Some((a, b)) => (
+                        a.trim().parse().map_err(|_| err())?,
+                        b.trim().parse().map_err(|_| err())?,
+                    ),
                     None => {
                         let p: u16 = part.parse().map_err(|_| err())?;
                         (p, p)

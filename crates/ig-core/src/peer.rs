@@ -89,8 +89,12 @@ impl Peer {
     /// Called from the timer loop. Returns true when the direct path was dropped.
     pub fn expire_direct(&mut self, now: Instant) -> bool {
         let Some(_) = self.direct else { return false };
-        let sent_recently = self.last_tx.is_some_and(|t| now.duration_since(t) < DIRECT_STALE);
-        let heard_recently = self.last_direct_rx.is_some_and(|t| now.duration_since(t) < DIRECT_STALE);
+        let sent_recently = self
+            .last_tx
+            .is_some_and(|t| now.duration_since(t) < DIRECT_STALE);
+        let heard_recently = self
+            .last_direct_rx
+            .is_some_and(|t| now.duration_since(t) < DIRECT_STALE);
         if sent_recently && !heard_recently {
             self.direct = None;
             return true;
@@ -99,7 +103,10 @@ impl Peer {
     }
 
     pub fn may_punch(&mut self, now: Instant) -> bool {
-        if self.last_punch.is_none_or(|t| now.duration_since(t) >= PUNCH_INTERVAL) {
+        if self
+            .last_punch
+            .is_none_or(|t| now.duration_since(t) >= PUNCH_INTERVAL)
+        {
             self.last_punch = Some(now);
             true
         } else {

@@ -30,35 +30,68 @@ pub struct ServerHello {
 pub enum ToLighthouse {
     /// Join a network using an invite token. The lighthouse replies with
     /// `Joined` or `JoinFailed` carrying the same network id.
-    Join { network: NetworkId, token: [u8; 16] },
+    Join {
+        network: NetworkId,
+        token: [u8; 16],
+    },
     /// Leave a network. Membership and address are released.
-    Leave { network: NetworkId },
+    Leave {
+        network: NetworkId,
+    },
     /// Ask for the state of every network this node is already a member of.
     /// Sent once after every (re)connect.
     Resume,
     /// Local candidate endpoints (LAN addresses + UDP port). The lighthouse adds
     /// the reflexive address it observes on UDP and shares the union with peers.
-    Endpoints { local: Vec<SocketAddr> },
+    Endpoints {
+        local: Vec<SocketAddr>,
+    },
     /// Ask the lighthouse to tell `target` to start sending towards us so both
     /// NATs open at the same time.
-    Punch { network: NetworkId, target: NodeId },
-    Ping { nonce: u64 },
+    Punch {
+        network: NetworkId,
+        target: NodeId,
+    },
+    Ping {
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FromLighthouse {
-    Joined { network: NetworkInfo },
-    JoinFailed { network: NetworkId, reason: String },
-    Left { network: NetworkId },
+    Joined {
+        network: NetworkInfo,
+    },
+    JoinFailed {
+        network: NetworkId,
+        reason: String,
+    },
+    Left {
+        network: NetworkId,
+    },
     /// Full membership of one network. Sent after join/resume and whenever
     /// anything about the network or its members changes.
-    NetworkState { network: NetworkInfo, peers: Vec<PeerInfo> },
+    NetworkState {
+        network: NetworkInfo,
+        peers: Vec<PeerInfo>,
+    },
     /// The node was removed from the network by an admin or the network was deleted.
-    Removed { network: NetworkId, reason: String },
+    Removed {
+        network: NetworkId,
+        reason: String,
+    },
     /// A peer wants to reach us; start sending towards its endpoints now.
-    PunchRequest { network: NetworkId, from: NodeId, endpoints: Vec<SocketAddr> },
-    Pong { nonce: u64 },
-    Error { message: String },
+    PunchRequest {
+        network: NetworkId,
+        from: NodeId,
+        endpoints: Vec<SocketAddr>,
+    },
+    Pong {
+        nonce: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// What a member knows about a network it belongs to.

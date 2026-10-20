@@ -25,9 +25,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub enum ControlCmd {
-    Join { network: NetworkId, token: [u8; 16], reply: oneshot::Sender<Result<NetworkInfo, String>> },
-    Leave { network: NetworkId, reply: oneshot::Sender<()> },
-    Punch { network: NetworkId, target: NodeId },
+    Join {
+        network: NetworkId,
+        token: [u8; 16],
+        reply: oneshot::Sender<Result<NetworkInfo, String>>,
+    },
+    Leave {
+        network: NetworkId,
+        reply: oneshot::Sender<()>,
+    },
+    Punch {
+        network: NetworkId,
+        target: NodeId,
+    },
     /// Re-send local endpoints (called when the embedder notices an address change).
     RefreshEndpoints,
     Shutdown,
@@ -52,7 +62,11 @@ impl LighthouseHandle {
 
 pub fn spawn(inner: Arc<Inner>, addr: LighthouseAddr) -> Arc<LighthouseHandle> {
     let (tx, rx) = mpsc::channel(64);
-    let relay = Arc::new(RelayPoint { addr: addr.clone(), udp_addr: RwLock::new(None), cmd: tx.clone() });
+    let relay = Arc::new(RelayPoint {
+        addr: addr.clone(),
+        udp_addr: RwLock::new(None),
+        cmd: tx.clone(),
+    });
     let handle = Arc::new(LighthouseHandle {
         addr,
         relay,
@@ -111,13 +125,19 @@ async fn run(inner: Arc<Inner>, h: Arc<LighthouseHandle>, mut rx: mpsc::Receiver
         backoff = Duration::from_secs(1);
         *h.last_error.lock() = None;
         h.connected.store(true, Ordering::Relaxed);
-        inner.emit(crate::EngineEvent::LighthouseStatus { lighthouse: h.addr.clone(), connected: true });
+        inner.emit(crate::EngineEvent::LighthouseStatus {
+            lighthouse: h.addr.clone(),
+            connected: true,
+        });
         tracing::info!(lighthouse = %h.addr, "control channel up");
 
         let outcome = session_loop(&inner, &h, session, &mut rx, std::mem::take(&mut queued)).await;
         h.connected.store(false, Ordering::Relaxed);
         *h.session_token.write() = None;
-        inner.emit(crate::EngineEvent::LighthouseStatus { lighthouse: h.addr.clone(), connected: false });
+        inner.emit(crate::EngineEvent::LighthouseStatus {
+            lighthouse: h.addr.clone(),
+            connected: false,
+        });
         inner.mark_lighthouse_peers_offline(&h.addr);
         match outcome {
             SessionEnd::Shutdown => return,
@@ -150,17 +170,30 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         .map_err(|_| anyhow::anyhow!("connect timed out"))??;
     inner.protect_tcp(&tcp);
     let _ = tcp.set_nodelay(true);
-    let hello = ClientHello { version: PROTOCOL_VERSION, hostname: inner.hostname.clone(), os: inner.os.clone() };
-    let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) =
-        tokio::time::timeout(CONNECT_TIMEOUT, NoiseStream::connect(tcp, &inner.keypair.private.0, &h.addr.key, &hello))
-            .await
-            .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
+    let hello = ClientHello {
+        version: PROTOCOL_VERSION,
+        hostname: inner.hostname.clone(),
+        os: inner.os.clone(),
+    };
+    let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        NoiseStream::connect(tcp, &inner.keypair.private.0, &h.addr.key, &hello),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     if server_hello.version != PROTOCOL_VERSION {
-        anyhow::bail!("lighthouse speaks protocol v{}, we speak v{}", server_hello.version, PROTOCOL_VERSION);
+        anyhow::bail!(
+            "lighthouse speaks protocol v{}, we speak v{}",
+            server_hello.version,
+            PROTOCOL_VERSION
+        );
     }
     *h.session_token.write() = Some(server_hello.session_token);
     *h.relay.udp_addr.write() = Some(addr);
-    Ok(Session { stream, udp_addr: addr })
+    Ok(Session {
+        stream,
+        udp_addr: addr,
+    })
 }
 
 async fn session_loop(
@@ -172,7 +205,8 @@ async fn session_loop(
 ) -> SessionEnd {
     let (mut tx, mut rx_noise) = session.stream.into_parts();
     let udp_addr = session.udp_addr;
-    let mut pending_joins: HashMap<NetworkId, oneshot::Sender<Result<NetworkInfo, String>>> = HashMap::new();
+    let mut pending_joins: HashMap<NetworkId, oneshot::Sender<Result<NetworkInfo, String>>> =
+        HashMap::new();
     let mut pending_leaves: HashMap<NetworkId, oneshot::Sender<()>> = HashMap::new();
     let mut join_deadlines: Vec<(NetworkId, Instant)> = Vec::new();
 
@@ -191,7 +225,11 @@ async fn session_loop(
     // Replay commands that arrived while we were (re)connecting.
     for cmd in queued {
         match cmd {
-            ControlCmd::Join { network, token, reply } => {
+            ControlCmd::Join {
+                network,
+                token,
+                reply,
+            } => {
                 pending_joins.insert(network, reply);
                 join_deadlines.push((network, Instant::now() + JOIN_TIMEOUT));
                 if let Err(e) = tx.send(&ToLighthouse::Join { network, token }).await {
@@ -322,15 +360,23 @@ async fn send_endpoints(
 ) -> Result<(), ig_proto::noise::NoiseError> {
     let current = inner.local_candidates();
     if force || current != *last {
-        tx.send(&ToLighthouse::Endpoints { local: current.clone() }).await?;
+        tx.send(&ToLighthouse::Endpoints {
+            local: current.clone(),
+        })
+        .await?;
         *last = current;
     }
     Ok(())
 }
 
 fn send_probe(inner: &Arc<Inner>, h: &LighthouseHandle, udp_addr: SocketAddr) {
-    let Some(token) = *h.session_token.read() else { return };
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let Some(token) = *h.session_token.read() else {
+        return;
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let frame = disco::encode_probe(&inner.keypair.public, ts, &token);
     inner.udp_send(&frame, udp_addr);
 }

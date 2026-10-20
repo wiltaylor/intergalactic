@@ -1,0 +1,23 @@
+[Unit]
+Description=Intergalactic node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ig-node run
+Restart=on-failure
+RestartSec=2
+# Needs CAP_NET_ADMIN to create TUN devices.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+StateDirectory=intergalactic/node
+RuntimeDirectory=intergalactic
+Environment=RUST_LOG=info
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

@@ -72,10 +72,9 @@ impl<'de> Deserialize<'de> for NodeId {
             s.parse().map_err(D::Error::custom)
         } else {
             let b: serde_bytes_shim::Bytes = Deserialize::deserialize(d)?;
-            let arr: [u8; 32] = b
-                .0
-                .try_into()
-                .map_err(|_| D::Error::custom("node id must be 32 bytes"))?;
+            let arr: [u8; 32] =
+                b.0.try_into()
+                    .map_err(|_| D::Error::custom("node id must be 32 bytes"))?;
             Ok(NodeId(arr))
         }
     }
@@ -139,10 +138,9 @@ impl<'de> Deserialize<'de> for NetworkId {
             s.parse().map_err(D::Error::custom)
         } else {
             let b: serde_bytes_shim::Bytes = Deserialize::deserialize(d)?;
-            let arr: [u8; 8] = b
-                .0
-                .try_into()
-                .map_err(|_| D::Error::custom("network id must be 8 bytes"))?;
+            let arr: [u8; 8] =
+                b.0.try_into()
+                    .map_err(|_| D::Error::custom("network id must be 8 bytes"))?;
             Ok(NetworkId(arr))
         }
     }

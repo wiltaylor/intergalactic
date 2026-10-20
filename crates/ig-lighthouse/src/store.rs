@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -96,7 +99,11 @@ impl Network {
 
     fn allocate(&self) -> Option<Ipv4Addr> {
         let (lo, hi) = self.host_range();
-        let used: std::collections::HashSet<u32> = self.members.values().map(|m| u32::from(m.address)).collect();
+        let used: std::collections::HashSet<u32> = self
+            .members
+            .values()
+            .map(|m| u32::from(m.address))
+            .collect();
         (lo..=hi).find(|a| !used.contains(a)).map(Ipv4Addr::from)
     }
 
@@ -166,7 +173,12 @@ impl Store {
 
     /// Consume an invite and add the node. Re-joining an existing member returns
     /// the existing address without consuming the invite.
-    pub fn join(&mut self, network: NetworkId, node: NodeId, token: &[u8; 16]) -> Result<Ipv4Addr, StoreError> {
+    pub fn join(
+        &mut self,
+        network: NetworkId,
+        node: NodeId,
+        token: &[u8; 16],
+    ) -> Result<Ipv4Addr, StoreError> {
         let net = self
             .networks
             .get_mut(&network)
@@ -180,7 +192,13 @@ impl Store {
         if net.invites[idx].uses_left == 0 {
             net.invites.remove(idx);
         }
-        net.members.insert(node, Member { address, joined_at: now_secs() });
+        net.members.insert(
+            node,
+            Member {
+                address,
+                joined_at: now_secs(),
+            },
+        );
         Ok(address)
     }
 
@@ -189,11 +207,18 @@ impl Store {
             .networks
             .get_mut(&network)
             .ok_or_else(|| StoreError::NoSuchNetwork(network.to_string()))?;
-        net.members.remove(node).map(|_| ()).ok_or(StoreError::NotMember)
+        net.members
+            .remove(node)
+            .map(|_| ())
+            .ok_or(StoreError::NotMember)
     }
 
     pub fn networks_of(&self, node: &NodeId) -> Vec<NetworkId> {
-        self.networks.values().filter(|n| n.members.contains_key(node)).map(|n| n.id).collect()
+        self.networks
+            .values()
+            .filter(|n| n.members.contains_key(node))
+            .map(|n| n.id)
+            .collect()
     }
 
     pub fn share_network(&self, a: &NodeId, b: &NodeId) -> bool {
@@ -264,21 +289,36 @@ mod tests {
     #[test]
     fn join_allocates_sequential_addresses_and_consumes_invites() {
         let mut s = Store::default();
-        let id = s.create_network("dev", "10.90.0.0/29".parse().unwrap()).unwrap().id;
+        let id = s
+            .create_network("dev", "10.90.0.0/29".parse().unwrap())
+            .unwrap()
+            .id;
         let token = invite(s.networks.get_mut(&id).unwrap(), 2);
         let a = NodeId(ig_proto::random_array());
         let b = NodeId(ig_proto::random_array());
         let c = NodeId(ig_proto::random_array());
-        assert_eq!(s.join(id, a, &token).unwrap(), "10.90.0.1".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(s.join(id, b, &token).unwrap(), "10.90.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            s.join(id, a, &token).unwrap(),
+            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            s.join(id, b, &token).unwrap(),
+            "10.90.0.2".parse::<Ipv4Addr>().unwrap()
+        );
         // Used up.
         assert!(matches!(s.join(id, c, &token), Err(StoreError::BadInvite)));
         // Re-join is idempotent and needs no invite.
-        assert_eq!(s.join(id, a, &[0u8; 16]).unwrap(), "10.90.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            s.join(id, a, &[0u8; 16]).unwrap(),
+            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+        );
         s.remove_member(id, &a).unwrap();
         let token2 = invite(s.networks.get_mut(&id).unwrap(), 10);
         // Freed address is reused.
-        assert_eq!(s.join(id, c, &token2).unwrap(), "10.90.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            s.join(id, c, &token2).unwrap(),
+            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+        );
         assert!(s.share_network(&b, &c));
         assert!(!s.share_network(&a, &b));
     }
@@ -286,9 +326,16 @@ mod tests {
     #[test]
     fn rejects_bad_networks() {
         let mut s = Store::default();
-        s.create_network("x", "10.0.0.0/24".parse().unwrap()).unwrap();
-        assert!(matches!(s.create_network("x", "10.1.0.0/24".parse().unwrap()), Err(StoreError::DuplicateName(_))));
-        assert!(matches!(s.create_network("y", "10.1.0.0/31".parse().unwrap()), Err(StoreError::PrefixTooSmall(31))));
+        s.create_network("x", "10.0.0.0/24".parse().unwrap())
+            .unwrap();
+        assert!(matches!(
+            s.create_network("x", "10.1.0.0/24".parse().unwrap()),
+            Err(StoreError::DuplicateName(_))
+        ));
+        assert!(matches!(
+            s.create_network("y", "10.1.0.0/31".parse().unwrap()),
+            Err(StoreError::PrefixTooSmall(31))
+        ));
     }
 
     #[test]
@@ -296,12 +343,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ig-store-test-{}", std::process::id()));
         let path = dir.join("lighthouse.json");
         let mut s = Store::default();
-        let id = s.create_network("dev", "10.90.0.0/24".parse().unwrap()).unwrap().id;
+        let id = s
+            .create_network("dev", "10.90.0.0/24".parse().unwrap())
+            .unwrap()
+            .id;
         invite(s.networks.get_mut(&id).unwrap(), 1);
         s.save(&path).unwrap();
         let back = Store::load(&path).unwrap();
         assert_eq!(back.networks[&id].invites.len(), 1);
-        assert_eq!(back.networks[&id].invites[0].token_hash, s.networks[&id].invites[0].token_hash);
+        assert_eq!(
+            back.networks[&id].invites[0].token_hash,
+            s.networks[&id].invites[0].token_hash
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

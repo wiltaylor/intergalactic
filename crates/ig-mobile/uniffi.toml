@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "dev.intergalactic.core"
+cdylib_name = "ig_mobile"
+android = true
+android_cleaner = true

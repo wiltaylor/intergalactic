@@ -20,6 +20,7 @@ repository = "https://github.com/wiltaylor/intergalactic"
 ig-proto = { path = "crates/ig-proto" }
 ig-core = { path = "crates/ig-core" }
 ig-lighthouse = { path = "crates/ig-lighthouse" }
+ig-node = { path = "crates/ig-node" }
 
 anyhow = "1"
 thiserror = "2"

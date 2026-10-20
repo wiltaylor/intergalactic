@@ -60,7 +60,9 @@ impl FromStr for Invite {
     type Err = ParseInviteError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        let body = s.strip_prefix(INVITE_PREFIX).ok_or(ParseInviteError::Prefix)?;
+        let body = s
+            .strip_prefix(INVITE_PREFIX)
+            .ok_or(ParseInviteError::Prefix)?;
         let bytes = URL_SAFE_NO_PAD.decode(body)?;
         Ok(postcard::from_bytes(&bytes)?)
     }
