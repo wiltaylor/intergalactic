@@ -5,7 +5,7 @@ use boringtun::noise::Tunn;
 use ig_proto::ipc::PeerPath;
 use ig_proto::{NetworkId, NodeId};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,10 @@ pub struct Peer {
     pub hostname: String,
     pub online: bool,
     pub tunn: Tunn,
-    /// Address of the peer in each network we share with it.
-    pub addresses: HashMap<NetworkId, Ipv4Addr>,
+    /// Addresses of the peer in each network we share with it (IPv4 and IPv6).
+    pub addresses: HashMap<NetworkId, Vec<IpAddr>>,
+    /// DNS label of the peer in each shared network.
+    pub dns_names: HashMap<NetworkId, String>,
     /// Endpoints worth trying for a direct path.
     pub candidates: Vec<SocketAddr>,
     /// Endpoint that proved to work (we received authenticated traffic from it).
@@ -112,5 +114,15 @@ impl Peer {
         } else {
             false
         }
+    }
+}
+
+impl Peer {
+    /// Network in which the peer owns `addr`, if any.
+    pub fn network_of(&self, addr: &IpAddr) -> Option<NetworkId> {
+        self.addresses
+            .iter()
+            .find(|(_, v)| v.contains(addr))
+            .map(|(n, _)| *n)
     }
 }

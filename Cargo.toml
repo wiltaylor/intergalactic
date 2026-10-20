@@ -46,6 +46,7 @@ gethostname = "1"
 interprocess = { version = "2.4", features = ["tokio"] }
 tun-rs = { version = "2.8", features = ["async_tokio"] }
 uniffi = "0.32"
+socket2 = { version = "0.6", features = ["all"] }
 
 [profile.release]
 lto = "thin"

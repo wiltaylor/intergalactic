@@ -7,7 +7,7 @@
 //! ```text
 //! Probe       node -> LH   magic | 0x01 | node_id[32] | ts_be[8] | mac[16]
 //! ProbeReply  LH -> node   magic | 0x02 | ts_be[8] | addr(postcard) | mac[16]
-//! Relay       node -> LH   magic | 0x03 | dst_node[32] | wireguard payload
+//! Relay       node -> LH   magic | 0x03 | network[8] | dst_node[32] | wireguard payload
 //! Relayed     LH -> node   magic | 0x04 | src_node[32] | wireguard payload
 //! ```
 //!
@@ -15,11 +15,11 @@
 //! before the mac)`. The session token is given to the node on its control
 //! channel, so only the lighthouse and the node can produce or verify it.
 
-use crate::NodeId;
+use crate::{NetworkId, NodeId};
 use std::net::SocketAddr;
 
 pub const MAGIC: [u8; 4] = *b"IGD\x01";
-pub const RELAY_HEADER_LEN: usize = 4 + 1 + 32;
+pub const RELAY_HEADER_LEN: usize = 4 + 1 + 8 + 32;
 
 const T_PROBE: u8 = 1;
 const T_PROBE_REPLY: u8 = 2;
@@ -29,10 +29,23 @@ const MAC_LEN: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Disco<'a> {
-    Probe { node: NodeId, ts: u64 },
-    ProbeReply { ts: u64, observed: SocketAddr },
-    Relay { dst: NodeId, payload: &'a [u8] },
-    Relayed { src: NodeId, payload: &'a [u8] },
+    Probe {
+        node: NodeId,
+        ts: u64,
+    },
+    ProbeReply {
+        ts: u64,
+        observed: SocketAddr,
+    },
+    Relay {
+        network: NetworkId,
+        dst: NodeId,
+        payload: &'a [u8],
+    },
+    Relayed {
+        src: NodeId,
+        payload: &'a [u8],
+    },
 }
 
 /// True if the datagram is a disco frame rather than WireGuard.
@@ -69,10 +82,11 @@ pub fn encode_probe_reply(ts: u64, observed: SocketAddr, session_token: &[u8; 32
     out
 }
 
-pub fn encode_relay(dst: &NodeId, payload: &[u8]) -> Vec<u8> {
+pub fn encode_relay(network: &NetworkId, dst: &NodeId, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(RELAY_HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
     out.push(T_RELAY);
+    out.extend_from_slice(&network.0);
     out.extend_from_slice(&dst.0);
     out.extend_from_slice(payload);
     out
@@ -113,12 +127,13 @@ pub fn decode(datagram: &[u8]) -> Option<Disco<'_>> {
             Some(Disco::ProbeReply { ts, observed })
         }
         T_RELAY => {
-            if body.len() < 32 {
+            if body.len() < 40 {
                 return None;
             }
             Some(Disco::Relay {
-                dst: NodeId(body[..32].try_into().ok()?),
-                payload: &body[32..],
+                network: NetworkId(body[..8].try_into().ok()?),
+                dst: NodeId(body[8..40].try_into().ok()?),
+                payload: &body[40..],
             })
         }
         T_RELAYED => {
@@ -190,10 +205,12 @@ mod tests {
     #[test]
     fn relay_frames() {
         let a = NodeId(crate::random_array());
-        let f = encode_relay(&a, b"wg");
+        let n = NetworkId::random();
+        let f = encode_relay(&n, &a, b"wg");
         assert_eq!(
             decode(&f),
             Some(Disco::Relay {
+                network: n,
                 dst: a,
                 payload: b"wg"
             })

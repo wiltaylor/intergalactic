@@ -4,7 +4,7 @@
 use crate::control::NetworkInfo;
 use crate::{NetworkId, NodeId};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IpcRequest {
@@ -54,8 +54,11 @@ pub struct PeerStatus {
     pub node: NodeId,
     pub hostname: String,
     pub online: bool,
-    /// (network id, address in that network)
-    pub addresses: Vec<(NetworkId, Ipv4Addr)>,
+    /// (network id, address in that network); both IPv4 and IPv6 entries.
+    pub addresses: Vec<(NetworkId, IpAddr)>,
+    /// (network id, fully qualified DNS name)
+    #[serde(default)]
+    pub names: Vec<(NetworkId, String)>,
     pub path: PeerPath,
     pub endpoint: Option<SocketAddr>,
     pub last_handshake_secs_ago: Option<u64>,

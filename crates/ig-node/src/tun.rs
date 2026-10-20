@@ -37,6 +37,9 @@ impl OsTun {
             .name(name.clone())
             .ipv4(network.address, network.cidr.prefix_len(), None)
             .mtu(OVERLAY_MTU);
+        if let (Some(a6), Some(c6)) = (network.address6, network.cidr6) {
+            builder = builder.ipv6(a6, c6.prefix_len());
+        }
         #[cfg(windows)]
         {
             // Stable GUID per network keeps Windows from creating a new adapter
@@ -50,7 +53,13 @@ impl OsTun {
         }
         let dev = builder.build_async()?;
         let actual = dev.name().unwrap_or_else(|_| name.clone());
-        tracing::info!(interface = %actual, address = %network.address, cidr = %network.cidr, "created tun");
+        tracing::info!(
+            interface = %actual,
+            address = %network.address,
+            cidr = %network.cidr,
+            address6 = ?network.address6,
+            "created tun"
+        );
         Ok(OsTun { dev, name: actual })
     }
 }

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 # Replace lighthouse.example.com with the public DNS name or IP of this VPS.
-ExecStart=/usr/local/bin/ig-lighthouse serve --listen 0.0.0.0:7777 --public-host lighthouse.example.com
+ExecStart=/usr/local/bin/ig-lighthouse serve --listen [::]:7777 --public-host lighthouse.example.com --dns-domain ig.internal
 Restart=on-failure
 RestartSec=2
 DynamicUser=yes

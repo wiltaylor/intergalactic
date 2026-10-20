@@ -88,6 +88,45 @@ Empty means allow all. `ig_core::filter` is stateful per peer:
 - stray TCP segments without state are dropped, so the kernel never answers with RST;
 - ICMP echo requests need an `icmp` rule; echo replies to our own pings pass; ICMP errors pass.
 
+## Addresses
+
+Each network has an IPv4 prefix and an optional IPv6 prefix. The lighthouse hands out host
+numbers; a member's IPv6 address uses the same host number as its IPv4 address
+(`10.90.0.7` and `fd42:9a:1::7`). The first host of each prefix (`10.90.0.1`, `fd42:9a:1::1`)
+is reserved for the DNS responder and never assigned.
+
+The UDP socket is dual-stack (`[::]` with `IPV6_V6ONLY=0`) on both nodes and lighthouses, so
+underlay endpoints can be IPv4 or IPv6. IPv4 peers appear as IPv4-mapped addresses and are
+normalised before use. A v4-only host simply skips IPv6 candidates.
+
+## Peer DNS
+
+Names are `<label>.<network>.<domain>`, with `<label>.<domain>` as a shortcut. The lighthouse
+derives `label` from the hostname (lowercase, `[a-z0-9-]`) and keeps it unique per network
+(`laptop`, `laptop-2`). The domain is a lighthouse setting (`--dns-domain`), default
+`ig.internal`, which is reserved for private use and never resolves on the internet.
+
+Resolution happens inside the node (`ig_core::dns`): a UDP packet from the TUN addressed to
+the reserved responder address on port 53 is answered straight back into the TUN with A, AAAA
+or PTR records. No socket listens anywhere, and the same code path works on Android.
+
+The desktop daemon then tells the OS where to send those names (`ig_node::dns_os`):
+
+- Linux with systemd-resolved: `resolvectl dns`/`domain` per interface, routing-only domains
+  (`~dev.ig.internal`), default route disabled for the interface.
+- Linux without resolvectl: a managed block in `/etc/hosts` (`--dns hosts`).
+- Windows: per-interface DNS server via `netsh` plus Name Resolution Policy Table rules, so
+  only the overlay suffixes are sent to the overlay.
+- Android: `VpnService.Builder.addDnsServer` and `addSearchDomain`.
+
+## Relay rate limits
+
+The lighthouse enforces a token bucket per `(network, member)` and one per network, in bytes,
+with one second of burst. Relay frames carry the network id, so one member in two networks is
+limited by the network the traffic belongs to. Networks without a limit use the lighthouse
+default (`serve --relay-limit-*`). Direct peer-to-peer traffic never touches the lighthouse and
+is never limited. Limits are shown to members in `ig status`.
+
 ## Persistence
 
 - Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, invite hashes) in the

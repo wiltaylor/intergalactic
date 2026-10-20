@@ -22,3 +22,6 @@ async-trait.workspace = true
 gethostname.workspace = true
 interprocess.workspace = true
 tun-rs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

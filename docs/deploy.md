@@ -16,7 +16,7 @@ Admin commands need access to `/var/lib/intergalactic/lighthouse/admin.sock`:
 
 ```sh
 sudo ig-lighthouse info
-sudo ig-lighthouse network create dev 10.90.0.0/24
+sudo ig-lighthouse network create dev 10.90.0.0/24 --ipv6 fd42:9a:1::/64
 sudo ig-lighthouse invite create dev --uses 10 --ttl 30d --label "team"
 sudo ig-lighthouse node list
 sudo ig-lighthouse node remove dev <node-id>
@@ -38,6 +38,26 @@ sudo ig-lighthouse network policy dev
 
 Policy changes reach online members within a second.
 
+### DNS domain
+
+`ig-lighthouse serve --dns-domain ig.internal` sets the suffix for peer names. Use a name
+that does not exist on the internet; `.internal` is reserved for exactly this. Members become
+`<host>.<network>.<domain>`, for example `laptop.dev.ig.internal`, and the shortcut
+`laptop.ig.internal` works when the label is unique across the device's networks.
+
+### Relay limits
+
+```sh
+# Default for every network that has no limit of its own:
+ig-lighthouse serve ... --relay-limit-per-node-kbps 5000 --relay-limit-total-kbps 50000
+# Per network:
+sudo ig-lighthouse network relay-limit game --per-node-kbps 1000 --total-kbps 10000
+# Back to the lighthouse default:
+sudo ig-lighthouse network relay-limit game
+```
+
+Limits apply only to traffic relayed through the lighthouse. Direct paths are never limited.
+
 ## Node on Linux
 
 ```sh
@@ -53,17 +73,30 @@ The daemon needs `CAP_NET_ADMIN` for `/dev/net/tun`. The control socket is
 
 Useful flags for `ig-node run`: `--port 41641` to pin the UDP port (then forward it on your
 router for the best chance of direct paths), `--relay-only` to force relaying,
-`--hostname` to override the name shown to peers.
+`--hostname` to override the name shown to peers, `--dns auto|system|hosts|off` to choose how
+peer names are made resolvable (`auto` uses systemd-resolved when present, otherwise the
+hosts file).
 
 ## Node on Windows
 
-1. Download `wintun.dll` from <https://www.wintun.net/> and place it next to `ig-node.exe`.
-2. Run `ig-node.exe run` from an **Administrator** prompt. State lives in
-   `C:\ProgramData\Intergalactic\node`.
-3. In another prompt: `ig.exe join ig1:...`, `ig.exe status`.
+1. Download `wintun.dll` from <https://www.wintun.net/> and place it next to `ig-node.exe`,
+   for example in `C:\Program Files\Intergalactic\`.
+2. From an **Administrator** prompt install the service:
 
-The daemon is a console program. To run it at boot use NSSM or WinSW to wrap it as a service,
-or a Task Scheduler task that runs at startup with highest privileges.
+   ```powershell
+   ig-node.exe service install            # registers "ig-node", starts it, starts at boot
+   ig.exe join ig1:...
+   ig.exe status
+   ```
+
+   `service install` accepts the same flags as `run` (`--port`, `--dns`, `--relay-only`,
+   `--hostname`). The service logs to `C:\ProgramData\Intergalactic\node\ig-node.log`.
+   `ig-node.exe service stop|start|uninstall` manage it afterwards.
+3. To run in the foreground instead: `ig-node.exe run`.
+
+Peer names are made resolvable with Name Resolution Policy Table rules, so only
+`*.ig.internal` queries go to the overlay. `ig-node.exe service uninstall` or stopping the
+daemon removes the rules.
 
 ## Containers and ephemeral environments
 

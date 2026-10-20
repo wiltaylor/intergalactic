@@ -3,8 +3,11 @@ use clap::{Parser, Subcommand};
 use ig_lighthouse::admin_socket;
 use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
-use ig_proto::{Keypair, NodeId, Policy, PrivateKey, Rule, DEFAULT_LIGHTHOUSE_PORT};
-use ipnet::Ipv4Net;
+use ig_proto::{
+    Keypair, NodeId, Policy, PrivateKey, RelayLimit, Rule, DEFAULT_DNS_DOMAIN,
+    DEFAULT_LIGHTHOUSE_PORT,
+};
+use ipnet::{Ipv4Net, Ipv6Net};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -38,7 +41,7 @@ enum Cmd {
     /// Run the lighthouse daemon.
     Serve {
         /// TCP and UDP listen address.
-        #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DEFAULT_LIGHTHOUSE_PORT)))]
+        #[arg(long, default_value_t = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_LIGHTHOUSE_PORT)))]
         listen: SocketAddr,
         /// Public host name or IP written into invites.
         #[arg(long)]
@@ -46,6 +49,15 @@ enum Cmd {
         /// Public port written into invites (defaults to the listen port).
         #[arg(long)]
         public_port: Option<u16>,
+        /// DNS suffix for peer names. Pick something that is not a real internet domain.
+        #[arg(long, default_value = DEFAULT_DNS_DOMAIN)]
+        dns_domain: String,
+        /// Default relay cap per member in kbit/s for networks without their own limit (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        relay_limit_per_node_kbps: u32,
+        /// Default relay cap per network in kbit/s for networks without their own limit (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        relay_limit_total_kbps: u32,
     },
     /// Show lighthouse identity and counters.
     Info,
@@ -68,10 +80,13 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum NetworkCmd {
-    /// Create a network, e.g. `network create dev 10.90.0.0/24`.
+    /// Create a network, e.g. `network create dev 10.90.0.0/24 --ipv6 fd42:9a:1::/64`.
     Create {
         name: String,
         cidr: Ipv4Net,
+        /// Optional IPv6 prefix (/120 or larger). Members get matching v4 and v6 host numbers.
+        #[arg(long = "ipv6")]
+        cidr6: Option<Ipv6Net>,
     },
     List,
     Delete {
@@ -83,6 +98,17 @@ enum NetworkCmd {
         /// Allow rule, repeatable: `tcp:22,80`, `udp:27015-27030`, `icmp`.
         #[arg(long = "allow")]
         allow: Vec<Rule>,
+    },
+    /// Cap relayed traffic for one network. Without flags the network falls back
+    /// to the lighthouse default.
+    RelayLimit {
+        network: String,
+        /// kbit/s per member.
+        #[arg(long, default_value_t = 0)]
+        per_node_kbps: u32,
+        /// kbit/s for the whole network.
+        #[arg(long, default_value_t = 0)]
+        total_kbps: u32,
     },
 }
 
@@ -135,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
             listen,
             public_host,
             public_port,
+            dns_domain,
+            relay_limit_per_node_kbps,
+            relay_limit_total_kbps,
         } => {
             std::fs::create_dir_all(&cli.state_dir)
                 .with_context(|| format!("creating {}", cli.state_dir.display()))?;
@@ -145,6 +174,11 @@ async fn main() -> anyhow::Result<()> {
                 public_host,
                 public_port: public_port.unwrap_or(listen.port()),
                 state_path: Some(cli.state_dir.join("lighthouse.json")),
+                dns_domain: dns_domain.trim_matches('.').to_string(),
+                default_relay_limit: RelayLimit {
+                    per_node_kbps: relay_limit_per_node_kbps,
+                    total_kbps: relay_limit_total_kbps,
+                },
             };
             let lh = Lighthouse::start(config).await?;
             println!("lighthouse public key: {}", lh.public_key());
@@ -160,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             if let AdminResponse::Info(i) = r {
                 println!("public key   {}", i.public_key);
                 println!("invite host  {}:{}", i.public_host, i.port);
+                println!("dns domain   {}", i.dns_domain);
                 println!("networks     {}", i.networks);
                 println!("nodes online {}", i.nodes_online);
                 println!(
@@ -172,10 +207,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Network { cmd } => match cmd {
-            NetworkCmd::Create { name, cidr } => {
-                let r =
-                    admin_socket::request(&admin_sock, &AdminRequest::NetworkCreate { name, cidr })
-                        .await?;
+            NetworkCmd::Create { name, cidr, cidr6 } => {
+                let r = admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::NetworkCreate { name, cidr, cidr6 },
+                )
+                .await?;
                 print_networks(r)
             }
             NetworkCmd::List => {
@@ -186,6 +223,23 @@ async fn main() -> anyhow::Result<()> {
                 admin_socket::request(&admin_sock, &AdminRequest::NetworkDelete { network })
                     .await?,
             ),
+            NetworkCmd::RelayLimit {
+                network,
+                per_node_kbps,
+                total_kbps,
+            } => {
+                let limit = RelayLimit {
+                    per_node_kbps,
+                    total_kbps,
+                };
+                expect_ok(
+                    admin_socket::request(
+                        &admin_sock,
+                        &AdminRequest::NetworkSetRelayLimit { network, limit },
+                    )
+                    .await?,
+                )
+            }
             NetworkCmd::Policy { network, allow } => {
                 let policy = Policy { rules: allow };
                 expect_ok(
@@ -265,8 +319,14 @@ async fn main() -> anyhow::Result<()> {
                 match r {
                     AdminResponse::Nodes(nodes) => {
                         println!(
-                            "{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} ENDPOINTS",
-                            "NODE", "HOSTNAME", "OS", "ADDRESS", "NETWORK", "STATE"
+                            "{:<12} {:<20} {:<9} {:<16} {:<30} {:<8} {:<8} ENDPOINTS",
+                            "NODE",
+                            "HOSTNAME",
+                            "OS",
+                            "ADDRESS",
+                            "IPV6 / DNS NAME",
+                            "NETWORK",
+                            "STATE"
                         );
                         for n in nodes {
                             let state = if n.online {
@@ -285,11 +345,18 @@ async fn main() -> anyhow::Result<()> {
                             let eps: Vec<String> =
                                 n.endpoints.iter().map(|e| e.to_string()).collect();
                             println!(
-                                "{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} {}",
+                                "{:<12} {:<20} {:<9} {:<16} {:<30} {:<8} {:<8} {}",
                                 n.node.short(),
                                 truncate(&n.hostname, 20),
                                 truncate(&n.os, 9),
-                                n.address,
+                                n.address.to_string(),
+                                format!(
+                                    "{} {}",
+                                    n.address6
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|| "-".into()),
+                                    n.dns_name
+                                ),
                                 truncate(&n.network_name, 8),
                                 state,
                                 eps.join(",")
@@ -334,8 +401,8 @@ fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
     match r {
         AdminResponse::Networks(list) => {
             println!(
-                "{:<16} {:<16} {:<18} {:<8} {:<7} POLICY",
-                "ID", "NAME", "CIDR", "MEMBERS", "ONLINE"
+                "{:<16} {:<12} {:<18} {:<22} {:<7} {:<6} {:<22} POLICY",
+                "ID", "NAME", "CIDR", "IPV6", "MEMBERS", "ONLINE", "RELAY LIMIT"
             );
             for n in list {
                 let policy = if n.policy.is_allow_all() {
@@ -349,12 +416,14 @@ fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
                         .join(" ")
                 };
                 println!(
-                    "{:<16} {:<16} {:<18} {:<8} {:<7} {}",
+                    "{:<16} {:<12} {:<18} {:<22} {:<7} {:<6} {:<22} {}",
                     n.id.to_string(),
-                    truncate(&n.name, 16),
+                    truncate(&n.name, 12),
                     n.cidr.to_string(),
+                    n.cidr6.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     n.members,
                     n.online,
+                    n.relay_limit.to_string(),
                     policy
                 );
             }

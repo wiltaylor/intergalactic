@@ -44,9 +44,20 @@ pub struct MobileNetwork {
     pub address: String,
     pub prefix_len: u8,
     pub cidr: String,
+    /// IPv6 address, prefix and CIDR when the network has an IPv6 range.
+    pub address6: Option<String>,
+    pub prefix_len6: Option<u8>,
+    pub cidr6: Option<String>,
+    /// In-engine DNS responder addresses to hand to `VpnService.Builder.addDnsServer`.
+    pub dns_server: String,
+    pub dns_server6: Option<String>,
+    /// Search domain for this network (`<network>.<domain>`) and this node's name.
+    pub dns_search_domain: String,
+    pub dns_name: String,
     pub lighthouse: String,
     pub lighthouse_connected: bool,
     pub policy_summary: String,
+    pub relay_limit: String,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -54,8 +65,10 @@ pub struct MobilePeer {
     pub node_id: String,
     pub hostname: String,
     pub online: bool,
-    /// "network=address" strings.
+    /// "network=address" strings (IPv4 and IPv6).
     pub addresses: Vec<String>,
+    /// Fully qualified DNS names, one per shared network.
+    pub names: Vec<String>,
     /// "none", "direct" or "relay".
     pub path: String,
     pub endpoint: Option<String>,
@@ -220,16 +233,7 @@ impl MobileEngine {
         let st = self.engine.status();
         st.networks
             .iter()
-            .map(|n| MobileNetwork {
-                id: n.info.id.to_string(),
-                name: n.info.name.clone(),
-                address: n.info.address.to_string(),
-                prefix_len: n.info.cidr.prefix_len(),
-                cidr: n.info.cidr.to_string(),
-                lighthouse: n.lighthouse.clone(),
-                lighthouse_connected: n.lighthouse_connected,
-                policy_summary: policy_summary(&n.info.policy),
-            })
+            .map(|n| network_record(&n.info, &n.lighthouse, n.lighthouse_connected))
             .collect()
     }
 
@@ -263,6 +267,7 @@ impl MobileEngine {
                             )
                         })
                         .collect(),
+                    names: p.names.iter().map(|(_, n)| n.clone()).collect(),
                     path: match p.path {
                         PeerPath::None => "none",
                         PeerPath::Direct => "direct",
@@ -305,15 +310,31 @@ fn policy_summary(p: &ig_proto::Policy) -> String {
 }
 
 fn to_mobile_network(m: &ig_core::Membership, connected: bool) -> MobileNetwork {
+    network_record(&m.network, &m.lighthouse.host_port(), connected)
+}
+
+fn network_record(
+    n: &ig_proto::control::NetworkInfo,
+    lighthouse: &str,
+    connected: bool,
+) -> MobileNetwork {
     MobileNetwork {
-        id: m.network.id.to_string(),
-        name: m.network.name.clone(),
-        address: m.network.address.to_string(),
-        prefix_len: m.network.cidr.prefix_len(),
-        cidr: m.network.cidr.to_string(),
-        lighthouse: m.lighthouse.host_port(),
+        id: n.id.to_string(),
+        name: n.name.clone(),
+        address: n.address.to_string(),
+        prefix_len: n.cidr.prefix_len(),
+        cidr: n.cidr.to_string(),
+        address6: n.address6.map(|a| a.to_string()),
+        prefix_len6: n.cidr6.map(|c| c.prefix_len()),
+        cidr6: n.cidr6.map(|c| c.to_string()),
+        dns_server: n.dns_server_v4().to_string(),
+        dns_server6: n.dns_server_v6().map(|a| a.to_string()),
+        dns_search_domain: format!("{}.{}", ig_proto::control::dns_label(&n.name), n.dns_domain),
+        dns_name: n.fqdn(),
+        lighthouse: lighthouse.to_string(),
         lighthouse_connected: connected,
-        policy_summary: policy_summary(&m.network.policy),
+        policy_summary: policy_summary(&n.policy),
+        relay_limit: n.relay_limit.to_string(),
     }
 }
 

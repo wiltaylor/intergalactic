@@ -8,8 +8,8 @@ use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
 use ig_proto::control::NetworkInfo;
 use ig_proto::ipc::PeerPath;
-use ig_proto::{Invite, Keypair, Policy, Rule};
-use std::net::Ipv4Addr;
+use ig_proto::{Invite, Keypair, Policy, RelayLimit, Rule};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,23 +24,26 @@ fn init_tracing() {
 }
 
 async fn lighthouse() -> Lighthouse {
-    let lh = Lighthouse::start(LighthouseConfig {
+    Lighthouse::start(LighthouseConfig {
         keypair: Keypair::generate(),
         listen: "127.0.0.1:0".parse().unwrap(),
         public_host: "127.0.0.1".into(),
         public_port: 0,
         state_path: None,
+        dns_domain: "ig.test".into(),
+        default_relay_limit: RelayLimit::unlimited(),
     })
     .await
-    .unwrap();
-    lh
+    .unwrap()
 }
 
-fn create_network(lh: &Lighthouse, name: &str, cidr: &str) {
-    match lh.admin(AdminRequest::NetworkCreate {
+fn create_network(lh: &Lighthouse, name: &str, cidr: &str, cidr6: Option<&str>) {
+    let req = AdminRequest::NetworkCreate {
         name: name.into(),
         cidr: cidr.parse().unwrap(),
-    }) {
+        cidr6: cidr6.map(|c| c.parse().unwrap()),
+    };
+    match lh.admin(req) {
         AdminResponse::Networks(_) => {}
         other => panic!("create failed: {other:?}"),
     }
@@ -139,11 +142,19 @@ async fn deliver(from: &OsSide, to: &mut OsSide, pkt: Vec<u8>) -> Vec<u8> {
     panic!("packet never delivered");
 }
 
+fn v4(info: &NetworkInfo) -> IpAddr {
+    IpAddr::V4(info.address)
+}
+
+fn v6(info: &NetworkInfo) -> IpAddr {
+    IpAddr::V6(info.address6.expect("network has IPv6"))
+}
+
 #[tokio::test]
 async fn two_nodes_exchange_packets_and_go_direct() {
     init_tracing();
     let lh = lighthouse().await;
-    create_network(&lh, "dev", "10.90.0.0/24");
+    create_network(&lh, "dev", "10.90.0.0/24", None);
     let inv = invite(&lh, "dev", 2);
 
     let a = node("alpha", vec![], false).await;
@@ -153,18 +164,23 @@ async fn two_nodes_exchange_packets_and_go_direct() {
     assert_eq!(ia.id, ib.id);
     assert_ne!(ia.address, ib.address);
     assert!(ia.cidr.contains(&ia.address));
+    // First host is the DNS responder, never a member.
+    assert_ne!(ia.address, ia.dns_server_v4());
+    assert_ne!(ib.address, ib.dns_server_v4());
+    assert_eq!(ia.dns_domain, "ig.test");
+    assert_eq!(ia.fqdn(), "alpha.dev.ig.test");
 
     wait_for("peers visible", || {
         a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
     })
     .await;
 
-    let pkt = build_udp(ia.address, 5000, ib.address, 6000, b"hello from alpha");
+    let pkt = build_udp(v4(&ia), 5000, v4(&ib), 6000, b"hello from alpha");
     let got = deliver(&os_a, &mut os_b, pkt.clone()).await;
     assert_eq!(got, pkt);
 
     // Reply direction.
-    let reply = build_udp(ib.address, 6000, ia.address, 5000, b"hello from bravo");
+    let reply = build_udp(v4(&ib), 6000, v4(&ia), 5000, b"hello from bravo");
     let mut os_a = os_a;
     let got = deliver(&os_b, &mut os_a, reply.clone()).await;
     assert_eq!(got, reply);
@@ -177,6 +193,10 @@ async fn two_nodes_exchange_packets_and_go_direct() {
     let st = a.engine.status();
     assert!(st.peers[0].tx_bytes > 0 && st.peers[0].rx_bytes > 0);
     assert_eq!(st.peers[0].hostname, "bravo");
+    assert_eq!(
+        st.peers[0].names,
+        vec![(ia.id, "bravo.dev.ig.test".to_string())]
+    );
     assert!(st.networks[0].lighthouse_connected);
 
     // A third node cannot use the exhausted invite.
@@ -195,10 +215,137 @@ async fn two_nodes_exchange_packets_and_go_direct() {
 }
 
 #[tokio::test]
+async fn ipv6_addresses_work_end_to_end() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "six", "10.96.0.0/24", Some("fd96:1::/64"));
+    let inv = invite(&lh, "six", 2);
+    let a = node("alpha", vec![], false).await;
+    let b = node("bravo", vec![], false).await;
+    let (ia, os_a) = join_with_tun(&a, &inv).await;
+    let (ib, mut os_b) = join_with_tun(&b, &inv).await;
+    // v4 and v6 host numbers line up.
+    let host = u32::from(ia.address) - u32::from(ia.cidr.network());
+    assert_eq!(
+        u128::from(ia.address6.unwrap()) - u128::from(ia.cidr6.unwrap().network()),
+        host as u128
+    );
+    wait_for("peers visible", || {
+        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+    })
+    .await;
+    let pkt = build_udp(v6(&ia), 7000, v6(&ib), 7001, b"over six");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+    // v4 still works in the same session.
+    let pkt4 = build_udp(v4(&ia), 7000, v4(&ib), 7001, b"over four");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt4.clone()).await, pkt4);
+    // Peer status lists both families.
+    let st = a.engine.status();
+    assert_eq!(st.peers[0].addresses.len(), 2);
+    a.engine.shutdown().await;
+    b.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+    let mut q = vec![0xbe, 0xef, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q
+}
+
+#[tokio::test]
+async fn dns_names_resolve_through_the_tun() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "Dev Net", "10.97.0.0/24", Some("fd97::/64"));
+    let inv = invite(&lh, "Dev Net", 2);
+    let a = node("Alpha Laptop", vec![], false).await;
+    let b = node("bravo", vec![], false).await;
+    let (ia, mut os_a) = join_with_tun(&a, &inv).await;
+    let (ib, _os_b) = join_with_tun(&b, &inv).await;
+    assert_eq!(ia.fqdn(), "alpha-laptop.dev-net.ig.test");
+    wait_for("peers visible", || a.engine.status().peers.len() == 1).await;
+
+    // A query for bravo's full name, sent to the network's DNS address.
+    let dns4 = IpAddr::V4(ia.dns_server_v4());
+    let q = build_udp(
+        v4(&ia),
+        40000,
+        dns4,
+        53,
+        &dns_query("bravo.dev-net.ig.test", 1),
+    );
+    os_a.to_tun.send(q).await.unwrap();
+    let reply = recv_packet(&mut os_a, Duration::from_secs(2))
+        .await
+        .expect("dns reply");
+    let f = ig_core::packet::parse_flow(&reply).unwrap();
+    assert_eq!((f.src, f.dst, f.sport, f.dport), (dns4, v4(&ia), 53, 40000));
+    let payload = &reply[f.l4_offset + 8..];
+    assert_eq!(&payload[0..2], &[0xbe, 0xef]);
+    assert_eq!(payload[3] & 0x0f, 0, "NOERROR");
+    assert_eq!(&payload[payload.len() - 4..], &ib.address.octets());
+
+    // AAAA over the IPv6 responder, using the short name.
+    let dns6 = IpAddr::V6(ia.dns_server_v6().unwrap());
+    let q6 = build_udp(v6(&ia), 40001, dns6, 53, &dns_query("bravo.ig.test", 28));
+    os_a.to_tun.send(q6).await.unwrap();
+    let reply6 = recv_packet(&mut os_a, Duration::from_secs(2))
+        .await
+        .expect("dns reply v6");
+    let f6 = ig_core::packet::parse_flow(&reply6).unwrap();
+    assert_eq!((f6.src, f6.dst), (dns6, v6(&ia)));
+    let payload6 = &reply6[f6.l4_offset + 8..];
+    assert_eq!(
+        &payload6[payload6.len() - 16..],
+        &ib.address6.unwrap().octets()
+    );
+
+    // Our own name resolves too; unknown names are NXDOMAIN.
+    let qs = build_udp(
+        v4(&ia),
+        40002,
+        dns4,
+        53,
+        &dns_query("alpha-laptop.dev-net.ig.test", 1),
+    );
+    os_a.to_tun.send(qs).await.unwrap();
+    let rs = recv_packet(&mut os_a, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let fs = ig_core::packet::parse_flow(&rs).unwrap();
+    assert_eq!(&rs[rs.len() - 4..], &ia.address.octets());
+    assert_eq!(fs.dport, 40002);
+    let qn = build_udp(
+        v4(&ia),
+        40003,
+        dns4,
+        53,
+        &dns_query("nobody.dev-net.ig.test", 1),
+    );
+    os_a.to_tun.send(qn).await.unwrap();
+    let rn = recv_packet(&mut os_a, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let fn_ = ig_core::packet::parse_flow(&rn).unwrap();
+    assert_eq!(rn[fn_.l4_offset + 8 + 3] & 0x0f, 3, "NXDOMAIN");
+
+    a.engine.shutdown().await;
+    b.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
 async fn relay_only_nodes_still_talk() {
     init_tracing();
     let lh = lighthouse().await;
-    create_network(&lh, "dev", "10.91.0.0/24");
+    create_network(&lh, "dev", "10.91.0.0/24", None);
     let inv = invite(&lh, "dev", 2);
     let a = node("alpha", vec![], true).await;
     let b = node("bravo", vec![], true).await;
@@ -208,9 +355,7 @@ async fn relay_only_nodes_still_talk() {
         a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
     })
     .await;
-    // The lighthouse must know both UDP addresses before it can relay; probes
-    // are sent as soon as the control channel is up.
-    let pkt = build_udp(ia.address, 1, ib.address, 2, b"via relay");
+    let pkt = build_udp(v4(&ia), 1, v4(&ib), 2, b"via relay");
     let got = deliver(&os_a, &mut os_b, pkt.clone()).await;
     assert_eq!(got, pkt);
     wait_for("relay path reported", || {
@@ -224,10 +369,100 @@ async fn relay_only_nodes_still_talk() {
 }
 
 #[tokio::test]
+async fn relay_limit_caps_relayed_traffic_per_network() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "slow", "10.98.0.0/24", None);
+    let inv = invite(&lh, "slow", 2);
+    let a = node("alpha", vec![], true).await;
+    let b = node("bravo", vec![], true).await;
+    let (ia, os_a) = join_with_tun(&a, &inv).await;
+    let (ib, mut os_b) = join_with_tun(&b, &inv).await;
+    wait_for("peers visible", || {
+        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+    })
+    .await;
+    // Warm the session while unlimited.
+    deliver(&os_a, &mut os_b, build_udp(v4(&ia), 1, v4(&ib), 2, b"warm")).await;
+
+    // 64 kbit/s per node: one second of burst is 8000 bytes, about 7 of our packets.
+    let limit = RelayLimit {
+        per_node_kbps: 64,
+        total_kbps: 0,
+    };
+    assert!(matches!(
+        lh.admin(AdminRequest::NetworkSetRelayLimit {
+            network: "slow".into(),
+            limit
+        }),
+        AdminResponse::Ok
+    ));
+    wait_for("limit pushed", || {
+        a.engine.status().networks[0].info.relay_limit == limit
+    })
+    .await;
+
+    let payload = vec![0u8; 1000];
+    for i in 0..100u16 {
+        os_a.to_tun
+            .send(build_udp(v4(&ia), 100 + i, v4(&ib), 2, &payload))
+            .await
+            .unwrap();
+    }
+    let mut delivered = 0;
+    while recv_packet(&mut os_b, Duration::from_millis(300))
+        .await
+        .is_some()
+    {
+        delivered += 1;
+    }
+    assert!(delivered > 0, "some packets must pass");
+    assert!(
+        delivered < 40,
+        "limit should drop most of 100 packets, got {delivered}"
+    );
+
+    // Back to unlimited: everything passes again.
+    let open = RelayLimit::unlimited();
+    assert!(matches!(
+        lh.admin(AdminRequest::NetworkSetRelayLimit {
+            network: "slow".into(),
+            limit: open
+        }),
+        AdminResponse::Ok
+    ));
+    wait_for("limit lifted", || {
+        a.engine.status().networks[0].info.relay_limit == open
+    })
+    .await;
+    for i in 0..30u16 {
+        os_a.to_tun
+            .send(build_udp(v4(&ia), 300 + i, v4(&ib), 2, &payload))
+            .await
+            .unwrap();
+    }
+    let mut delivered = 0;
+    while recv_packet(&mut os_b, Duration::from_millis(300))
+        .await
+        .is_some()
+    {
+        delivered += 1;
+    }
+    assert!(
+        delivered >= 25,
+        "unlimited relay should pass nearly all, got {delivered}"
+    );
+
+    a.engine.shutdown().await;
+    b.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
 async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
     init_tracing();
     let lh = lighthouse().await;
-    create_network(&lh, "game", "10.92.0.0/24");
+    create_network(&lh, "game", "10.92.0.0/24", None);
     let inv = invite(&lh, "game", 2);
     let a = node("alpha", vec![], false).await;
     let b = node("bravo", vec![], false).await;
@@ -239,7 +474,7 @@ async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
     .await;
 
     // Establish the session while the policy is open.
-    let warm = build_udp(ia.address, 1, ib.address, 2, b"warm");
+    let warm = build_udp(v4(&ia), 1, v4(&ib), 2, b"warm");
     deliver(&os_a, &mut os_b, warm).await;
 
     // Lock the network down to SSH only.
@@ -261,7 +496,7 @@ async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
 
     // Unsolicited UDP is dropped.
     os_a.to_tun
-        .send(build_udp(ia.address, 1, ib.address, 2, b"blocked"))
+        .send(build_udp(v4(&ia), 1, v4(&ib), 2, b"blocked"))
         .await
         .unwrap();
     assert!(recv_packet(&mut os_b, Duration::from_millis(500))
@@ -269,15 +504,15 @@ async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
         .is_none());
 
     // SSH SYN is allowed...
-    let syn = build_tcp(ia.address, 40000, ib.address, 22, TCP_SYN);
+    let syn = build_tcp(v4(&ia), 40000, v4(&ib), 22, TCP_SYN);
     assert_eq!(deliver(&os_a, &mut os_b, syn.clone()).await, syn);
     // ...and so is the SYN-ACK coming back (a reply to a tracked flow).
-    let synack = build_tcp(ib.address, 22, ia.address, 40000, TCP_SYN | 0x10);
+    let synack = build_tcp(v4(&ib), 22, v4(&ia), 40000, TCP_SYN | 0x10);
     assert_eq!(deliver(&os_b, &mut os_a, synack.clone()).await, synack);
 
     // HTTP SYN is not.
     os_a.to_tun
-        .send(build_tcp(ia.address, 40001, ib.address, 80, TCP_SYN))
+        .send(build_tcp(v4(&ia), 40001, v4(&ib), 80, TCP_SYN))
         .await
         .unwrap();
     assert!(recv_packet(&mut os_b, Duration::from_millis(500))
@@ -293,8 +528,8 @@ async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
 async fn networks_are_isolated_and_a_node_can_be_in_several() {
     init_tracing();
     let lh = lighthouse().await;
-    create_network(&lh, "dev", "10.93.0.0/24");
-    create_network(&lh, "game", "10.94.0.0/24");
+    create_network(&lh, "dev", "10.93.0.0/24", None);
+    create_network(&lh, "game", "10.94.0.0/24", None);
     let dev_inv = invite(&lh, "dev", 5);
     let game_inv = invite(&lh, "game", 5);
 
@@ -317,15 +552,15 @@ async fn networks_are_isolated_and_a_node_can_be_in_several() {
     assert_eq!(a.engine.memberships().len(), 2);
 
     // bravo -> alpha over dev lands on alpha's dev interface.
-    let p1 = build_udp(b_dev.address, 1, a_dev.address, 2, b"dev");
+    let p1 = build_udp(v4(&b_dev), 1, v4(&a_dev), 2, b"dev");
     assert_eq!(deliver(&os_b, &mut os_a_dev, p1.clone()).await, p1);
     // charlie -> alpha over game lands on alpha's game interface.
-    let p2 = build_udp(c_game.address, 1, a_game.address, 2, b"game");
+    let p2 = build_udp(v4(&c_game), 1, v4(&a_game), 2, b"game");
     assert_eq!(deliver(&os_c, &mut os_a_game, p2.clone()).await, p2);
 
     // charlie has no route to the dev network at all.
     os_c.to_tun
-        .send(build_udp(c_game.address, 1, a_dev.address, 2, b"leak?"))
+        .send(build_udp(v4(&c_game), 1, v4(&a_dev), 2, b"leak?"))
         .await
         .unwrap();
     assert!(recv_packet(&mut os_a_dev, Duration::from_millis(400))
@@ -333,14 +568,9 @@ async fn networks_are_isolated_and_a_node_can_be_in_several() {
         .is_none());
     // charlie cannot spoof a dev source address either: alpha only accepts
     // charlie's game address as a source.
+    let spoof: IpAddr = "10.93.0.200".parse().unwrap();
     os_c.to_tun
-        .send(build_udp(
-            Ipv4Addr::new(10, 93, 0, 200),
-            1,
-            a_game.address,
-            2,
-            b"spoof",
-        ))
+        .send(build_udp(spoof, 1, v4(&a_game), 2, b"spoof"))
         .await
         .unwrap();
     assert!(recv_packet(&mut os_a_game, Duration::from_millis(400))
@@ -369,7 +599,7 @@ async fn networks_are_isolated_and_a_node_can_be_in_several() {
 async fn restart_resumes_memberships_and_admin_can_kick() {
     init_tracing();
     let lh = lighthouse().await;
-    create_network(&lh, "dev", "10.95.0.0/24");
+    create_network(&lh, "dev", "10.95.0.0/24", None);
     let inv = invite(&lh, "dev", 5);
     let mut a = node("alpha", vec![], false).await;
     let b = node("bravo", vec![], false).await;
@@ -416,6 +646,7 @@ async fn restart_resumes_memberships_and_admin_can_kick() {
         AdminResponse::Nodes(nodes) => {
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].hostname, "alpha");
+            assert_eq!(nodes[0].dns_name, "alpha");
             assert!(nodes[0].online);
         }
         other => panic!("{other:?}"),

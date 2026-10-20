@@ -5,10 +5,10 @@
 //! Flows admitted by a rule are tracked too, so the rest of the conversation
 //! passes without re-matching. Anything else is dropped before it reaches the OS.
 
-use crate::packet::{self, Flow, PROTO_ICMP, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
+use crate::packet::{self, Flow, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
 use ig_proto::{Policy, Proto};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 const TCP_IDLE: Duration = Duration::from_secs(3600);
@@ -20,9 +20,9 @@ const SWEEP_AT: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Key {
     proto: u8,
-    local: Ipv4Addr,
+    local: IpAddr,
     lport: u16,
-    remote: Ipv4Addr,
+    remote: IpAddr,
     rport: u16,
 }
 
@@ -48,7 +48,7 @@ impl PeerFilter {
         // For ICMP echo, "ports" are (id, type); normalise type to the request so
         // the reply (type 0) matches the request (type 8).
         let (lport, rport) = match f.proto {
-            PROTO_ICMP => (f.sport, 8),
+            PROTO_ICMP | PROTO_ICMPV6 => (f.sport, 8),
             _ => (f.sport, f.dport),
         };
         Key {
@@ -62,7 +62,7 @@ impl PeerFilter {
 
     fn key_inbound(f: &Flow) -> Key {
         let (lport, rport) = match f.proto {
-            PROTO_ICMP => (f.sport, 8),
+            PROTO_ICMP | PROTO_ICMPV6 => (f.sport, 8),
             _ => (f.dport, f.sport),
         };
         Key {
@@ -125,6 +125,13 @@ impl PeerFilter {
                 3 | 11 | 12 => true,
                 _ => false,
             },
+            PROTO_ICMPV6 => match f.dport as u8 {
+                128 => rule_allows(policy, Proto::Icmp, 0),
+                129 => false,
+                // Destination unreachable, packet too big, time exceeded, parameter problem.
+                1..=4 => true,
+                _ => false,
+            },
             _ => false,
         };
         if allowed {
@@ -147,11 +154,11 @@ mod tests {
     use crate::packet::{build_icmp_echo, build_tcp, build_udp};
     use ig_proto::Rule;
 
-    fn me() -> Ipv4Addr {
-        Ipv4Addr::new(10, 9, 0, 1)
+    fn me() -> IpAddr {
+        "10.9.0.1".parse().unwrap()
     }
-    fn peer() -> Ipv4Addr {
-        Ipv4Addr::new(10, 9, 0, 2)
+    fn peer() -> IpAddr {
+        "10.9.0.2".parse().unwrap()
     }
 
     fn policy(rules: &[&str]) -> Policy {
@@ -194,6 +201,20 @@ mod tests {
         assert!(f.allow_inbound(&p, &build_udp(peer(), 53, me(), 5353, b"a")));
         // Unsolicited UDP: dropped.
         assert!(!f.allow_inbound(&p, &build_udp(peer(), 53, me(), 5354, b"a")));
+    }
+
+    #[test]
+    fn ipv6_flows_are_tracked_too() {
+        let p = policy(&["tcp:22"]);
+        let me6: IpAddr = "fd00::1".parse().unwrap();
+        let peer6: IpAddr = "fd00::2".parse().unwrap();
+        let mut f = PeerFilter::new();
+        assert!(f.allow_inbound(&p, &build_tcp(peer6, 4000, me6, 22, TCP_SYN)));
+        assert!(!f.allow_inbound(&p, &build_tcp(peer6, 4001, me6, 80, TCP_SYN)));
+        // ICMPv6 echo needs a rule; packet-too-big is always fine.
+        assert!(!f.allow_inbound(&p, &build_icmp_echo(peer6, me6, false, 1)));
+        f.note_outbound(&build_icmp_echo(me6, peer6, false, 5));
+        assert!(f.allow_inbound(&p, &build_icmp_echo(peer6, me6, true, 5)));
     }
 
     #[test]

@@ -161,10 +161,15 @@ struct Session {
 }
 
 async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Session> {
-    let mut addrs = tokio::net::lookup_host(h.addr.host_port()).await?;
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(h.addr.host_port()).await?.collect();
+    // Prefer IPv4 for the lighthouse: it is reachable from v4-only networks and
+    // our UDP socket can always send to it.
     let addr = addrs
+        .iter()
         .find(|a| a.is_ipv4())
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 address for {}", h.addr.host))?;
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no address for {}", h.addr.host))?;
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("connect timed out"))??;

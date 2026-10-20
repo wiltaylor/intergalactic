@@ -1,6 +1,7 @@
 //! The engine: UDP socket, peer table, TUN attachments and the glue between them.
 
 use crate::control::{self, ControlCmd, LighthouseHandle};
+use crate::dns::DnsTable;
 use crate::filter::PeerFilter;
 use crate::packet;
 use crate::peer::Peer;
@@ -12,11 +13,12 @@ use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use ig_proto::control::{NetworkInfo, PeerInfo};
 use ig_proto::ipc::{NetworkStatus, PeerStatus, StatusReport};
+use ig_proto::udp::{bind_dual_stack, canonical, reachable, to_wire};
 use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -105,7 +107,7 @@ struct NetworkEntry {
 struct PeerTable {
     by_id: HashMap<NodeId, Arc<Mutex<Peer>>>,
     by_index: HashMap<u32, NodeId>,
-    by_addr: HashMap<Ipv4Addr, NodeId>,
+    by_addr: HashMap<IpAddr, NodeId>,
     next_index: u32,
 }
 
@@ -114,7 +116,7 @@ impl PeerTable {
         self.by_addr.clear();
         for (id, p) in &self.by_id {
             let p = p.lock();
-            for addr in p.addresses.values() {
+            for addr in p.addresses.values().flatten() {
                 if let Some(other) = self.by_addr.insert(*addr, *id) {
                     if other != *id {
                         tracing::warn!(%addr, "overlay address used by two peers; networks have overlapping CIDRs");
@@ -132,7 +134,11 @@ pub struct Inner {
     pub hostname: String,
     pub os: String,
     udp: UdpSocket,
+    /// True when the socket is IPv6 with IPv4-mapped addresses enabled.
+    dual_stack: bool,
     udp_port: u16,
+    /// Peer and own names for the in-engine DNS responder.
+    dns: RwLock<DnsTable>,
     keepalive: Option<u16>,
     relay_only: bool,
     peers: RwLock<PeerTable>,
@@ -155,7 +161,8 @@ impl Engine {
         config: EngineConfig,
         protector: Arc<dyn SocketProtector>,
     ) -> Result<(Engine, mpsc::Receiver<EngineEvent>), EngineError> {
-        let udp = UdpSocket::bind(("0.0.0.0", config.udp_port)).await?;
+        let (udp, dual_stack) =
+            bind_dual_stack(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), config.udp_port)?;
         protect(&*protector, &udp);
         let udp_port = udp.local_addr()?.port();
         let secret = config.keypair.private.to_static_secret();
@@ -185,7 +192,9 @@ impl Engine {
             hostname: config.hostname,
             os: config.os,
             udp,
+            dual_stack,
             udp_port,
+            dns: RwLock::new(DnsTable::new()),
             keepalive: config.persistent_keepalive,
             relay_only: config.relay_only,
             peers: RwLock::new(PeerTable::default()),
@@ -204,7 +213,8 @@ impl Engine {
         for lh in by_lighthouse.into_keys() {
             inner.ensure_lighthouse(lh);
         }
-        tracing::info!(node = %inner.keypair.public, udp_port, "engine started");
+        inner.rebuild_dns();
+        tracing::info!(node = %inner.keypair.public, udp_port, dual_stack, "engine started");
         Ok((Engine { inner }, events_rx))
     }
 
@@ -392,7 +402,10 @@ impl Inner {
     }
 
     pub fn udp_send(&self, data: &[u8], to: SocketAddr) {
-        if let Err(e) = self.udp.try_send_to(data, to) {
+        if !reachable(to, self.dual_stack) {
+            return;
+        }
+        if let Err(e) = self.udp.try_send_to(data, to_wire(to, self.dual_stack)) {
             tracing::trace!(%to, error = %e, "udp send failed");
         }
     }
@@ -431,16 +444,73 @@ impl Inner {
             .any(|e| e.membership.lighthouse == *lh)
     }
 
-    fn overlay_cidrs(&self) -> Vec<Ipv4Net> {
-        self.networks
-            .read()
-            .values()
-            .map(|e| e.membership.network.cidr)
-            .collect()
+    fn overlay_cidrs(&self) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
+        let nets = self.networks.read();
+        (
+            nets.values().map(|e| e.membership.network.cidr).collect(),
+            nets.values()
+                .filter_map(|e| e.membership.network.cidr6)
+                .collect(),
+        )
     }
 
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
-        crate::endpoints::local_candidates(self.udp_port, &self.overlay_cidrs())
+        let (v4, v6) = self.overlay_cidrs();
+        crate::endpoints::local_candidates(self.udp_port, &v4, &v6, self.dual_stack)
+    }
+
+    /// Rebuild the DNS table from memberships and peers.
+    fn rebuild_dns(&self) {
+        let mut table = DnsTable::new();
+        let nets: Vec<NetworkInfo> = self
+            .networks
+            .read()
+            .values()
+            .map(|e| e.membership.network.clone())
+            .collect();
+        for n in &nets {
+            table.add_zone(&n.dns_domain);
+            if !n.dns_name.is_empty() {
+                table.add(
+                    &n.dns_name,
+                    &ig_proto::control::dns_label(&n.name),
+                    &n.dns_domain,
+                    &n.addresses(),
+                );
+            }
+        }
+        {
+            let t = self.peers.read();
+            for p in t.by_id.values() {
+                let p = p.lock();
+                for (net_id, label) in &p.dns_names {
+                    let Some(n) = nets.iter().find(|n| n.id == *net_id) else {
+                        continue;
+                    };
+                    let Some(addrs) = p.addresses.get(net_id) else {
+                        continue;
+                    };
+                    table.add(
+                        label,
+                        &ig_proto::control::dns_label(&n.name),
+                        &n.dns_domain,
+                        addrs,
+                    );
+                }
+            }
+        }
+        *self.dns.write() = table;
+    }
+
+    /// Is `dst` the DNS responder address of one of our networks?
+    fn is_dns_server(&self, dst: &IpAddr) -> bool {
+        self.networks.read().values().any(|e| {
+            let n = &e.membership.network;
+            match dst {
+                IpAddr::V4(v4) => n.dns_server_v4() == *v4,
+                IpAddr::V6(v6) => n.dns_server_v6() == Some(*v6),
+            }
+        })
     }
 
     fn is_lighthouse_udp(&self, addr: SocketAddr) -> Option<Arc<LighthouseHandle>> {
@@ -478,6 +548,7 @@ impl Inner {
                 },
             );
         }
+        self.rebuild_dns();
         tracing::info!(network = %info.name, address = %info.address, "joined network");
         self.emit(EngineEvent::MembershipsChanged(self.memberships()));
     }
@@ -493,6 +564,7 @@ impl Inner {
             for (pid, p) in t.by_id.iter() {
                 let mut p = p.lock();
                 p.addresses.remove(&id);
+                p.dns_names.remove(&id);
                 if p.addresses.is_empty() {
                     gone.push((*pid, p.index));
                 }
@@ -503,6 +575,7 @@ impl Inner {
             }
             t.rebuild_routes();
         }
+        self.rebuild_dns();
         tracing::info!(network = %id, "left network");
         self.emit(EngineEvent::MembershipsChanged(self.memberships()));
         self.emit(EngineEvent::PeersChanged);
@@ -573,6 +646,7 @@ impl Inner {
                         online: pi.online,
                         tunn,
                         addresses: HashMap::new(),
+                        dns_names: HashMap::new(),
                         candidates: Vec::new(),
                         direct: None,
                         last_direct_rx: None,
@@ -592,9 +666,10 @@ impl Inner {
                 }
             };
             let mut p = arc.lock();
-            p.hostname = pi.hostname;
+            p.hostname = pi.hostname.clone();
             p.online = pi.online;
-            p.addresses.insert(info.id, pi.address);
+            p.addresses.insert(info.id, pi.addresses());
+            p.dns_names.insert(info.id, pi.dns_name.clone());
             let primary = match &p.relay {
                 Some(r) => r.addr == h.addr,
                 None => {
@@ -616,6 +691,7 @@ impl Inner {
                 continue;
             }
             let mut p = p.lock();
+            p.dns_names.remove(&info.id);
             if p.addresses.remove(&info.id).is_some() && p.addresses.is_empty() {
                 gone.push((*pid, p.index));
             }
@@ -626,6 +702,7 @@ impl Inner {
         }
         t.rebuild_routes();
         drop(t);
+        self.rebuild_dns();
         self.emit(EngineEvent::PeersChanged);
     }
 
@@ -674,8 +751,8 @@ impl Inner {
             return;
         }
         let relay_addr = p.relay.as_ref().and_then(|r| *r.udp_addr.read());
-        if let Some(r) = relay_addr {
-            self.udp_send(&disco::encode_relay(&p.id, b), r);
+        if let (Some(r), Some(net)) = (relay_addr, p.relay_network) {
+            self.udp_send(&disco::encode_relay(&net, &p.id, b), r);
         }
         if self.relay_only {
             return;
@@ -697,19 +774,30 @@ impl Inner {
     fn reply(&self, p: &mut Peer, b: &[u8], from: SocketAddr, via_relay: bool) {
         p.last_tx = Some(Instant::now());
         if via_relay {
-            self.udp_send(&disco::encode_relay(&p.id, b), from);
+            if let Some(net) = p.relay_network {
+                self.udp_send(&disco::encode_relay(&net, &p.id, b), from);
+            }
         } else {
             self.udp_send(b, from);
         }
     }
 
-    fn handle_tun_packet(&self, pkt: &[u8], out: &mut [u8]) {
-        let Some(dst) = packet::ipv4_dst(pkt) else {
+    fn handle_tun_packet(&self, pkt: &[u8], out: &mut [u8], dev: &Arc<dyn TunDevice>) {
+        let Some(dst) = packet::dst(pkt) else {
             return;
         };
-        let Some(src) = packet::ipv4_src(pkt) else {
+        let Some(src) = packet::src(pkt) else {
             return;
         };
+        if self.is_dns_server(&dst) {
+            let reply = crate::dns::reply_packet(&self.dns.read(), pkt);
+            if let Some(reply) = reply {
+                if let Err(e) = dev.send(&reply) {
+                    tracing::trace!(error = %e, "dns reply write failed");
+                }
+            }
+            return;
+        }
         let arc = {
             let t = self.peers.read();
             match t.by_addr.get(&dst).and_then(|id| t.by_id.get(id)) {
@@ -721,19 +809,14 @@ impl Inner {
             }
         };
         let mut p = arc.lock();
-        let Some(net) = p
-            .addresses
-            .iter()
-            .find(|(_, a)| **a == dst)
-            .map(|(n, _)| *n)
-        else {
+        let Some(net) = p.network_of(&dst) else {
             return;
         };
         let src_ok = self
             .networks
             .read()
             .get(&net)
-            .is_some_and(|e| e.membership.network.address == src);
+            .is_some_and(|e| e.membership.network.addresses().contains(&src));
         if !src_ok {
             tracing::trace!(%src, %dst, "source address does not belong to the destination's network");
             return;
@@ -835,12 +918,16 @@ impl Inner {
             }
             TunnResult::WriteToTunnelV4(b, src) => {
                 let len = b.len();
-                let delivered = self.deliver(&mut p, src, &out[..len]);
-                if delivered {
+                if self.deliver(&mut p, IpAddr::V4(src), &out[..len]) {
                     p.rx_bytes += len as u64;
                 }
             }
-            TunnResult::WriteToTunnelV6(..) => {}
+            TunnResult::WriteToTunnelV6(b, src) => {
+                let len = b.len();
+                if self.deliver(&mut p, IpAddr::V6(src), &out[..len]) {
+                    p.rx_bytes += len as u64;
+                }
+            }
             TunnResult::Done => {}
             TunnResult::Err(e) => {
                 authenticated = false;
@@ -861,24 +948,19 @@ impl Inner {
     }
 
     /// Validate a decrypted packet and hand it to the right TUN.
-    fn deliver(&self, p: &mut Peer, src: Ipv4Addr, pkt: &[u8]) -> bool {
-        let Some(net) = p
-            .addresses
-            .iter()
-            .find(|(_, a)| **a == src)
-            .map(|(n, _)| *n)
-        else {
+    fn deliver(&self, p: &mut Peer, src: IpAddr, pkt: &[u8]) -> bool {
+        let Some(net) = p.network_of(&src) else {
             tracing::trace!(peer = %p.id.short(), %src, "source not in peer's allowed addresses");
             return false;
         };
-        let Some(dst) = packet::ipv4_dst(pkt) else {
+        let Some(dst) = packet::dst(pkt) else {
             return false;
         };
         let nets = self.networks.read();
         let Some(entry) = nets.get(&net) else {
             return false;
         };
-        if entry.membership.network.address != dst {
+        if !entry.membership.network.addresses().contains(&dst) {
             tracing::trace!(%dst, network = %entry.membership.network.name, "packet not addressed to us in this network");
             return false;
         }
@@ -972,6 +1054,10 @@ impl Inner {
             v.sort_by(|a, b| a.info.name.cmp(&b.info.name));
             v
         };
+        let nets_by_id: HashMap<NetworkId, NetworkInfo> = networks
+            .iter()
+            .map(|n| (n.info.id, n.info.clone()))
+            .collect();
         let peers: Vec<PeerStatus> = {
             let t = self.peers.read();
             let mut v: Vec<PeerStatus> = t
@@ -979,14 +1065,35 @@ impl Inner {
                 .values()
                 .map(|p| {
                     let p = p.lock();
-                    let mut addresses: Vec<(NetworkId, Ipv4Addr)> =
-                        p.addresses.iter().map(|(n, a)| (*n, *a)).collect();
+                    let mut addresses: Vec<(NetworkId, IpAddr)> = p
+                        .addresses
+                        .iter()
+                        .flat_map(|(n, v)| v.iter().map(move |a| (*n, *a)))
+                        .collect();
                     addresses.sort();
+                    let mut names: Vec<(NetworkId, String)> = p
+                        .dns_names
+                        .iter()
+                        .filter_map(|(n, label)| {
+                            let net = nets_by_id.get(n)?;
+                            Some((
+                                *n,
+                                format!(
+                                    "{}.{}.{}",
+                                    label,
+                                    ig_proto::control::dns_label(&net.name),
+                                    net.dns_domain
+                                ),
+                            ))
+                        })
+                        .collect();
+                    names.sort();
                     PeerStatus {
                         node: p.id,
                         hostname: p.hostname.clone(),
                         online: p.online,
                         addresses,
+                        names,
                         path: p.path(),
                         endpoint: p.direct,
                         last_handshake_secs_ago: p
@@ -1016,7 +1123,7 @@ async fn udp_loop(inner: Arc<Inner>) {
     let mut out = vec![0u8; OUT_BUF];
     loop {
         match inner.udp.recv_from(&mut buf).await {
-            Ok((n, from)) => inner.handle_datagram(&buf[..n], from, &mut out),
+            Ok((n, from)) => inner.handle_datagram(&buf[..n], canonical(from), &mut out),
             Err(e) => {
                 tracing::warn!(error = %e, "udp receive error");
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1040,7 +1147,7 @@ async fn tun_loop(inner: Arc<Inner>, dev: Arc<dyn TunDevice>) {
     loop {
         match dev.recv(&mut buf).await {
             Ok(0) => continue,
-            Ok(n) => inner.handle_tun_packet(&buf[..n], &mut out),
+            Ok(n) => inner.handle_tun_packet(&buf[..n], &mut out, &dev),
             Err(e) => {
                 tracing::warn!(tun = %dev.name(), error = %e, "tun read failed, stopping reader");
                 return;

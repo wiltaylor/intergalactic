@@ -1,10 +1,10 @@
 //! Control channel messages (node <-> lighthouse) carried inside the Noise
 //! transport described in [`crate::noise`]. Encoded with postcard.
 
-use crate::{NetworkId, NodeId, Policy};
-use ipnet::Ipv4Net;
+use crate::{NetworkId, NodeId, Policy, RelayLimit};
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Payload of the first Noise handshake message (node -> lighthouse).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,17 +102,130 @@ pub struct NetworkInfo {
     pub cidr: Ipv4Net,
     /// This node's address inside `cidr`.
     pub address: Ipv4Addr,
+    /// Optional IPv6 prefix and this node's address inside it.
+    #[serde(default)]
+    pub cidr6: Option<Ipv6Net>,
+    #[serde(default)]
+    pub address6: Option<Ipv6Addr>,
     pub policy: Policy,
+    /// DNS suffix for peer names, e.g. `ig.internal`. Names are
+    /// `<dns_name>.<network name>.<dns_domain>`.
+    #[serde(default)]
+    pub dns_domain: String,
+    /// This node's own DNS label in the network.
+    #[serde(default)]
+    pub dns_name: String,
+    #[serde(default)]
+    pub relay_limit: RelayLimit,
+}
+
+impl NetworkInfo {
+    /// Address of the in-engine DNS responder: the first host of the prefix.
+    /// It is never assigned to a member.
+    pub fn dns_server_v4(&self) -> Ipv4Addr {
+        dns_server_v4(&self.cidr)
+    }
+
+    pub fn dns_server_v6(&self) -> Option<Ipv6Addr> {
+        self.cidr6.as_ref().map(dns_server_v6)
+    }
+
+    /// All addresses of this node in the network.
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        let mut v = vec![IpAddr::V4(self.address)];
+        if let Some(a6) = self.address6 {
+            v.push(IpAddr::V6(a6));
+        }
+        v
+    }
+
+    /// Fully qualified name of this node in the network, without trailing dot.
+    pub fn fqdn(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.dns_name,
+            dns_label(&self.name),
+            self.dns_domain
+        )
+    }
+}
+
+pub fn dns_server_v4(cidr: &Ipv4Net) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(cidr.network()) + 1)
+}
+
+pub fn dns_server_v6(cidr: &Ipv6Net) -> Ipv6Addr {
+    Ipv6Addr::from(u128::from(cidr.network()) + 1)
+}
+
+/// Turn a free-form name into a DNS label: lowercase, `[a-z0-9-]`, max 63 chars.
+pub fn dns_label(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for c in name.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= 63 {
+            break;
+        }
+    }
+    let trimmed = out.trim_end_matches('-').to_string();
+    if trimmed.is_empty() {
+        "node".into()
+    } else {
+        trimmed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node: NodeId,
     pub hostname: String,
+    /// Unique DNS label of the peer within the network.
+    #[serde(default)]
+    pub dns_name: String,
     pub address: Ipv4Addr,
+    #[serde(default)]
+    pub address6: Option<Ipv6Addr>,
     /// Candidate endpoints: LAN addresses as reported by the peer plus the public
     /// address the lighthouse observed. Try all; keep the one that answers.
     pub endpoints: Vec<SocketAddr>,
     /// True while the peer holds a control session with the lighthouse.
     pub online: bool,
+}
+
+impl PeerInfo {
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        let mut v = vec![IpAddr::V4(self.address)];
+        if let Some(a6) = self.address6 {
+            v.push(IpAddr::V6(a6));
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_are_sanitised() {
+        assert_eq!(dns_label("Wil's Laptop"), "wil-s-laptop");
+        assert_eq!(dns_label("---"), "node");
+        assert_eq!(dns_label("DESKTOP_01"), "desktop-01");
+        assert_eq!(
+            dns_server_v4(&"10.90.0.0/24".parse().unwrap()),
+            Ipv4Addr::new(10, 90, 0, 1)
+        );
+        assert_eq!(
+            dns_server_v6(&"fd00::/64".parse().unwrap()),
+            "fd00::1".parse::<Ipv6Addr>().unwrap()
+        );
+    }
 }

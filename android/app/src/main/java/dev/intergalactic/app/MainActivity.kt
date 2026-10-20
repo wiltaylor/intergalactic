@@ -119,7 +119,8 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
         if (status.networks.isEmpty()) row("none joined. Paste an invite above.")
         for (n in status.networks) {
             val lh = if (n.lighthouseConnected) "connected" else "disconnected"
-            row("${n.name}  ${n.address}/${n.prefixLen}  ${n.policySummary}  [$lh]  (long-press to leave)") {
+            val v6 = n.address6?.let { "  $it/${n.prefixLen6}" } ?: ""
+            row("${n.name}  ${n.address}/${n.prefixLen}$v6\n  ${n.dnsName}  ${n.policySummary}  relay:${n.relayLimit}  [$lh]  (long-press to leave)") {
                 scope.launch(Dispatchers.IO) { runCatching { engine.leave(n.id) } }
             }
         }
@@ -128,7 +129,7 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
         if (status.peers.isEmpty()) row("no peers.")
         for (p in status.peers) {
             val hs = p.lastHandshakeSecsAgo?.let { "${it}s ago" } ?: "-"
-            row("${p.hostname}  ${p.addresses.joinToString(" ")}\n  ${p.path}  ${p.endpoint ?: ""}  hs:$hs  ${if (p.online) "online" else "offline"}")
+            row("${p.hostname}  ${p.addresses.joinToString(" ")}\n  ${p.names.joinToString(" ")}\n  ${p.path}  ${p.endpoint ?: ""}  hs:$hs  ${if (p.online) "online" else "offline"}")
         }
         list.visibility = View.VISIBLE
     }

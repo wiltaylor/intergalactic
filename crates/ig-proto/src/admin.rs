@@ -1,10 +1,10 @@
 //! Local admin protocol for the lighthouse (`ig-lighthouse` CLI <-> daemon).
 //! JSON, one request and one response per connection.
 
-use crate::{NetworkId, NodeId, Policy};
-use ipnet::Ipv4Net;
+use crate::{NetworkId, NodeId, Policy, RelayLimit};
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AdminRequest {
@@ -12,6 +12,7 @@ pub enum AdminRequest {
     NetworkCreate {
         name: String,
         cidr: Ipv4Net,
+        cidr6: Option<Ipv6Net>,
     },
     NetworkList,
     NetworkDelete {
@@ -20,6 +21,10 @@ pub enum AdminRequest {
     NetworkSetPolicy {
         network: String,
         policy: Policy,
+    },
+    NetworkSetRelayLimit {
+        network: String,
+        limit: RelayLimit,
     },
     InviteCreate {
         network: String,
@@ -62,6 +67,7 @@ pub struct LighthouseInfo {
     pub networks: usize,
     pub nodes_online: usize,
     pub uptime_secs: u64,
+    pub dns_domain: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,9 +75,11 @@ pub struct NetworkSummary {
     pub id: NetworkId,
     pub name: String,
     pub cidr: Ipv4Net,
+    pub cidr6: Option<Ipv6Net>,
     pub members: usize,
     pub online: usize,
     pub policy: Policy,
+    pub relay_limit: RelayLimit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,7 +97,9 @@ pub struct NodeSummary {
     pub os: String,
     pub network: NetworkId,
     pub network_name: String,
+    pub dns_name: String,
     pub address: Ipv4Addr,
+    pub address6: Option<Ipv6Addr>,
     pub online: bool,
     pub endpoints: Vec<SocketAddr>,
     pub last_seen_secs_ago: Option<u64>,

@@ -84,6 +84,18 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
             builder.addAddress(n.address, n.prefixLen.toInt())
             val (netAddr, prefix) = n.cidr.split('/')
             builder.addRoute(netAddr, prefix.toInt())
+            // Peer names: the engine answers DNS for these addresses inside the tunnel.
+            builder.addDnsServer(n.dnsServer)
+            builder.addSearchDomain(n.dnsSearchDomain)
+            val a6 = n.address6
+            val c6 = n.cidr6
+            val p6 = n.prefixLen6
+            if (a6 != null && c6 != null && p6 != null) {
+                builder.addAddress(a6, p6.toInt())
+                val (net6, prefix6) = c6.split('/')
+                builder.addRoute(net6, prefix6.toInt())
+                n.dnsServer6?.let { builder.addDnsServer(it) }
+            }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
         val pfd = builder.establish()

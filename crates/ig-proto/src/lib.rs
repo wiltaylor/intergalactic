@@ -24,11 +24,15 @@ pub mod ipc;
 pub mod keys;
 pub mod noise;
 pub mod policy;
+pub mod udp;
 
 pub use ids::{NetworkId, NodeId};
 pub use invite::Invite;
 pub use keys::{Keypair, PrivateKey};
-pub use policy::{Policy, Proto, Rule};
+pub use policy::{Policy, Proto, RelayLimit, Rule};
+
+/// Default DNS suffix for peer names. `.internal` is reserved for private use.
+pub const DEFAULT_DNS_DOMAIN: &str = "ig.internal";
 
 /// Protocol version carried in the control-channel hello.
 pub const PROTOCOL_VERSION: u16 = 1;

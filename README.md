@@ -48,9 +48,10 @@ A systemd unit is in `deploy/ig-lighthouse.service`. The key and state live in `
 Run these on the VPS (the admin CLI talks to the daemon over a local socket):
 
 ```sh
-sudo ig-lighthouse network create dev  10.90.0.0/24
+sudo ig-lighthouse network create dev  10.90.0.0/24 --ipv6 fd42:9a:1::/64
 sudo ig-lighthouse network create game 10.91.0.0/24
 sudo ig-lighthouse network policy game --allow udp:27015-27030 --allow icmp
+sudo ig-lighthouse network relay-limit game --per-node-kbps 2000 --total-kbps 20000
 sudo ig-lighthouse invite create dev --uses 5 --ttl 7d --label laptops
 ```
 
@@ -66,7 +67,7 @@ sudo ig status
 
 On Windows, run `ig-node.exe run` as Administrator with `wintun.dll` next to the executable, then `ig.exe join ig1:...`. See `docs/deploy.md`.
 
-Each joined network gets its own interface (`ig-dev`, `ig-game`) with the address the lighthouse assigned. Leave with `ig leave dev`.
+Each joined network gets its own interface (`ig-dev`, `ig-game`) with the addresses the lighthouse assigned. Peers are reachable by name: `ssh laptop.dev.ig.internal`. Leave with `ig leave dev`.
 
 ### 4. Android
 
@@ -80,13 +81,18 @@ See `docs/architecture.md` for the full design. In short:
 2. The lighthouse pushes the member list of each network to every online member: addresses, LAN endpoints and the public address it observed on UDP.
 3. Two peers send WireGuard handshakes to each other's candidate endpoints at the same time (hole punching). If that works the path is **direct**. Until then, and if it never works, packets are **relayed** through the lighthouse.
 4. Every inbound packet is checked: the source must be the peer's address in a shared network, the destination must be this node's address in that same network, and the network policy must allow the flow.
+5. DNS queries for the overlay domain go to a reserved address in each network (`10.90.0.1`). The node answers them itself from the peer list it already has.
+
+## Features
+
+- **IPv4 and IPv6** overlay addresses. Give a network an IPv6 prefix with `--ipv6` and every member gets matching v4 and v6 host numbers. Peers also reach each other over IPv6 underlay endpoints when available.
+- **Peer DNS** on a domain you choose (`--dns-domain`, default `ig.internal`). Every member is `<host>.<network>.<domain>`, plus the shortcut `<host>.<domain>`. Names are answered inside the tunnel by the node itself, so no DNS server is exposed anywhere.
+- **Windows service**: `ig-node service install` registers the daemon with the Service Control Manager and starts it at boot.
+- **Relay rate limits** per network (per member and total), with a lighthouse-wide default. Direct peer-to-peer traffic is never limited.
+- **Policies** per network: allow lists of inbound flows, stateful, so an untrusted network can be restricted to a game's ports.
 
 ## Status and limits
 
-This is a working first version. Known limits:
-
-- IPv4 overlay addresses only. Endpoint discovery is IPv4 only.
-- No DNS for peer names. `ig status` and the lighthouse's `node list` show hostnames.
-- Windows runs as a console program. Use NSSM, WinSW or Task Scheduler to run it at boot.
 - Android builds are not verified in this repository because it has no Android NDK. The Kotlin bindings are generated from the Rust code and the app uses those exact signatures.
-- Relay traffic is not rate limited per node.
+- The lighthouse itself must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
+- Hostnames that collide inside one network get a numeric suffix (`laptop`, `laptop-2`).

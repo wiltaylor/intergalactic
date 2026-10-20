@@ -17,3 +17,4 @@ blake3.workspace = true
 snow.workspace = true
 x25519-dalek.workspace = true
 tokio.workspace = true
+socket2.workspace = true

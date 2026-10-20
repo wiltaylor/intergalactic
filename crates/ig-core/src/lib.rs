@@ -12,6 +12,7 @@
 //!                           └──Noise/TCP──▶ lighthouse (control)
 //! ```
 
+pub mod dns;
 pub mod endpoints;
 pub mod engine;
 pub mod filter;

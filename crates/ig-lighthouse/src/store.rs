@@ -2,11 +2,12 @@
 //! that is rewritten atomically after every change. Changes are rare (joins,
 //! invites, admin edits), so this is simpler and more robust than a database.
 
-use ig_proto::{NetworkId, NodeId, Policy};
-use ipnet::Ipv4Net;
+use ig_proto::control::dns_label;
+use ig_proto::{NetworkId, NodeId, Policy, RelayLimit};
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +32,11 @@ pub struct Network {
     pub name: String,
     pub cidr: Ipv4Net,
     #[serde(default)]
+    pub cidr6: Option<Ipv6Net>,
+    #[serde(default)]
     pub policy: Policy,
+    #[serde(default)]
+    pub relay_limit: RelayLimit,
     #[serde(default)]
     pub members: BTreeMap<NodeId, Member>,
     #[serde(default)]
@@ -42,6 +47,11 @@ pub struct Network {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Member {
     pub address: Ipv4Addr,
+    #[serde(default)]
+    pub address6: Option<Ipv6Addr>,
+    /// Unique DNS label within the network.
+    #[serde(default)]
+    pub dns_name: String,
     pub joined_at: u64,
 }
 
@@ -70,6 +80,8 @@ pub enum StoreError {
     DuplicateName(String),
     #[error("prefix /{0} is too small; use /30 or larger")]
     PrefixTooSmall(u8),
+    #[error("IPv6 prefix /{0} is too small; use /120 or larger")]
+    Prefix6TooSmall(u8),
     #[error("network is full")]
     Full,
     #[error("invite is invalid, expired or used up")]
@@ -88,8 +100,34 @@ impl Network {
     fn host_range(&self) -> (u32, u32) {
         let base = u32::from(self.cidr.network());
         let bcast = u32::from(self.cidr.broadcast());
-        // Reserve network address and broadcast; /31 and /32 are refused at creation.
-        (base + 1, bcast - 1)
+        // Reserve the network address, the first host (DNS responder) and the
+        // broadcast address; /31 and /32 are refused at creation.
+        (base + 2, bcast - 1)
+    }
+
+    /// IPv6 address with the same host offset as the IPv4 address, so a member's
+    /// two addresses line up (`10.90.0.7` and `fd..::7`).
+    fn address6_for(&self, v4: Ipv4Addr) -> Option<Ipv6Addr> {
+        let cidr6 = self.cidr6?;
+        let offset = u32::from(v4) - u32::from(self.cidr.network());
+        Some(Ipv6Addr::from(u128::from(cidr6.network()) + offset as u128))
+    }
+
+    /// Unique DNS label for a hostname within this network.
+    fn unique_label(&self, hostname: &str) -> String {
+        let base = dns_label(hostname);
+        let taken: std::collections::HashSet<&str> =
+            self.members.values().map(|m| m.dns_name.as_str()).collect();
+        if !taken.contains(base.as_str()) {
+            return base;
+        }
+        for i in 2.. {
+            let candidate = format!("{base}-{i}");
+            if !taken.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!()
     }
 
     pub fn capacity(&self) -> u32 {
@@ -150,19 +188,31 @@ impl Store {
             .ok_or_else(|| StoreError::NoSuchNetwork(name_or_id.to_string()))
     }
 
-    pub fn create_network(&mut self, name: &str, cidr: Ipv4Net) -> Result<&Network, StoreError> {
+    pub fn create_network(
+        &mut self,
+        name: &str,
+        cidr: Ipv4Net,
+        cidr6: Option<Ipv6Net>,
+    ) -> Result<&Network, StoreError> {
         if self.networks.values().any(|n| n.name == name) {
             return Err(StoreError::DuplicateName(name.to_string()));
         }
         if cidr.prefix_len() > 30 {
             return Err(StoreError::PrefixTooSmall(cidr.prefix_len()));
         }
+        if let Some(c6) = cidr6 {
+            if c6.prefix_len() > 120 {
+                return Err(StoreError::Prefix6TooSmall(c6.prefix_len()));
+            }
+        }
         let id = NetworkId::random();
         let net = Network {
             id,
             name: name.to_string(),
             cidr: cidr.trunc(),
+            cidr6: cidr6.map(|c| c.trunc()),
             policy: Policy::allow_all(),
+            relay_limit: RelayLimit::unlimited(),
             members: BTreeMap::new(),
             invites: Vec::new(),
             created_at: now_secs(),
@@ -179,6 +229,11 @@ impl Store {
         node: NodeId,
         token: &[u8; 16],
     ) -> Result<Ipv4Addr, StoreError> {
+        let hostname = self
+            .nodes
+            .get(&node)
+            .map(|n| n.hostname.clone())
+            .unwrap_or_default();
         let net = self
             .networks
             .get_mut(&network)
@@ -192,14 +247,42 @@ impl Store {
         if net.invites[idx].uses_left == 0 {
             net.invites.remove(idx);
         }
+        let address6 = net.address6_for(address);
+        let dns_name = net.unique_label(&hostname);
         net.members.insert(
             node,
             Member {
                 address,
+                address6,
+                dns_name,
                 joined_at: now_secs(),
             },
         );
         Ok(address)
+    }
+
+    /// Refresh a member's DNS label after its hostname changed. Returns the
+    /// networks whose state changed.
+    pub fn refresh_labels(&mut self, node: &NodeId) -> Vec<NetworkId> {
+        let hostname = self
+            .nodes
+            .get(node)
+            .map(|n| n.hostname.clone())
+            .unwrap_or_default();
+        let base = dns_label(&hostname);
+        let mut changed = Vec::new();
+        for net in self.networks.values_mut() {
+            let Some(current) = net.members.get(node).map(|m| m.dns_name.clone()) else {
+                continue;
+            };
+            if current == base || current.starts_with(&format!("{base}-")) {
+                continue;
+            }
+            let label = net.unique_label(&hostname);
+            net.members.get_mut(node).expect("present").dns_name = label;
+            changed.push(net.id);
+        }
+        changed
     }
 
     pub fn remove_member(&mut self, network: NetworkId, node: &NodeId) -> Result<(), StoreError> {
@@ -290,34 +373,44 @@ mod tests {
     fn join_allocates_sequential_addresses_and_consumes_invites() {
         let mut s = Store::default();
         let id = s
-            .create_network("dev", "10.90.0.0/29".parse().unwrap())
+            .create_network(
+                "dev",
+                "10.90.0.0/29".parse().unwrap(),
+                Some("fd42::/64".parse().unwrap()),
+            )
             .unwrap()
             .id;
         let token = invite(s.networks.get_mut(&id).unwrap(), 2);
         let a = NodeId(ig_proto::random_array());
         let b = NodeId(ig_proto::random_array());
         let c = NodeId(ig_proto::random_array());
+        s.touch_node(a, "Laptop", "linux");
+        s.touch_node(b, "laptop", "windows");
         assert_eq!(
             s.join(id, a, &token).unwrap(),
-            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+            "10.90.0.2".parse::<Ipv4Addr>().unwrap()
         );
         assert_eq!(
             s.join(id, b, &token).unwrap(),
-            "10.90.0.2".parse::<Ipv4Addr>().unwrap()
+            "10.90.0.3".parse::<Ipv4Addr>().unwrap()
         );
+        let ma = &s.networks[&id].members[&a];
+        assert_eq!(ma.address6, Some("fd42::2".parse().unwrap()));
+        assert_eq!(ma.dns_name, "laptop");
+        assert_eq!(s.networks[&id].members[&b].dns_name, "laptop-2");
         // Used up.
         assert!(matches!(s.join(id, c, &token), Err(StoreError::BadInvite)));
         // Re-join is idempotent and needs no invite.
         assert_eq!(
             s.join(id, a, &[0u8; 16]).unwrap(),
-            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+            "10.90.0.2".parse::<Ipv4Addr>().unwrap()
         );
         s.remove_member(id, &a).unwrap();
         let token2 = invite(s.networks.get_mut(&id).unwrap(), 10);
         // Freed address is reused.
         assert_eq!(
             s.join(id, c, &token2).unwrap(),
-            "10.90.0.1".parse::<Ipv4Addr>().unwrap()
+            "10.90.0.2".parse::<Ipv4Addr>().unwrap()
         );
         assert!(s.share_network(&b, &c));
         assert!(!s.share_network(&a, &b));
@@ -326,15 +419,23 @@ mod tests {
     #[test]
     fn rejects_bad_networks() {
         let mut s = Store::default();
-        s.create_network("x", "10.0.0.0/24".parse().unwrap())
+        s.create_network("x", "10.0.0.0/24".parse().unwrap(), None)
             .unwrap();
         assert!(matches!(
-            s.create_network("x", "10.1.0.0/24".parse().unwrap()),
+            s.create_network("x", "10.1.0.0/24".parse().unwrap(), None),
             Err(StoreError::DuplicateName(_))
         ));
         assert!(matches!(
-            s.create_network("y", "10.1.0.0/31".parse().unwrap()),
+            s.create_network("y", "10.1.0.0/31".parse().unwrap(), None),
             Err(StoreError::PrefixTooSmall(31))
+        ));
+        assert!(matches!(
+            s.create_network(
+                "z",
+                "10.2.0.0/24".parse().unwrap(),
+                Some("fd00::/124".parse().unwrap())
+            ),
+            Err(StoreError::Prefix6TooSmall(124))
         ));
     }
 
@@ -344,7 +445,7 @@ mod tests {
         let path = dir.join("lighthouse.json");
         let mut s = Store::default();
         let id = s
-            .create_network("dev", "10.90.0.0/24".parse().unwrap())
+            .create_network("dev", "10.90.0.0/24".parse().unwrap(), None)
             .unwrap()
             .id;
         invite(s.networks.get_mut(&id).unwrap(), 1);

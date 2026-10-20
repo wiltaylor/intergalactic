@@ -1013,6 +1013,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun-rs",
+ "windows-service",
 ]
 
 [[package]]
@@ -1027,6 +1028,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "socket2",
  "thiserror",
  "tokio",
  "x25519-dalek",
@@ -2400,6 +2402,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f42bd332cc6c8eac5af113fc0c1fd6a8fd2aa08a0119358686e5160d0586c6"
 dependencies = [
  "windows-link 0.1.3",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -8,7 +8,8 @@ use ig_proto::control::{
     ClientHello, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
 };
 use ig_proto::noise::NoiseStream;
-use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, PROTOCOL_VERSION};
+use ig_proto::udp::{bind_dual_stack, canonical, reachable, to_wire};
+use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, RelayLimit, PROTOCOL_VERSION};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -36,6 +37,10 @@ pub struct LighthouseConfig {
     pub public_port: u16,
     /// Where to persist state. `None` keeps everything in memory (tests).
     pub state_path: Option<PathBuf>,
+    /// DNS suffix for peer names, e.g. `ig.internal`.
+    pub dns_domain: String,
+    /// Relay limit applied to networks that have no limit of their own.
+    pub default_relay_limit: RelayLimit,
 }
 
 struct Session {
@@ -55,6 +60,9 @@ struct Inner {
     /// reverse index for relay source lookup
     udp_nodes: RwLock<HashMap<SocketAddr, NodeId>>,
     udp: UdpSocket,
+    dual_stack: bool,
+    /// Relay token buckets: per (network, node) and per network.
+    buckets: Mutex<Buckets>,
     dirty: Mutex<HashSet<NetworkId>>,
     dirty_notify: tokio::sync::Notify,
     started: Instant,
@@ -75,7 +83,7 @@ impl Lighthouse {
         };
         let tcp = TcpListener::bind(config.listen).await?;
         let tcp_addr = tcp.local_addr()?;
-        let udp = UdpSocket::bind(SocketAddr::new(config.listen.ip(), tcp_addr.port())).await?;
+        let (udp, dual_stack) = bind_dual_stack(config.listen.ip(), tcp_addr.port())?;
         let inner = Arc::new(Inner {
             config,
             store: Mutex::new(store),
@@ -83,6 +91,8 @@ impl Lighthouse {
             udp_addrs: RwLock::new(HashMap::new()),
             udp_nodes: RwLock::new(HashMap::new()),
             udp,
+            dual_stack,
+            buckets: Mutex::new(Buckets::default()),
             dirty: Mutex::new(HashSet::new()),
             dirty_notify: tokio::sync::Notify::new(),
             started: Instant::now(),
@@ -93,7 +103,7 @@ impl Lighthouse {
         let t3 = tokio::spawn(broadcast_loop(inner.clone()));
         let t4 = tokio::spawn(housekeeping(inner.clone()));
         inner.tasks.lock().extend([t1, t2, t3, t4]);
-        tracing::info!(addr = %tcp_addr, key = %inner.config.keypair.public, "lighthouse listening");
+        tracing::info!(addr = %tcp_addr, dual_stack, key = %inner.config.keypair.public, dns_domain = %inner.config.dns_domain, "lighthouse listening");
         Ok(Lighthouse { inner, tcp_addr })
     }
 
@@ -126,7 +136,113 @@ impl Lighthouse {
     }
 }
 
+/// Token bucket in bytes. Refills at `rate` bytes/s up to one second of burst.
+struct Bucket {
+    tokens: f64,
+    rate: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    fn new(kbps: u32) -> Self {
+        let rate = kbps as f64 * 1000.0 / 8.0;
+        Bucket {
+            tokens: rate,
+            rate,
+            last: Instant::now(),
+        }
+    }
+
+    fn take(&mut self, bytes: usize, now: Instant) -> bool {
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.rate);
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct Buckets {
+    per_node: HashMap<(NetworkId, NodeId), (u32, Bucket)>,
+    per_network: HashMap<NetworkId, (u32, Bucket)>,
+}
+
+impl Buckets {
+    /// Returns true if `bytes` may be relayed under `limit`.
+    fn allow(&mut self, network: NetworkId, node: NodeId, limit: RelayLimit, bytes: usize) -> bool {
+        if limit.is_unlimited() {
+            return true;
+        }
+        let now = Instant::now();
+        if limit.per_node_kbps > 0 {
+            let e = self
+                .per_node
+                .entry((network, node))
+                .or_insert_with(|| (0, Bucket::new(limit.per_node_kbps)));
+            if e.0 != limit.per_node_kbps {
+                *e = (limit.per_node_kbps, Bucket::new(limit.per_node_kbps));
+            }
+            if !e.1.take(bytes, now) {
+                return false;
+            }
+        }
+        if limit.total_kbps > 0 {
+            let e = self
+                .per_network
+                .entry(network)
+                .or_insert_with(|| (0, Bucket::new(limit.total_kbps)));
+            if e.0 != limit.total_kbps {
+                *e = (limit.total_kbps, Bucket::new(limit.total_kbps));
+            }
+            if !e.1.take(bytes, now) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn forget(&mut self, network: NetworkId) {
+        self.per_node.retain(|(n, _), _| *n != network);
+        self.per_network.remove(&network);
+    }
+}
+
 impl Inner {
+    fn effective_limit(&self, net: &crate::store::Network) -> RelayLimit {
+        if net.relay_limit.is_unlimited() {
+            self.config.default_relay_limit
+        } else {
+            net.relay_limit
+        }
+    }
+
+    fn udp_send(&self, data: &[u8], to: SocketAddr) {
+        if !reachable(to, self.dual_stack) {
+            return;
+        }
+        let _ = self.udp.try_send_to(data, to_wire(to, self.dual_stack));
+    }
+
+    fn network_info(&self, net: &crate::store::Network, m: &crate::store::Member) -> NetworkInfo {
+        NetworkInfo {
+            id: net.id,
+            name: net.name.clone(),
+            cidr: net.cidr,
+            address: m.address,
+            cidr6: net.cidr6,
+            address6: m.address6,
+            policy: net.policy.clone(),
+            dns_domain: self.config.dns_domain.clone(),
+            dns_name: m.dns_name.clone(),
+            relay_limit: self.effective_limit(net),
+        }
+    }
+
     fn persist(&self, store: &Store) {
         if let Some(p) = &self.config.state_path {
             if let Err(e) = store.save(p) {
@@ -171,7 +287,7 @@ impl Inner {
         me: &NodeId,
     ) -> Option<FromLighthouse> {
         let net = store.networks.get(&network)?;
-        let my_addr = net.members.get(me)?.address;
+        let me_member = net.members.get(me)?;
         let sessions = self.sessions.read();
         let peers = net
             .members
@@ -184,19 +300,15 @@ impl Inner {
                     .get(id)
                     .map(|n| n.hostname.clone())
                     .unwrap_or_default(),
+                dns_name: m.dns_name.clone(),
                 address: m.address,
+                address6: m.address6,
                 endpoints: self.endpoints_of(id),
                 online: sessions.contains_key(id),
             })
             .collect();
         Some(FromLighthouse::NetworkState {
-            network: NetworkInfo {
-                id: net.id,
-                name: net.name.clone(),
-                cidr: net.cidr,
-                address: my_addr,
-                policy: net.policy.clone(),
-            },
+            network: self.network_info(net, me_member),
             peers,
         })
     }
@@ -275,8 +387,7 @@ impl Inner {
                 }
             }
             ToLighthouse::Endpoints { local } => {
-                let mut local: Vec<SocketAddr> =
-                    local.into_iter().filter(|a| a.is_ipv4()).take(8).collect();
+                let mut local: Vec<SocketAddr> = local.into_iter().take(10).collect();
                 local.dedup();
                 let changed = *session.local_endpoints.read() != local;
                 if changed {
@@ -317,13 +428,7 @@ impl Inner {
     ) -> Option<NetworkInfo> {
         let net = store.networks.get(&network)?;
         let m = net.members.get(node)?;
-        Some(NetworkInfo {
-            id: net.id,
-            name: net.name.clone(),
-            cidr: net.cidr,
-            address: m.address,
-            policy: net.policy.clone(),
-        })
+        Some(self.network_info(net, m))
     }
 
     // ---- udp ------------------------------------------------------------------
@@ -355,9 +460,13 @@ impl Inner {
                     self.mark_dirty_for_node(&node);
                 }
                 let reply = disco::encode_probe_reply(ts, from, &session.token);
-                let _ = self.udp.try_send_to(&reply, from);
+                self.udp_send(&reply, from);
             }
-            disco::Disco::Relay { dst, payload } => {
+            disco::Disco::Relay {
+                network,
+                dst,
+                payload,
+            } => {
                 if payload.len() > MAX_RELAY_PAYLOAD {
                     return;
                 }
@@ -372,11 +481,26 @@ impl Inner {
                         _ => return,
                     }
                 };
-                if !self.store.lock().share_network(&src, &dst) {
+                let limit = {
+                    let store = self.store.lock();
+                    let Some(net) = store.networks.get(&network) else {
+                        return;
+                    };
+                    if !(net.members.contains_key(&src) && net.members.contains_key(&dst)) {
+                        return;
+                    }
+                    self.effective_limit(net)
+                };
+                if !self
+                    .buckets
+                    .lock()
+                    .allow(network, src, limit, payload.len())
+                {
+                    tracing::trace!(%network, node = %src.short(), "relay rate limited");
                     return;
                 }
                 let frame = disco::encode_relayed(&src, payload);
-                let _ = self.udp.try_send_to(&frame, dst_addr);
+                self.udp_send(&frame, dst_addr);
             }
             _ => {}
         }
@@ -404,11 +528,12 @@ impl Inner {
                     networks: store.networks.len(),
                     nodes_online: self.sessions.read().len(),
                     uptime_secs: self.started.elapsed().as_secs(),
+                    dns_domain: self.config.dns_domain.clone(),
                 }))
             }
-            AdminRequest::NetworkCreate { name, cidr } => {
+            AdminRequest::NetworkCreate { name, cidr, cidr6 } => {
                 let mut store = self.store.lock();
-                let net = store.create_network(&name, cidr)?;
+                let net = store.create_network(&name, cidr, cidr6)?;
                 let summary = self.summarise(net);
                 self.persist(&store);
                 Ok(AdminResponse::Networks(vec![summary]))
@@ -425,6 +550,7 @@ impl Inner {
                 let net = store.networks.remove(&id).expect("resolved");
                 self.persist(&store);
                 drop(store);
+                self.buckets.lock().forget(id);
                 for m in net.members.keys() {
                     self.send_to(
                         m,
@@ -442,6 +568,16 @@ impl Inner {
                 store.networks.get_mut(&id).expect("resolved").policy = policy;
                 self.persist(&store);
                 drop(store);
+                self.mark_dirty([id]);
+                Ok(AdminResponse::Ok)
+            }
+            AdminRequest::NetworkSetRelayLimit { network, limit } => {
+                let mut store = self.store.lock();
+                let id = store.resolve(&network)?;
+                store.networks.get_mut(&id).expect("resolved").relay_limit = limit;
+                self.persist(&store);
+                drop(store);
+                self.buckets.lock().forget(id);
                 self.mark_dirty([id]);
                 Ok(AdminResponse::Ok)
             }
@@ -529,7 +665,9 @@ impl Inner {
                             os: rec.os,
                             network: net.id,
                             network_name: net.name.clone(),
+                            dns_name: m.dns_name.clone(),
                             address: m.address,
+                            address6: m.address6,
                             online,
                             endpoints: self.endpoints_of(id),
                             last_seen_secs_ago: if online {
@@ -569,6 +707,7 @@ impl Inner {
             id: n.id,
             name: n.name.clone(),
             cidr: n.cidr,
+            cidr6: n.cidr6,
             members: n.members.len(),
             online: n
                 .members
@@ -576,6 +715,7 @@ impl Inner {
                 .filter(|m| sessions.contains_key(m))
                 .count(),
             policy: n.policy.clone(),
+            relay_limit: self.effective_limit(n),
         }
     }
 }
@@ -634,7 +774,10 @@ async fn handle_connection(
     {
         let mut store = inner.store.lock();
         store.touch_node(node, &hello.hostname, &hello.os);
+        let relabelled = store.refresh_labels(&node);
         inner.persist(&store);
+        drop(store);
+        inner.mark_dirty(relabelled);
     }
     if let Some(old) = inner.sessions.write().insert(node, session.clone()) {
         tracing::info!(node = %node.short(), "replacing existing session");
@@ -691,7 +834,7 @@ async fn udp_loop(inner: Arc<Inner>) {
     let mut buf = vec![0u8; 65536];
     loop {
         match inner.udp.recv_from(&mut buf).await {
-            Ok((n, from)) => inner.handle_udp(&buf[..n], from),
+            Ok((n, from)) => inner.handle_udp(&buf[..n], canonical(from)),
             Err(e) => {
                 tracing::warn!(error = %e, "udp receive error");
                 tokio::time::sleep(Duration::from_millis(50)).await;

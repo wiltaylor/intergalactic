@@ -95,8 +95,8 @@ fn print_networks(st: &StatusReport) {
         return;
     }
     println!(
-        "{:<16} {:<16} {:<18} {:<12} {:<12} LIGHTHOUSE",
-        "NETWORK", "ADDRESS", "CIDR", "INTERFACE", "POLICY"
+        "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} LIGHTHOUSE",
+        "NETWORK", "ADDRESS", "IPV6", "DNS NAME", "INTERFACE", "POLICY", "RELAY LIMIT"
     );
     for n in &st.networks {
         let policy = if n.info.policy.is_allow_all() {
@@ -105,12 +105,21 @@ fn print_networks(st: &StatusReport) {
             format!("{} rules", n.info.policy.rules.len())
         };
         println!(
-            "{:<16} {:<16} {:<18} {:<12} {:<12} {}{}",
-            n.info.name,
-            n.info.address.to_string(),
-            n.info.cidr.to_string(),
+            "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} {}{}",
+            truncate(&n.info.name, 12),
+            format!("{}/{}", n.info.address, n.info.cidr.prefix_len()),
+            n.info
+                .address6
+                .map(|a| format!(
+                    "{}/{}",
+                    a,
+                    n.info.cidr6.map(|c| c.prefix_len()).unwrap_or(128)
+                ))
+                .unwrap_or_else(|| "-".into()),
+            truncate(&n.info.fqdn(), 28),
             n.interface.clone().unwrap_or_else(|| "-".into()),
             policy,
+            n.info.relay_limit.to_string(),
             n.lighthouse,
             if n.lighthouse_connected {
                 ""
@@ -132,8 +141,8 @@ fn print_peers(st: &StatusReport) {
         .map(|n| (n.info.id, n.info.name.clone()))
         .collect();
     println!(
-        "{:<20} {:<28} {:<7} {:<22} {:<10} {:<12} TX/RX",
-        "PEER", "ADDRESSES", "PATH", "ENDPOINT", "HANDSHAKE", "STATE"
+        "{:<20} {:<30} {:<36} {:<7} {:<22} {:<10} {:<8} TX/RX",
+        "PEER", "ADDRESSES", "DNS NAMES", "PATH", "ENDPOINT", "HANDSHAKE", "STATE"
     );
     for p in &st.peers {
         let addrs: Vec<String> = p
@@ -162,10 +171,12 @@ fn print_peers(st: &StatusReport) {
             ),
             None => "-".into(),
         };
+        let names: Vec<String> = p.names.iter().map(|(_, n)| n.clone()).collect();
         println!(
-            "{:<20} {:<28} {:<7} {:<22} {:<10} {:<12} {}/{}",
+            "{:<20} {:<30} {:<36} {:<7} {:<22} {:<10} {:<8} {}/{}",
             truncate(&p.hostname, 20),
-            truncate(&addrs.join(","), 28),
+            truncate(&addrs.join(","), 30),
+            truncate(&names.join(","), 36),
             path,
             p.endpoint
                 .map(|e| e.to_string())

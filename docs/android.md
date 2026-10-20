@@ -38,9 +38,11 @@ Android Studio, which generates it.
    The state JSON holds the private key and memberships; `generateState()` creates a new one.
 2. `join(invite)` talks to the lighthouse and returns the network with the assigned address.
    The engine then fires `onNetworksChanged(networks, stateJson)`; the holder persists the JSON.
-3. `IgVpnService` builds a `VpnService.Builder` with one `addAddress` and one `addRoute` per
-   network, calls `establish()` and passes the fd to `attachTun(fd)`. Only overlay CIDRs are
-   routed into the VPN, so normal internet traffic is untouched.
+3. `IgVpnService` builds a `VpnService.Builder` with `addAddress` and `addRoute` for each
+   network's IPv4 and IPv6 ranges, plus `addDnsServer` (the network's in-tunnel DNS responder)
+   and `addSearchDomain`, calls `establish()` and passes the fd to `attachTun(fd)`. Only
+   overlay CIDRs are routed into the VPN, so normal internet traffic is untouched. Peer names
+   such as `laptop.dev.ig.internal` resolve on the phone while connected.
 4. The engine calls `protectSocket(fd)` for its UDP and TCP sockets; the service answers with
    `VpnService.protect`.
 5. On membership changes the service re-establishes the interface and attaches the new fd.

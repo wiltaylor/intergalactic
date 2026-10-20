@@ -27,6 +27,44 @@ impl Policy {
     }
 }
 
+/// Relay bandwidth limits for one network, enforced by the lighthouse.
+/// Values are kilobits per second; 0 means unlimited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayLimit {
+    /// Cap for each member's relayed traffic in this network.
+    #[serde(default)]
+    pub per_node_kbps: u32,
+    /// Cap for all relayed traffic of this network together.
+    #[serde(default)]
+    pub total_kbps: u32,
+}
+
+impl RelayLimit {
+    pub fn unlimited() -> Self {
+        RelayLimit::default()
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.per_node_kbps == 0 && self.total_kbps == 0
+    }
+}
+
+impl fmt::Display for RelayLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_unlimited() {
+            return f.write_str("unlimited");
+        }
+        let mut parts = Vec::new();
+        if self.per_node_kbps > 0 {
+            parts.push(format!("{} kbps/node", self.per_node_kbps));
+        }
+        if self.total_kbps > 0 {
+            parts.push(format!("{} kbps total", self.total_kbps));
+        }
+        f.write_str(&parts.join(", "))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Proto {
     Tcp,
