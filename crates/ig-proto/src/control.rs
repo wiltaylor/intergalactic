@@ -17,6 +17,10 @@ pub struct ClientHello {
     /// LANs it is attached to (`ig-node run --gateway`).
     #[serde(default)]
     pub gateway: bool,
+    /// This connection is the node's tunnel channel for port forwards, not its
+    /// control channel. Carries [`crate::tunnel::TunnelMsg`] frames.
+    #[serde(default)]
+    pub tunnel: bool,
 }
 
 /// Payload of the second Noise handshake message (lighthouse -> node).
@@ -65,10 +69,32 @@ pub enum ToLighthouse {
     Ping {
         nonce: u64,
     },
+    /// Ask for an ephemeral port forward. `public_port = None` lets the
+    /// lighthouse pick one from its range. Answered with `Exposed` or `ExposeFailed`.
+    Expose {
+        network: NetworkId,
+        proto: crate::tunnel::ForwardProto,
+        public_port: Option<u16>,
+        target: String,
+        label: String,
+    },
+    Unexpose {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FromLighthouse {
+    Exposed {
+        forward: crate::tunnel::ForwardInfo,
+    },
+    ExposeFailed {
+        target: String,
+        reason: String,
+    },
+    Unexposed {
+        id: String,
+    },
     Joined {
         network: NetworkInfo,
     },
@@ -130,6 +156,16 @@ pub struct NetworkInfo {
     /// Devices registered in this network and who currently gateways them.
     #[serde(default)]
     pub devices: Vec<DeviceInfo>,
+    /// Port forwards on the lighthouse that point at the recipient node.
+    #[serde(default)]
+    pub forwards: Vec<crate::tunnel::ForwardInfo>,
+    /// Whether members may request ephemeral forwards in this network.
+    #[serde(default = "default_true")]
+    pub exposes_allowed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A device on a physical LAN that members reach through a gateway node. The

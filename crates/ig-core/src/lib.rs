@@ -21,6 +21,7 @@ pub mod packet;
 pub mod peer;
 pub mod state;
 pub mod tun;
+pub mod tunnel;
 
 mod control;
 

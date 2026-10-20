@@ -10,6 +10,7 @@
 //!    read the traffic it relays.
 
 pub mod admin_socket;
+pub mod forwards;
 pub mod server;
 pub mod store;
 

@@ -30,6 +30,26 @@ enum Cmd {
         #[command(subcommand)]
         cmd: InviteCmd,
     },
+    /// Publish a local port on the lighthouse's public address while this node is up.
+    /// `ig expose 8080` forwards <lighthouse>:<public port> to 127.0.0.1:8080.
+    Expose {
+        /// Local port, or `host:port` for something else this node can reach.
+        target: String,
+        /// Network whose lighthouse should publish it (default: the only or first one).
+        #[arg(long)]
+        network: Option<String>,
+        /// Ask for a specific public port inside the lighthouse's range.
+        #[arg(long)]
+        public_port: Option<u16>,
+        #[arg(long)]
+        udp: bool,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Remove an ephemeral forward by id.
+    Unexpose { id: String },
+    /// List forwards that point at this node.
+    Exposes,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +93,9 @@ async fn main() -> anyhow::Result<()> {
             print_header(&st);
             print_networks(&st);
             print_devices(&st);
+            if st.networks.iter().any(|n| !n.info.forwards.is_empty()) {
+                print_forwards(&st);
+            }
             println!();
             print_peers(&st);
             Ok(())
@@ -85,6 +108,73 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Networks => {
             let st = status(&cli.socket).await?;
             print_networks(&st);
+            Ok(())
+        }
+        Cmd::Expose {
+            target,
+            network,
+            public_port,
+            udp,
+            label,
+        } => {
+            let target = if target.contains(':') {
+                target
+            } else {
+                format!("127.0.0.1:{target}")
+            };
+            let network = match network {
+                Some(n) => n,
+                None => {
+                    let st = status(&cli.socket).await?;
+                    st.networks
+                        .first()
+                        .map(|n| n.info.name.clone())
+                        .ok_or_else(|| anyhow::anyhow!("not a member of any network"))?
+                }
+            };
+            let proto = if udp {
+                ig_proto::tunnel::ForwardProto::Udp
+            } else {
+                ig_proto::tunnel::ForwardProto::Tcp
+            };
+            match ipc::request(
+                &cli.socket,
+                &IpcRequest::Expose {
+                    network,
+                    proto,
+                    public_port,
+                    target,
+                    label,
+                },
+            )
+            .await?
+            {
+                IpcResponse::Exposed(f) => {
+                    println!(
+                        "{}://{}:{}  ->  {}   (id {})",
+                        f.proto, f.public_host, f.public_port, f.target, f.id
+                    );
+                    println!(
+                        "ephemeral: gone when this node disconnects or after `ig unexpose {}`",
+                        f.id
+                    );
+                    Ok(())
+                }
+                other => fail(other),
+            }
+        }
+        Cmd::Unexpose { id } => {
+            match ipc::request(&cli.socket, &IpcRequest::Unexpose { id }).await? {
+                IpcResponse::Ok => {
+                    println!("removed");
+                    Ok(())
+                }
+                other => fail(other),
+            }
+        }
+        Cmd::Exposes => {
+            let st = status(&cli.socket).await?;
+            print_forwards(&st);
             Ok(())
         }
         Cmd::Invite { cmd } => match cmd {
@@ -165,6 +255,39 @@ fn print_networks(st: &StatusReport) {
                 " (disconnected)"
             }
         );
+    }
+}
+
+fn print_forwards(st: &StatusReport) {
+    let mut any = false;
+    for n in &st.networks {
+        for f in &n.info.forwards {
+            if !any {
+                println!();
+                println!(
+                    "{:<10} {:<10} {:<6} {:<26} {:<22} {:<10} LABEL",
+                    "FORWARD", "KIND", "PROTO", "PUBLIC", "TARGET", "NETWORK"
+                );
+                any = true;
+            }
+            let kind = match f.kind {
+                ig_proto::tunnel::ForwardKind::Permanent => "permanent",
+                ig_proto::tunnel::ForwardKind::Ephemeral => "ephemeral",
+            };
+            println!(
+                "{:<10} {:<10} {:<6} {:<26} {:<22} {:<10} {}",
+                f.id,
+                kind,
+                f.proto.to_string(),
+                format!("{}:{}", f.public_host, f.public_port),
+                truncate(&f.target, 22),
+                truncate(&n.info.name, 10),
+                f.label
+            );
+        }
+    }
+    if !any {
+        println!("no forwards. Use `ig expose <port>`.");
     }
 }
 

@@ -91,6 +91,7 @@ See `docs/architecture.md` for the full design. In short:
 - **Windows service**: `ig-node service install` registers the daemon with the Service Control Manager and starts it at boot.
 - **Relay rate limits** per network (per member and total), with a lighthouse-wide default. Direct peer-to-peer traffic is never limited.
 - **Policies** per network: allow lists of inbound flows, stateful, so an untrusted network can be restricted to a game's ports.
+- **Public port forwards** through the lighthouse: `ig expose 8080` publishes a local port on the lighthouse's public address for as long as the node is up, and admins create permanent forwards (`forward add dev <node> 20022 127.0.0.1:22`). TCP and UDP, with per-network opt-out.
 - **Gateway devices**: register a printer, NAS or any machine on a physical LAN (IPv4, and IPv6 with `--ipv6`) and members reach it at an overlay address and name. Nodes started with `--gateway` on that LAN forward and translate for it; the lighthouse picks one and fails over within a minute when it leaves.
 
 ## Verification

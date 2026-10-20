@@ -413,6 +413,36 @@ async fn handle_ipc(engine: &Engine, req: IpcRequest) -> IpcResponse {
                 message: e.to_string(),
             },
         },
+        IpcRequest::Expose {
+            network,
+            proto,
+            public_port,
+            target,
+            label,
+        } => {
+            let id = engine
+                .memberships()
+                .into_iter()
+                .find(|m| m.network.name == network || m.network.id.to_string() == network)
+                .map(|m| m.network.id);
+            match id {
+                Some(id) => match engine.expose(id, proto, public_port, target, label).await {
+                    Ok(info) => IpcResponse::Exposed(info),
+                    Err(e) => IpcResponse::Error {
+                        message: e.to_string(),
+                    },
+                },
+                None => IpcResponse::Error {
+                    message: format!("not a member of `{network}`"),
+                },
+            }
+        }
+        IpcRequest::Unexpose { id } => match engine.unexpose(&id).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
         IpcRequest::Leave { network } => {
             let id = engine
                 .memberships()

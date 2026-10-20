@@ -9,9 +9,24 @@ use std::net::{IpAddr, SocketAddr};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IpcRequest {
     Status,
-    Join { invite: String },
-    Leave { network: String },
+    Join {
+        invite: String,
+    },
+    Leave {
+        network: String,
+    },
     Peers,
+    /// Request an ephemeral public port on the lighthouse for `target`.
+    Expose {
+        network: String,
+        proto: crate::tunnel::ForwardProto,
+        public_port: Option<u16>,
+        target: String,
+        label: String,
+    },
+    Unexpose {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +35,7 @@ pub enum IpcResponse {
     Error { message: String },
     Status(StatusReport),
     Joined(NetworkInfo),
+    Exposed(crate::tunnel::ForwardInfo),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

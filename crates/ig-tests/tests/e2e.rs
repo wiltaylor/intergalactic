@@ -32,6 +32,7 @@ async fn lighthouse() -> Lighthouse {
         state_path: None,
         dns_domain: "ig.test".into(),
         default_relay_limit: RelayLimit::unlimited(),
+        forward_range: (30000, 30099),
     })
     .await
     .unwrap()
@@ -890,5 +891,210 @@ async fn ipv6_devices_are_translated_too() {
     assert!(matches!(r, AdminResponse::Error { .. }));
     gw.engine.shutdown().await;
     client.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_port_forwards_carry_tcp_and_udp() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "dev", "10.96.0.0/24", None);
+    let inv = invite(&lh, "dev", 5);
+    let a = node("alpha", vec![], false).await;
+    let (ia, _os_a) = join_with_tun(&a, &inv).await;
+
+    // A TCP echo service and a UDP echo service on the node's host (this process).
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let uecho = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let uecho_port = uecho.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = uecho.recv_from(&mut buf).await {
+            let _ = uecho.send_to(&buf[..n], from).await;
+        }
+    });
+
+    // Ephemeral TCP forward with an automatic public port.
+    let f = a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Tcp,
+            None,
+            format!("127.0.0.1:{echo_port}"),
+            "echo".into(),
+        )
+        .await
+        .expect("expose");
+    assert!((30000..=30099).contains(&f.public_port));
+    assert_eq!(f.kind, ig_proto::tunnel::ForwardKind::Ephemeral);
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The tunnel channel comes up right after the control channel; retry until
+    // a round trip succeeds.
+    let mut echoed = None;
+    for _ in 0..50 {
+        let Ok(mut client) = tokio::net::TcpStream::connect(("127.0.0.1", f.public_port)).await
+        else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        client
+            .write_all(b"hello through the lighthouse")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf)).await
+        {
+            if n > 0 {
+                echoed = Some((buf[..n].to_vec(), client));
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (first, client) = echoed.expect("echo through the public port");
+    assert_eq!(first, b"hello through the lighthouse");
+    // A large payload survives chunking.
+    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut r, mut w) = client.into_split();
+    let payload = big.clone();
+    let writer = tokio::spawn(async move {
+        w.write_all(&payload).await.unwrap();
+        w
+    });
+    let mut got = vec![0u8; big.len()];
+    tokio::time::timeout(Duration::from_secs(10), r.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, big);
+    drop(writer.await.unwrap());
+    drop(r);
+
+    // Node status lists the forward; the lighthouse lists it as ephemeral and online.
+    wait_for("forward in status", || {
+        a.engine.status().networks[0].info.forwards.len() == 1
+    })
+    .await;
+    match lh.admin(AdminRequest::ForwardList) {
+        AdminResponse::Forwards(list) => {
+            assert_eq!(list.len(), 1);
+            assert!(list[0].node_online);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // UDP forward with an explicit public port.
+    let fu = a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Udp,
+            Some(30050),
+            format!("127.0.0.1:{uecho_port}"),
+            "udp".into(),
+        )
+        .await
+        .expect("expose udp");
+    assert_eq!(fu.public_port, 30050);
+    let us = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut got = None;
+    for _ in 0..30 {
+        us.send_to(b"ping over udp", ("127.0.0.1", 30050))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(300), us.recv_from(&mut buf)).await
+        {
+            got = Some(buf[..n].to_vec());
+            break;
+        }
+    }
+    assert_eq!(got.expect("udp echo"), b"ping over udp");
+
+    // Taken port and out-of-range port are refused; a denied network refuses everything.
+    assert!(a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Udp,
+            Some(30050),
+            "127.0.0.1:1".into(),
+            String::new()
+        )
+        .await
+        .is_err());
+    assert!(a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Tcp,
+            Some(40000),
+            "127.0.0.1:1".into(),
+            String::new()
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        lh.admin(AdminRequest::NetworkSetExposes {
+            network: "dev".into(),
+            allowed: false
+        }),
+        AdminResponse::Ok
+    ));
+    wait_for("deny pushed", || {
+        !a.engine.status().networks[0].info.exposes_allowed
+    })
+    .await;
+    assert!(a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Tcp,
+            None,
+            "127.0.0.1:1".into(),
+            String::new()
+        )
+        .await
+        .is_err());
+
+    // A permanent forward created by the admin survives the node going away;
+    // the ephemeral ones are gone.
+    let r = lh.admin(AdminRequest::ForwardAdd {
+        network: "dev".into(),
+        node: a.engine.node_id(),
+        proto: ig_proto::tunnel::ForwardProto::Tcp,
+        public_port: 30080,
+        target: format!("127.0.0.1:{echo_port}"),
+        label: "perm".into(),
+    });
+    assert!(matches!(r, AdminResponse::Forwards(_)), "{r:?}");
+    a.engine.unexpose(&f.id).await.unwrap();
+    wait_for("ephemeral tcp removed", || {
+        matches!(lh.admin(AdminRequest::ForwardList), AdminResponse::Forwards(l) if l.iter().all(|x| x.info.id != f.id))
+    })
+    .await;
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", f.public_port))
+        .await
+        .is_err());
+    a.engine.shutdown().await;
+    wait_for("udp ephemeral removed on disconnect", || {
+        matches!(lh.admin(AdminRequest::ForwardList), AdminResponse::Forwards(l) if l.len() == 1 && l[0].info.public_port == 30080)
+    })
+    .await;
     lh.shutdown().await;
 }

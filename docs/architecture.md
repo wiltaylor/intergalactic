@@ -156,6 +156,21 @@ dropped (nodes ping every 15 s), the networks of that node are re-pushed, and th
 to the next candidate. Members already hold WireGuard sessions with every peer, so the switch
 is one route change.
 
+## Public port forwards
+
+A forward binds a public port on the lighthouse to a `host:port` target that one node
+reaches. Permanent forwards live in the store; ephemeral ones live in memory with the node's
+session and are re-requested by the node after a reconnect. The lighthouse keeps one listener
+per forward (TCP accept loop or UDP socket) and refuses to bind its own control port.
+
+Each node holds a second Noise/TCP connection to each lighthouse, the **tunnel channel**
+(`ClientHello.tunnel = true`). The lighthouse multiplexes streams over it: `Open` for every
+accepted TCP connection or new UDP peer, `Data` frames of at most 16 KiB, `Close`. The node
+connects to the target and pumps bytes both ways; the lighthouse pumps between the public
+socket and the frames. Nothing is decrypted on the lighthouse beyond the Noise layer of the
+tunnel channel itself, which it terminates by design: unlike relayed WireGuard traffic, the
+lighthouse sees forwarded bytes in the clear, exactly as any reverse proxy would.
+
 ## Persistence
 
 - Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, invite hashes) in the

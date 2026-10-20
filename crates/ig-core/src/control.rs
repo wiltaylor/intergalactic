@@ -40,6 +40,18 @@ pub enum ControlCmd {
     },
     /// Re-send local endpoints (called when the embedder notices an address change).
     RefreshEndpoints,
+    /// Request an ephemeral public port forward.
+    Expose {
+        network: NetworkId,
+        proto: ig_proto::tunnel::ForwardProto,
+        public_port: Option<u16>,
+        target: String,
+        label: String,
+        reply: oneshot::Sender<Result<ig_proto::tunnel::ForwardInfo, String>>,
+    },
+    Unexpose {
+        id: String,
+    },
     Shutdown,
 }
 
@@ -180,6 +192,7 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         hostname: inner.hostname.clone(),
         os: inner.os.clone(),
         gateway: inner.gateway,
+        tunnel: false,
     };
     let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -252,6 +265,29 @@ async fn session_loop(
         }
     }
 
+    // The tunnel channel for public port forwards lives alongside the control session.
+    let tunnel_task = tokio::spawn(crate::tunnel::run(inner.clone(), h.addr.clone()));
+    let mut pending_exposes: HashMap<
+        String,
+        oneshot::Sender<Result<ig_proto::tunnel::ForwardInfo, String>>,
+    > = HashMap::new();
+    // Ephemeral forwards requested earlier are re-requested after a reconnect.
+    for req in inner.remembered_exposes(&h.addr) {
+        if let Err(e) = tx
+            .send(&ToLighthouse::Expose {
+                network: req.network,
+                proto: req.proto,
+                public_port: Some(req.public_port),
+                target: req.target.clone(),
+                label: req.label.clone(),
+            })
+            .await
+        {
+            tunnel_task.abort();
+            return SessionEnd::Lost(e.to_string());
+        }
+    }
+
     let (incoming_tx, mut incoming) = mpsc::channel::<Result<FromLighthouse, String>>(64);
     let reader = tokio::spawn(async move {
         loop {
@@ -306,6 +342,14 @@ async fn session_loop(
                     Some(ControlCmd::Punch { network, target }) => {
                         if let Err(e) = tx.send(&ToLighthouse::Punch { network, target }).await { break SessionEnd::Lost(e.to_string()); }
                     }
+                    Some(ControlCmd::Expose { network, proto, public_port, target, label, reply }) => {
+                        pending_exposes.insert(target.clone(), reply);
+                        if let Err(e) = tx.send(&ToLighthouse::Expose { network, proto, public_port, target, label }).await { break SessionEnd::Lost(e.to_string()); }
+                    }
+                    Some(ControlCmd::Unexpose { id }) => {
+                        inner.forget_expose(&id);
+                        if let Err(e) = tx.send(&ToLighthouse::Unexpose { id }).await { break SessionEnd::Lost(e.to_string()); }
+                    }
                     Some(ControlCmd::RefreshEndpoints) => {
                         if let Err(e) = send_endpoints(inner, &mut tx, &mut last_endpoints, true).await { break SessionEnd::Lost(e.to_string()); }
                         send_probe(inner, h, udp_addr);
@@ -343,6 +387,17 @@ async fn session_loop(
                     FromLighthouse::PunchRequest { network: _, from, endpoints } => {
                         inner.punch_towards(&from, &endpoints);
                     }
+                    FromLighthouse::Exposed { forward } => {
+                        inner.remember_expose(&h.addr, &forward);
+                        if let Some(reply) = pending_exposes.remove(&forward.target) { let _ = reply.send(Ok(forward)); }
+                    }
+                    FromLighthouse::ExposeFailed { target, reason } => {
+                        tracing::warn!(%target, %reason, "expose refused");
+                        if let Some(reply) = pending_exposes.remove(&target) { let _ = reply.send(Err(reason)); }
+                    }
+                    FromLighthouse::Unexposed { id } => {
+                        inner.forget_expose(&id);
+                    }
                     FromLighthouse::Pong { .. } => {}
                     FromLighthouse::Error { message } => {
                         tracing::warn!(lighthouse = %h.addr, %message, "lighthouse error");
@@ -352,6 +407,7 @@ async fn session_loop(
         }
     };
     reader.abort();
+    tunnel_task.abort();
     for (_, reply) in pending_leaves.drain() {
         let _ = reply.send(());
     }

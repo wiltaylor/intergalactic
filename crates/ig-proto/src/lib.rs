@@ -24,6 +24,7 @@ pub mod ipc;
 pub mod keys;
 pub mod noise;
 pub mod policy;
+pub mod tunnel;
 pub mod udp;
 
 pub use ids::{NetworkId, NodeId};

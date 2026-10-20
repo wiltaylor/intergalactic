@@ -34,6 +34,11 @@ flat-linux: require-vmlab
 flat-windows: require-vmlab
 	cd lab/flat && vmlab script scripts/windows.ws
 
+# Run the public port forward scenario against the flat lab (after flat-windows)
+[group('lab')]
+flat-forward: require-vmlab
+	cd lab/flat && vmlab script scripts/forward.ws
+
 # Run the gateway-device scenario against the flat lab (after flat-windows)
 [group('lab')]
 flat-gateway: require-vmlab
@@ -46,7 +51,7 @@ flat-gateway-more: require-vmlab
 
 # Run all flat scenarios
 [group('lab')]
-flat-test: flat-linux flat-windows flat-gateway flat-gateway-more
+flat-test: flat-linux flat-windows flat-forward flat-gateway flat-gateway-more
 
 # Stop the flat lab, keeping the clones
 [group('lab')]

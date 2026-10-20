@@ -1,14 +1,16 @@
 //! Lighthouse runtime: control sessions, UDP disco/relay, broadcasts and admin.
 
+use crate::forwards::{Forwards, TunnelSession};
 use crate::store::{now_secs, InviteRecord, Store, StoreError};
 use ig_proto::admin::{
-    AdminRequest, AdminResponse, DeviceSummary, InviteSummary, LighthouseInfo, NetworkSummary,
-    NodeSummary,
+    AdminRequest, AdminResponse, DeviceSummary, ForwardSummary, InviteSummary, LighthouseInfo,
+    NetworkSummary, NodeSummary,
 };
 use ig_proto::control::{
     ClientHello, DeviceInfo, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
 };
 use ig_proto::noise::NoiseStream;
+use ig_proto::tunnel::{ForwardInfo, ForwardKind, ForwardProto, TunnelMsg};
 use ig_proto::udp::{bind_dual_stack, canonical, reachable, to_wire};
 use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, RelayLimit, PROTOCOL_VERSION};
 use ipnet::Ipv4Net;
@@ -47,7 +49,23 @@ pub struct LighthouseConfig {
     pub dns_domain: String,
     /// Relay limit applied to networks that have no limit of their own.
     pub default_relay_limit: RelayLimit,
+    /// Public ports handed out for ephemeral forwards, inclusive.
+    pub forward_range: (u16, u16),
 }
+
+/// Ephemeral forward held in memory for the life of the node's session.
+#[derive(Clone, Debug)]
+struct Ephemeral {
+    id: String,
+    network: NetworkId,
+    node: NodeId,
+    proto: ForwardProto,
+    public_port: u16,
+    target: String,
+    label: String,
+}
+
+const MAX_EPHEMERAL_PER_NODE: usize = 8;
 
 struct Session {
     node: NodeId,
@@ -75,6 +93,8 @@ struct Inner {
     /// Active gateway per (network, device name). Kept so a device does not
     /// hop between equally good gateways on every state push.
     active_gateways: Mutex<HashMap<(NetworkId, String), NodeId>>,
+    forwards: Arc<Forwards>,
+    ephemeral: Mutex<Vec<Ephemeral>>,
     /// Relay token buckets: per (network, node) and per network.
     buckets: Mutex<Buckets>,
     dirty: Mutex<HashSet<NetworkId>>,
@@ -107,6 +127,8 @@ impl Lighthouse {
             udp,
             dual_stack,
             active_gateways: Mutex::new(HashMap::new()),
+            forwards: Arc::new(Forwards::default()),
+            ephemeral: Mutex::new(Vec::new()),
             buckets: Mutex::new(Buckets::default()),
             dirty: Mutex::new(HashSet::new()),
             dirty_notify: tokio::sync::Notify::new(),
@@ -119,6 +141,7 @@ impl Lighthouse {
         let t4 = tokio::spawn(housekeeping(inner.clone()));
         let t5 = tokio::spawn(reap_idle_sessions(inner.clone()));
         inner.tasks.lock().extend([t1, t2, t3, t4, t5]);
+        inner.reconcile_forwards();
         tracing::info!(addr = %tcp_addr, dual_stack, key = %inner.config.keypair.public, dns_domain = %inner.config.dns_domain, "lighthouse listening");
         Ok(Lighthouse { inner, tcp_addr })
     }
@@ -327,7 +350,84 @@ impl Inner {
         v
     }
 
-    fn network_info(&self, net: &crate::store::Network, m: &crate::store::Member) -> NetworkInfo {
+    fn expose(
+        &self,
+        node: NodeId,
+        network: NetworkId,
+        proto: ForwardProto,
+        public_port: Option<u16>,
+        target: &str,
+        label: &str,
+    ) -> anyhow::Result<ForwardInfo> {
+        Self::validate_target(target)?;
+        let store = self.store.lock();
+        let net = store
+            .networks
+            .get(&network)
+            .ok_or_else(|| anyhow::anyhow!("no such network"))?;
+        if !net.members.contains_key(&node) {
+            anyhow::bail!("not a member of this network");
+        }
+        if !net.exposes_allowed {
+            anyhow::bail!("network `{}` does not allow ephemeral forwards", net.name);
+        }
+        let (lo, hi) = self.config.forward_range;
+        if lo > hi {
+            anyhow::bail!("this lighthouse does not hand out ephemeral ports");
+        }
+        let mine = self
+            .ephemeral
+            .lock()
+            .iter()
+            .filter(|e| e.node == node)
+            .count();
+        if mine >= MAX_EPHEMERAL_PER_NODE {
+            anyhow::bail!("at most {MAX_EPHEMERAL_PER_NODE} ephemeral forwards per node");
+        }
+        let port = match public_port {
+            Some(p) => {
+                if p < lo || p > hi {
+                    anyhow::bail!("public port must be within {lo}-{hi}");
+                }
+                if self.port_in_use(&store, p, proto) {
+                    anyhow::bail!("public port {p}/{proto} is taken");
+                }
+                p
+            }
+            None => (lo..=hi)
+                .find(|p| !self.port_in_use(&store, *p, proto))
+                .ok_or_else(|| anyhow::anyhow!("no free public port left in {lo}-{hi}"))?,
+        };
+        let e = Ephemeral {
+            id: Self::forward_id(),
+            network,
+            node,
+            proto,
+            public_port: port,
+            target: target.to_string(),
+            label: label.to_string(),
+        };
+        self.ephemeral.lock().push(e.clone());
+        Ok(ForwardInfo {
+            id: e.id,
+            network,
+            node,
+            proto,
+            kind: ForwardKind::Ephemeral,
+            public_host: self.config.public_host.clone(),
+            public_port: port,
+            target: e.target,
+            label: e.label,
+        })
+    }
+
+    fn network_info(
+        &self,
+        store: &Store,
+        net: &crate::store::Network,
+        node: &NodeId,
+        m: &crate::store::Member,
+    ) -> NetworkInfo {
         NetworkInfo {
             id: net.id,
             name: net.name.clone(),
@@ -340,7 +440,83 @@ impl Inner {
             dns_name: m.dns_name.clone(),
             relay_limit: self.effective_limit(net),
             devices: self.resolve_devices(net),
+            forwards: self
+                .all_forwards(store)
+                .into_iter()
+                .filter(|f| f.network == net.id && f.node == *node)
+                .collect(),
+            exposes_allowed: net.exposes_allowed,
         }
+    }
+
+    /// Every forward, permanent and ephemeral, as the node-facing record.
+    fn all_forwards(&self, store: &Store) -> Vec<ForwardInfo> {
+        let host = self.config.public_host.clone();
+        let mut v: Vec<ForwardInfo> = store
+            .forwards
+            .values()
+            .map(|f| ForwardInfo {
+                id: f.id.clone(),
+                network: f.network,
+                node: f.node,
+                proto: f.proto,
+                kind: ForwardKind::Permanent,
+                public_host: host.clone(),
+                public_port: f.public_port,
+                target: f.target.clone(),
+                label: f.label.clone(),
+            })
+            .collect();
+        v.extend(self.ephemeral.lock().iter().map(|e| ForwardInfo {
+            id: e.id.clone(),
+            network: e.network,
+            node: e.node,
+            proto: e.proto,
+            kind: ForwardKind::Ephemeral,
+            public_host: host.clone(),
+            public_port: e.public_port,
+            target: e.target.clone(),
+            label: e.label.clone(),
+        }));
+        v
+    }
+
+    fn reconcile_forwards(&self) {
+        let wanted = {
+            let store = self.store.lock();
+            self.all_forwards(&store)
+        };
+        self.forwards.reconcile(wanted);
+    }
+
+    fn port_in_use(&self, store: &Store, port: u16, proto: ForwardProto) -> bool {
+        port == self.config.listen.port()
+            || store
+                .forwards
+                .values()
+                .any(|f| f.public_port == port && f.proto == proto)
+            || self
+                .ephemeral
+                .lock()
+                .iter()
+                .any(|e| e.public_port == port && e.proto == proto)
+    }
+
+    fn forward_id() -> String {
+        ig_proto::random_array::<4>()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn validate_target(target: &str) -> anyhow::Result<()> {
+        let (host, port) = target
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("target must be host:port"))?;
+        if host.is_empty() || port.parse::<u16>().is_err() {
+            anyhow::bail!("target must be host:port");
+        }
+        Ok(())
     }
 
     fn persist(&self, store: &Store) {
@@ -408,7 +584,7 @@ impl Inner {
             })
             .collect();
         Some(FromLighthouse::NetworkState {
-            network: self.network_info(net, me_member),
+            network: self.network_info(store, net, me, me_member),
             peers,
         })
     }
@@ -528,6 +704,44 @@ impl Inner {
             ToLighthouse::Ping { nonce } => {
                 let _ = session.tx.try_send(FromLighthouse::Pong { nonce });
             }
+            ToLighthouse::Expose {
+                network,
+                proto,
+                public_port,
+                target,
+                label,
+            } => match self.expose(node, network, proto, public_port, &target, &label) {
+                Ok(info) => {
+                    tracing::info!(node = %node.short(), port = info.public_port, proto = %proto, %target, "ephemeral forward");
+                    let _ = session
+                        .tx
+                        .try_send(FromLighthouse::Exposed { forward: info });
+                    self.reconcile_forwards();
+                    self.mark_dirty([network]);
+                }
+                Err(e) => {
+                    let _ = session.tx.try_send(FromLighthouse::ExposeFailed {
+                        target,
+                        reason: e.to_string(),
+                    });
+                }
+            },
+            ToLighthouse::Unexpose { id } => {
+                let removed: Vec<Ephemeral> = {
+                    let mut eph = self.ephemeral.lock();
+                    let (gone, keep): (Vec<_>, Vec<_>) =
+                        eph.drain(..).partition(|e| e.id == id && e.node == node);
+                    *eph = keep;
+                    gone
+                };
+                for e in removed {
+                    let _ = session
+                        .tx
+                        .try_send(FromLighthouse::Unexposed { id: e.id.clone() });
+                    self.reconcile_forwards();
+                    self.mark_dirty([e.network]);
+                }
+            }
         }
     }
 
@@ -539,7 +753,7 @@ impl Inner {
     ) -> Option<NetworkInfo> {
         let net = store.networks.get(&network)?;
         let m = net.members.get(node)?;
-        Some(self.network_info(net, m))
+        Some(self.network_info(store, net, node, m))
     }
 
     // ---- udp ------------------------------------------------------------------
@@ -836,6 +1050,90 @@ impl Inner {
                 self.mark_dirty([id]);
                 Ok(AdminResponse::Ok)
             }
+            AdminRequest::ForwardAdd {
+                network,
+                node,
+                proto,
+                public_port,
+                target,
+                label,
+            } => {
+                Self::validate_target(&target)?;
+                let mut store = self.store.lock();
+                let id = store.resolve(&network)?;
+                if !store.networks[&id].members.contains_key(&node) {
+                    anyhow::bail!("node is not a member of that network");
+                }
+                if public_port < 1024 && public_port != 80 && public_port != 443 {
+                    anyhow::bail!("public port must be 80, 443 or 1024 and above");
+                }
+                if self.port_in_use(&store, public_port, proto) {
+                    anyhow::bail!("public port {public_port}/{proto} is taken");
+                }
+                let fid = Self::forward_id();
+                store.forwards.insert(
+                    fid.clone(),
+                    crate::store::ForwardRecord {
+                        id: fid.clone(),
+                        network: id,
+                        node,
+                        proto,
+                        public_port,
+                        target,
+                        label,
+                        created_at: now_secs(),
+                    },
+                );
+                self.persist(&store);
+                let list = self
+                    .forward_summaries(&store)
+                    .into_iter()
+                    .filter(|f| f.info.id == fid)
+                    .collect();
+                drop(store);
+                self.reconcile_forwards();
+                self.mark_dirty([id]);
+                Ok(AdminResponse::Forwards(list))
+            }
+            AdminRequest::ForwardList => {
+                let store = self.store.lock();
+                Ok(AdminResponse::Forwards(self.forward_summaries(&store)))
+            }
+            AdminRequest::ForwardRemove { id } => {
+                let mut store = self.store.lock();
+                let net = match store.forwards.remove(&id) {
+                    Some(f) => {
+                        self.persist(&store);
+                        f.network
+                    }
+                    None => {
+                        let mut eph = self.ephemeral.lock();
+                        let Some(pos) = eph.iter().position(|e| e.id == id) else {
+                            anyhow::bail!("forward not found: {id}");
+                        };
+                        let e = eph.remove(pos);
+                        self.send_to(&e.node, FromLighthouse::Unexposed { id: e.id.clone() });
+                        e.network
+                    }
+                };
+                drop(store);
+                self.reconcile_forwards();
+                self.mark_dirty([net]);
+                Ok(AdminResponse::Ok)
+            }
+            AdminRequest::NetworkSetExposes { network, allowed } => {
+                let mut store = self.store.lock();
+                let id = store.resolve(&network)?;
+                store
+                    .networks
+                    .get_mut(&id)
+                    .expect("resolved")
+                    .exposes_allowed = allowed;
+                self.persist(&store);
+                drop(store);
+                self.mark_dirty([id]);
+                Ok(AdminResponse::Ok)
+            }
             AdminRequest::NodeRemove { network, node } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
@@ -894,6 +1192,29 @@ impl Inner {
         }
     }
 
+    fn forward_summaries(&self, store: &Store) -> Vec<ForwardSummary> {
+        let sessions = self.sessions.read();
+        self.all_forwards(store)
+            .into_iter()
+            .map(|info| ForwardSummary {
+                network_name: store
+                    .networks
+                    .get(&info.network)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default(),
+                node_hostname: store
+                    .nodes
+                    .get(&info.node)
+                    .map(|n| n.hostname.clone())
+                    .unwrap_or_default(),
+                node_online: sessions.contains_key(&info.node)
+                    && self.forwards.has_tunnel(&info.node),
+                active_streams: self.forwards.active_streams(&info.id),
+                info,
+            })
+            .collect()
+    }
+
     fn summarise(&self, n: &crate::store::Network) -> NetworkSummary {
         let sessions = self.sessions.read();
         NetworkSummary {
@@ -909,6 +1230,7 @@ impl Inner {
                 .count(),
             policy: n.policy.clone(),
             relay_limit: self.effective_limit(n),
+            exposes_allowed: n.exposes_allowed,
         }
     }
 }
@@ -956,6 +1278,9 @@ async fn handle_connection(
         anyhow::bail!("node speaks protocol v{}", hello.version);
     }
     let node = noise.remote();
+    if hello.tunnel {
+        return handle_tunnel(inner, noise, node).await;
+    }
     let (tx, mut rx) = mpsc::channel::<FromLighthouse>(256);
     let session = Arc::new(Session {
         node,
@@ -1022,8 +1347,68 @@ async fn handle_connection(
         }
         inner.persist(&store);
     }
+    // Ephemeral forwards live only as long as the session.
+    let still_here = inner.sessions.read().contains_key(&node);
+    if !still_here {
+        let gone: Vec<Ephemeral> = {
+            let mut eph = inner.ephemeral.lock();
+            let (g, keep): (Vec<_>, Vec<_>) = eph.drain(..).partition(|e| e.node == node);
+            *eph = keep;
+            g
+        };
+        if !gone.is_empty() {
+            inner.reconcile_forwards();
+            inner.mark_dirty(gone.iter().map(|e| e.network));
+        }
+    }
     inner.mark_dirty_for_node(&node);
     tracing::info!(node = %node.short(), "node disconnected");
+    result
+}
+
+/// A node's tunnel channel: frames for public port forwards.
+async fn handle_tunnel(
+    inner: Arc<Inner>,
+    noise: NoiseStream<TcpStream>,
+    node: NodeId,
+) -> anyhow::Result<()> {
+    let member = !inner.store.lock().networks_of(&node).is_empty();
+    if !member {
+        anyhow::bail!("tunnel channel from a node that is not a member of any network");
+    }
+    let (tx, mut rx) = mpsc::channel::<TunnelMsg>(1024);
+    let session = Arc::new(TunnelSession {
+        node,
+        tx,
+        abort: tokio::sync::Notify::new(),
+    });
+    if let Some(old) = inner.forwards.tunnel_connected(session.clone()) {
+        old.abort.notify_one();
+    }
+    tracing::info!(node = %node.short(), "tunnel channel up");
+    let (mut noise_tx, mut noise_rx) = noise.into_parts();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if noise_tx.send(&msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+                _ = session.abort.notified() => break Ok(()),
+                msg = noise_rx.recv::<TunnelMsg>() => {
+                    let msg = msg?;
+                    inner.forwards.from_node(node, msg).await;
+                }
+            }
+        }
+    }
+    .await;
+    writer.abort();
+    inner.forwards.tunnel_disconnected(&node, &session);
+    tracing::info!(node = %node.short(), "tunnel channel closed");
     result
 }
 

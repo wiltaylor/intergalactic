@@ -58,6 +58,10 @@ enum Cmd {
         /// Default relay cap per network in kbit/s for networks without their own limit (0 = unlimited).
         #[arg(long, default_value_t = 0)]
         relay_limit_total_kbps: u32,
+        /// Public ports handed out for ephemeral forwards (`ig expose`), e.g. `20000-20999`.
+        /// Open this range in the firewall. `none` disables ephemeral forwards.
+        #[arg(long, default_value = "20000-20999")]
+        forward_range: String,
     },
     /// Show lighthouse identity and counters.
     Info,
@@ -80,6 +84,33 @@ enum Cmd {
     Device {
         #[command(subcommand)]
         cmd: DeviceCmd,
+    },
+    /// Manage permanent public port forwards.
+    Forward {
+        #[command(subcommand)]
+        cmd: ForwardCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ForwardCmd {
+    /// Forward a public port to a target reached from a node:
+    /// `forward add dev <node-id> 8443 127.0.0.1:443`.
+    Add {
+        network: String,
+        node: NodeId,
+        public_port: u16,
+        /// `host:port` as seen from the node, e.g. `127.0.0.1:8080` or `192.168.1.50:80`.
+        target: String,
+        #[arg(long)]
+        udp: bool,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// List permanent and ephemeral forwards.
+    List,
+    Remove {
+        id: String,
     },
 }
 
@@ -127,6 +158,12 @@ enum NetworkCmd {
         /// Allow rule, repeatable: `tcp:22,80`, `udp:27015-27030`, `icmp`.
         #[arg(long = "allow")]
         allow: Vec<Rule>,
+    },
+    /// Allow (default) or deny ephemeral forwards (`ig expose`) in a network.
+    Expose {
+        network: String,
+        #[arg(long)]
+        deny: bool,
     },
     /// Cap relayed traffic for one network. Without flags the network falls back
     /// to the lighthouse default.
@@ -193,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
             dns_domain,
             relay_limit_per_node_kbps,
             relay_limit_total_kbps,
+            forward_range,
         } => {
             std::fs::create_dir_all(&cli.state_dir)
                 .with_context(|| format!("creating {}", cli.state_dir.display()))?;
@@ -208,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
                     per_node_kbps: relay_limit_per_node_kbps,
                     total_kbps: relay_limit_total_kbps,
                 },
+                forward_range: parse_range(&forward_range)?,
             };
             let lh = Lighthouse::start(config).await?;
             println!("lighthouse public key: {}", lh.public_key());
@@ -251,6 +290,16 @@ async fn main() -> anyhow::Result<()> {
             NetworkCmd::Delete { network } => expect_ok(
                 admin_socket::request(&admin_sock, &AdminRequest::NetworkDelete { network })
                     .await?,
+            ),
+            NetworkCmd::Expose { network, deny } => expect_ok(
+                admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::NetworkSetExposes {
+                        network,
+                        allowed: !deny,
+                    },
+                )
+                .await?,
             ),
             NetworkCmd::RelayLimit {
                 network,
@@ -339,6 +388,41 @@ async fn main() -> anyhow::Result<()> {
                     &AdminRequest::InviteRevoke { network, invite_id },
                 )
                 .await?,
+            ),
+        },
+        Cmd::Forward { cmd } => match cmd {
+            ForwardCmd::Add {
+                network,
+                node,
+                public_port,
+                target,
+                udp,
+                label,
+            } => {
+                let proto = if udp {
+                    ig_proto::tunnel::ForwardProto::Udp
+                } else {
+                    ig_proto::tunnel::ForwardProto::Tcp
+                };
+                let r = admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::ForwardAdd {
+                        network,
+                        node,
+                        proto,
+                        public_port,
+                        target,
+                        label,
+                    },
+                )
+                .await?;
+                print_forwards(r)
+            }
+            ForwardCmd::List => print_forwards(
+                admin_socket::request(&admin_sock, &AdminRequest::ForwardList).await?,
+            ),
+            ForwardCmd::Remove { id } => expect_ok(
+                admin_socket::request(&admin_sock, &AdminRequest::ForwardRemove { id }).await?,
             ),
         },
         Cmd::Device { cmd } => match cmd {
@@ -485,6 +569,57 @@ fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
                     n.online,
                     n.relay_limit.to_string(),
                     policy
+                );
+            }
+            Ok(())
+        }
+        other => fail(other),
+    }
+}
+
+fn parse_range(s: &str) -> anyhow::Result<(u16, u16)> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok((1, 0));
+    }
+    let (a, b) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("--forward-range must be LOW-HIGH or none"))?;
+    let lo: u16 = a.trim().parse()?;
+    let hi: u16 = b.trim().parse()?;
+    if lo > hi || lo < 1024 {
+        anyhow::bail!("--forward-range must be within 1024-65535 and LOW <= HIGH");
+    }
+    Ok((lo, hi))
+}
+
+fn print_forwards(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Forwards(list) => {
+            println!(
+                "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<8} LABEL",
+                "ID", "KIND", "PUBLIC", "PROTO", "NETWORK", "NODE", "TARGET", "STREAMS"
+            );
+            for f in list {
+                let kind = match f.info.kind {
+                    ig_proto::tunnel::ForwardKind::Permanent => "permanent",
+                    ig_proto::tunnel::ForwardKind::Ephemeral => "ephemeral",
+                };
+                let node = format!(
+                    "{}{}",
+                    truncate(&f.node_hostname, 12),
+                    if f.node_online { "" } else { " (off)" }
+                );
+                println!(
+                    "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<8} {}",
+                    f.info.id,
+                    kind,
+                    format!("{}:{}", f.info.public_host, f.info.public_port),
+                    f.info.proto.to_string(),
+                    truncate(&f.network_name, 12),
+                    node,
+                    truncate(&f.info.target, 22),
+                    f.active_streams,
+                    f.info.label
                 );
             }
             Ok(())

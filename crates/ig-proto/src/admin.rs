@@ -58,6 +58,24 @@ pub enum AdminRequest {
         network: String,
         name: String,
     },
+    /// Permanent forward: public port on the lighthouse -> `target` reached from `node`.
+    ForwardAdd {
+        network: String,
+        node: NodeId,
+        proto: crate::tunnel::ForwardProto,
+        public_port: u16,
+        target: String,
+        label: String,
+    },
+    ForwardList,
+    ForwardRemove {
+        id: String,
+    },
+    /// Allow or deny ephemeral forwards for a network.
+    NetworkSetExposes {
+        network: String,
+        allowed: bool,
+    },
     NodeRemove {
         network: String,
         node: NodeId,
@@ -74,6 +92,17 @@ pub enum AdminResponse {
     Invites(Vec<InviteSummary>),
     Nodes(Vec<NodeSummary>),
     Devices(Vec<DeviceSummary>),
+    Forwards(Vec<ForwardSummary>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardSummary {
+    pub info: crate::tunnel::ForwardInfo,
+    pub network_name: String,
+    pub node_hostname: String,
+    pub node_online: bool,
+    /// Streams currently open through this forward.
+    pub active_streams: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +144,7 @@ pub struct NetworkSummary {
     pub online: usize,
     pub policy: Policy,
     pub relay_limit: RelayLimit,
+    pub exposes_allowed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

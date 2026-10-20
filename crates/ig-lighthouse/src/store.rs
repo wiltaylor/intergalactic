@@ -11,6 +11,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn default_true() -> bool {
+    true
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -24,6 +28,22 @@ pub struct Store {
     pub networks: BTreeMap<NetworkId, Network>,
     #[serde(default)]
     pub nodes: BTreeMap<NodeId, NodeRecord>,
+    /// Permanent public port forwards, by id.
+    #[serde(default)]
+    pub forwards: BTreeMap<String, ForwardRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardRecord {
+    pub id: String,
+    pub network: NetworkId,
+    pub node: NodeId,
+    pub proto: ig_proto::tunnel::ForwardProto,
+    pub public_port: u16,
+    pub target: String,
+    #[serde(default)]
+    pub label: String,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +57,9 @@ pub struct Network {
     pub policy: Policy,
     #[serde(default)]
     pub relay_limit: RelayLimit,
+    /// Members may request ephemeral public port forwards.
+    #[serde(default = "default_true")]
+    pub exposes_allowed: bool,
     #[serde(default)]
     pub members: BTreeMap<NodeId, Member>,
     #[serde(default)]
@@ -244,6 +267,7 @@ impl Store {
             cidr6: cidr6.map(|c| c.trunc()),
             policy: Policy::allow_all(),
             relay_limit: RelayLimit::unlimited(),
+            exposes_allowed: true,
             devices: BTreeMap::new(),
             members: BTreeMap::new(),
             invites: Vec::new(),

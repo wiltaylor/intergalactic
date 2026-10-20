@@ -58,6 +58,39 @@ sudo ig-lighthouse network relay-limit game
 
 Limits apply only to traffic relayed through the lighthouse. Direct paths are never limited.
 
+## Public port forwards
+
+The lighthouse has the public address, so it can publish ports for members: the developer
+who needs a webhook to reach a dev server, or a home server that must be reachable from the
+internet.
+
+```sh
+# Ephemeral, from the node, gone when the node disconnects:
+ig expose 8080                        # tcp://lighthouse.example.com:20017 -> 127.0.0.1:8080
+ig expose 27015 --udp --public-port 20500
+ig expose 192.168.1.50:80 --label nas  # anything this node can reach, gateway devices included
+ig exposes
+ig unexpose <id>
+
+# Permanent, by the admin, persisted on the lighthouse:
+sudo ig-lighthouse forward add dev <node-id> 20022 127.0.0.1:22 --label ssh
+sudo ig-lighthouse forward add dev <node-id> 443 127.0.0.1:8443
+sudo ig-lighthouse forward list
+sudo ig-lighthouse forward remove <id>
+
+# Keep untrusted networks from publishing anything:
+sudo ig-lighthouse network expose game --deny
+```
+
+Ephemeral ports come from `serve --forward-range 20000-20999` (default); open that range
+in the VPS firewall, plus any permanent ports. `--forward-range none` disables ephemeral
+forwards for the whole lighthouse. Each node may hold eight ephemeral forwards at a time.
+
+Bytes travel over a second encrypted connection from the node to the lighthouse, the tunnel
+channel, so a forward works for any member, including nodes behind NATs that never get a
+direct path. The service on the node sees connections coming from `127.0.0.1`; the
+lighthouse logs the real client address.
+
 ## Gateway devices
 
 A device that cannot run Intergalactic (a printer, a NAS, a lab box) can still be a member

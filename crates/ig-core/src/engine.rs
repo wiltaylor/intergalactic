@@ -85,6 +85,10 @@ pub enum EngineError {
     JoinTimeout(String),
     #[error("not a member of network {0}")]
     UnknownNetwork(NetworkId),
+    #[error("{0}")]
+    Refused(String),
+    #[error("lighthouse did not answer in time")]
+    NoReply,
     #[error("engine is shutting down")]
     Stopped,
 }
@@ -151,6 +155,19 @@ pub struct Inner {
     events: mpsc::Sender<EngineEvent>,
     protector: Arc<dyn SocketProtector>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Ephemeral forwards we asked for, re-requested after a reconnect.
+    exposes: Mutex<Vec<(LighthouseAddr, ExposeRequest)>>,
+}
+
+/// An ephemeral forward as the node remembers it.
+#[derive(Clone, Debug)]
+pub struct ExposeRequest {
+    pub id: String,
+    pub network: NetworkId,
+    pub proto: ig_proto::tunnel::ForwardProto,
+    pub public_port: u16,
+    pub target: String,
+    pub label: String,
 }
 
 #[derive(Clone)]
@@ -208,6 +225,7 @@ impl Engine {
             events,
             protector,
             tasks: Mutex::new(Vec::new()),
+            exposes: Mutex::new(Vec::new()),
         });
 
         let udp_task = tokio::spawn(udp_loop(inner.clone()));
@@ -331,6 +349,79 @@ impl Engine {
         }
     }
 
+    /// Ask the network's lighthouse for an ephemeral public port forwarding to
+    /// `target` (`host:port` as reachable from this node).
+    pub async fn expose(
+        &self,
+        network: NetworkId,
+        proto: ig_proto::tunnel::ForwardProto,
+        public_port: Option<u16>,
+        target: String,
+        label: String,
+    ) -> Result<ig_proto::tunnel::ForwardInfo, EngineError> {
+        let lh = self
+            .inner
+            .networks
+            .read()
+            .get(&network)
+            .map(|e| e.membership.lighthouse.clone())
+            .ok_or(EngineError::UnknownNetwork(network))?;
+        let handle = self
+            .inner
+            .lighthouses
+            .lock()
+            .get(&lh)
+            .cloned()
+            .ok_or(EngineError::Stopped)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .cmd
+            .send(ControlCmd::Expose {
+                network,
+                proto,
+                public_port,
+                target,
+                label,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| EngineError::Stopped)?;
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(Ok(Ok(info))) => Ok(info),
+            Ok(Ok(Err(reason))) => Err(EngineError::Refused(reason)),
+            Ok(Err(_)) => Err(EngineError::Stopped),
+            Err(_) => Err(EngineError::NoReply),
+        }
+    }
+
+    /// Give an ephemeral forward back.
+    pub async fn unexpose(&self, id: &str) -> Result<(), EngineError> {
+        let lh = self
+            .inner
+            .exposes
+            .lock()
+            .iter()
+            .find(|(_, r)| r.id == id)
+            .map(|(lh, _)| lh.clone());
+        let Some(lh) = lh else {
+            return Err(EngineError::Refused(format!(
+                "no ephemeral forward with id {id}"
+            )));
+        };
+        let handle = self
+            .inner
+            .lighthouses
+            .lock()
+            .get(&lh)
+            .cloned()
+            .ok_or(EngineError::Stopped)?;
+        handle
+            .cmd
+            .send(ControlCmd::Unexpose { id: id.to_string() })
+            .await
+            .map_err(|_| EngineError::Stopped)
+    }
+
     /// Tell every lighthouse our local addresses may have changed.
     pub fn refresh_endpoints(&self) {
         for h in self.inner.lighthouses.lock().values() {
@@ -439,6 +530,37 @@ impl Inner {
             .collect();
         v.sort_by(|a, b| a.network.name.cmp(&b.network.name));
         v
+    }
+
+    pub fn remembered_exposes(&self, lh: &LighthouseAddr) -> Vec<ExposeRequest> {
+        self.exposes
+            .lock()
+            .iter()
+            .filter(|(l, _)| l == lh)
+            .map(|(_, r)| r.clone())
+            .collect()
+    }
+
+    pub fn remember_expose(&self, lh: &LighthouseAddr, f: &ig_proto::tunnel::ForwardInfo) {
+        let mut v = self.exposes.lock();
+        v.retain(|(_, r)| {
+            r.id != f.id && !(r.target == f.target && r.network == f.network && r.proto == f.proto)
+        });
+        v.push((
+            lh.clone(),
+            ExposeRequest {
+                id: f.id.clone(),
+                network: f.network,
+                proto: f.proto,
+                public_port: f.public_port,
+                target: f.target.clone(),
+                label: f.label.clone(),
+            },
+        ));
+    }
+
+    pub fn forget_expose(&self, id: &str) {
+        self.exposes.lock().retain(|(_, r)| r.id != id);
     }
 
     pub fn has_memberships_with(&self, lh: &LighthouseAddr) -> bool {

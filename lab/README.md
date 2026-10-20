@@ -44,6 +44,13 @@ fetches a file from the device by name through the gateway; alpha's link goes do
 the 45 s idle timeout the device moves to bravo while Windows keeps working; bravo reaches its
 own device through the kernel DNAT; alpha returns and the active gateway stays with bravo.
 
+`forward.ws` (after `windows.ws`) checks public port forwards: `ig expose 8080` on alpha
+publishes a localhost-only HTTP server; the lighthouse VM and the Windows VM (both outside the
+overlay path) fetch through the public port; a 20 MiB transfer keeps its checksum; a UDP echo
+works on a chosen public port; an admin permanent forward serves bravo's SSH banner; stopping
+alpha's daemon removes its ephemeral forwards and keeps the permanent one; `network expose
+game --deny` makes `ig expose` fail in that network.
+
 `gateway-more.ws` (after `gateway.ws`) adds IPv6 ULA addresses to the LAN and re-registers the
 device with `--ipv6`: the active Linux gateway gets an `ip6` nftables table, the device
 resolves with an AAAA record, and it is reached over IPv6 from the other gateway, from the
@@ -101,7 +108,7 @@ its name; the lighthouse lists both members.
 
 ## Results on 2026-10-20
 
-All six scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
+All seven scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
 Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by these labs:
 
 - The Windows service did not exit on stop: the tokio runtime waited forever during
