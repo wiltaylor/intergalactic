@@ -29,9 +29,28 @@ pub fn interface_name(network: &NetworkInfo) -> String {
     name
 }
 
+/// Pick an interface name that is not already in use on this host. Two
+/// networks called `dev` on different lighthouses would otherwise collide.
+pub fn free_interface_name(network: &NetworkInfo, taken: &[String]) -> String {
+    let base = interface_name(network);
+    if !taken.contains(&base) {
+        return base;
+    }
+    for i in 2..100 {
+        let suffix = format!("-{i}");
+        let mut candidate = base.clone();
+        candidate.truncate(15 - suffix.len());
+        candidate.push_str(&suffix);
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    base
+}
+
 impl OsTun {
-    pub fn create(network: &NetworkInfo) -> io::Result<OsTun> {
-        let name = interface_name(network);
+    pub fn create(network: &NetworkInfo, taken: &[String]) -> io::Result<OsTun> {
+        let name = free_interface_name(network, taken);
         #[allow(unused_mut)]
         let mut builder = DeviceBuilder::new()
             .name(name.clone())

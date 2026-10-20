@@ -1,0 +1,42 @@
+// Flat lab: a lighthouse and two Linux nodes on one segment, plus a Windows
+// node. Verifies real TUN traffic, IPv6, peer DNS and the Windows service.
+import <vmlab.wcl>
+
+lab "ig-flat" {
+
+  segment "lan" {
+    subnet = "10.70.0.0/24"
+  }
+
+  vm "lh" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "lan" ip = "10.70.0.10" }
+  }
+
+  vm "alpha" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "lan" ip = "10.70.0.11" }
+  }
+
+  vm "bravo" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "lan" ip = "10.70.0.12" }
+  }
+
+  vm "win" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025"
+    arch     = "x86_64"
+    cpus     = 2
+    memory   = 4GiB
+    nic { segment = "lan" ip = "10.70.0.20" }
+  }
+}

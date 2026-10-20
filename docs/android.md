@@ -15,8 +15,9 @@ android/
 
 ## Build
 
-Requirements: Android Studio or the command line SDK, an NDK (r26 or newer), `cargo-ndk`
-and the Rust Android targets.
+Requirements: Android Studio or the command line SDK, an NDK (r26 or newer), `cargo-ndk`,
+the Rust Android targets, and a JDK between 17 and 23 (Gradle 8.10 does not run on newer
+JDKs; set `JAVA_HOME` if your system Java is newer).
 
 ```sh
 cargo install cargo-ndk
@@ -27,7 +28,12 @@ cd android && ./gradlew assembleDebug   # or: just android::apk-build
 ```
 
 `build-rust.sh` compiles `ig-mobile` for `arm64-v8a` and `x86_64` into `app/src/main/jniLibs`
-and runs `uniffi-bindgen` to produce `dev.intergalactic.core` Kotlin bindings.
+and runs `uniffi-bindgen` to produce `dev.intergalactic.core` Kotlin bindings. Bindgen reads
+its metadata from a host debug build of the same crate, because the stripped Android release
+libraries carry none.
+
+Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assembles. The app
+has not yet been run on a device or emulator.
 
 The Gradle wrapper jar is not committed. Run `gradle wrapper` once, or open the project in
 Android Studio, which generates it.

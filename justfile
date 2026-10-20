@@ -6,6 +6,9 @@ mod ci '.just/ci'
 # Android app and Rust core for Android
 mod android '.just/android'
 
+# vmlab virtual labs for real-machine verification
+mod lab '.just/lab'
+
 import '.just/shared.just'
 
 [default, private]

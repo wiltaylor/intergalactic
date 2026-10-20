@@ -91,8 +91,15 @@ See `docs/architecture.md` for the full design. In short:
 - **Relay rate limits** per network (per member and total), with a lighthouse-wide default. Direct peer-to-peer traffic is never limited.
 - **Policies** per network: allow lists of inbound flows, stateful, so an untrusted network can be restricted to a game's ports.
 
+## Verification
+
+`cargo test` covers the protocol and the engine with in-memory TUN devices over loopback.
+`lab/` holds vmlab labs that run the real binaries on QEMU/KVM guests: Ubuntu and Windows
+Server nodes with real TUN/Wintun devices, the OS resolvers, the Windows service, and two
+nodes behind separate NATs. See `lab/README.md` for what each lab checks and the results.
+
 ## Status and limits
 
-- Android builds are not verified in this repository because it has no Android NDK. The Kotlin bindings are generated from the Rust code and the app uses those exact signatures.
+- The Android APK builds (see `docs/android.md`) but has not been run on a device or emulator yet.
 - The lighthouse itself must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
 - Hostnames that collide inside one network get a numeric suffix (`laptop`, `laptop-2`).

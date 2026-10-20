@@ -88,16 +88,22 @@ fn main() -> anyhow::Result<()> {
                     let socket = cli.socket.clone();
                     return ig_node::service::run(Box::new(move |stop| {
                         let rt = tokio::runtime::Runtime::new()?;
-                        rt.block_on(run(state, state_path, socket, opts, async move {
-                            let _ = stop.await;
-                        }))
+                        let result =
+                            rt.block_on(run(state, state_path, socket, opts, async move {
+                                let _ = stop.await;
+                            }));
+                        // Never wait on a straggling blocking task; the SCM is waiting on us.
+                        rt.shutdown_timeout(std::time::Duration::from_secs(3));
+                        result
                     }));
                 }
                 #[cfg(not(windows))]
                 anyhow::bail!("--service is only meaningful on Windows");
             }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run(state, state_path, cli.socket, opts, shutdown_signal()))
+            let result = rt.block_on(run(state, state_path, cli.socket, opts, shutdown_signal()));
+            rt.shutdown_timeout(std::time::Duration::from_secs(3));
+            result
         }
         Cmd::Service { cmd } => {
             init_logging(false, &cli.state_dir);
@@ -254,8 +260,13 @@ async fn run(
     }
     tracing::info!("shutting down");
     ipc_task.abort();
-    dns_os::cleanup(dns_mode);
+    tracing::debug!("shutdown: engine");
     engine.shutdown().await;
+    tracing::debug!("shutdown: resolver cleanup");
+    dns_os::cleanup(dns_mode);
+    tracing::debug!("shutdown: firewall cleanup");
+    ig_node::firewall::remove_all();
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
@@ -284,7 +295,9 @@ fn reconcile(
     for id in stale {
         tracing::info!(network = %id, "removing interface");
         engine.detach_tun(TunScope::Network(id));
-        tuns.remove(&id);
+        if let Some((_, name)) = tuns.remove(&id) {
+            ig_node::firewall::remove_interface(&name);
+        }
     }
     let mut changed = false;
     for (id, m) in wanted {
@@ -293,7 +306,8 @@ fn reconcile(
             *existing = m;
             continue;
         }
-        match OsTun::create(&m.network) {
+        let taken: Vec<String> = tuns.values().map(|(_, name)| name.clone()).collect();
+        match OsTun::create(&m.network, &taken) {
             Ok(tun) => {
                 let name = ig_core::TunDevice::name(&tun);
                 if let Err(e) = engine.attach_tun(TunScope::Network(id), Arc::new(tun)) {
@@ -301,6 +315,7 @@ fn reconcile(
                     continue;
                 }
                 dns_os::configure_interface(dns_mode, &name, &m.network);
+                ig_node::firewall::allow_interface(&name);
                 tuns.insert(id, (m, name));
                 changed = true;
             }

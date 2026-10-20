@@ -1,0 +1,33 @@
+// NAT lab: two nodes on two separate NAT'd segments. The lighthouse runs on
+// the host (see run.sh), which the guests reach through their NAT like any
+// internet host. Verifies hole punching between two NATs and relay fallback.
+import <vmlab.wcl>
+
+lab "ig-nat" {
+
+  segment "nat-a" {
+    subnet = "10.81.0.0/24"
+    nat    = true
+  }
+
+  segment "nat-b" {
+    subnet = "10.82.0.0/24"
+    nat    = true
+  }
+
+  vm "alpha" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "nat-a" ip = "10.81.0.11" }
+  }
+
+  vm "bravo" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "nat-b" ip = "10.82.0.11" }
+  }
+}

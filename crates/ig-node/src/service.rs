@@ -66,10 +66,33 @@ fn service_body() -> anyhow::Result<()> {
         process_id: None,
     })?;
 
-    // Forward the SCM stop request into the async world.
+    // Forward the SCM stop request into the async world, tell the SCM we are
+    // stopping, and make sure the process goes away even if shutdown stalls.
+    let pending_status = status;
     std::thread::spawn(move || {
         let _ = sync_rx.recv();
+        let _ = pending_status.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: Duration::from_secs(20),
+            process_id: None,
+        });
         let _ = stop_tx.send(());
+        std::thread::sleep(Duration::from_secs(15));
+        tracing::error!("shutdown did not finish in 15 s; exiting the process");
+        let _ = pending_status.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::ServiceSpecific(2),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+        std::process::exit(2);
     });
 
     let args = ARGS
@@ -122,6 +145,23 @@ pub fn install_with_layout(launch: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Block until the service reports Stopped, or the deadline passes.
+fn wait_stopped(
+    service: &windows_service::service::Service,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        if start.elapsed() > deadline {
+            anyhow::bail!("service did not stop within {} s", deadline.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 pub fn uninstall() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
@@ -130,9 +170,10 @@ pub fn uninstall() -> anyhow::Result<()> {
     )?;
     if service.query_status()?.current_state != ServiceState::Stopped {
         let _ = service.stop();
-        std::thread::sleep(Duration::from_secs(2));
+        wait_stopped(&service, Duration::from_secs(30))?;
     }
     service.delete()?;
+    crate::firewall::remove_all();
     Ok(())
 }
 
@@ -146,8 +187,12 @@ pub fn start() -> anyhow::Result<()> {
 
 pub fn stop() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP)?
-        .stop()?;
-    Ok(())
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        service.stop()?;
+    }
+    wait_stopped(&service, Duration::from_secs(30))
 }

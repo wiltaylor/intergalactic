@@ -12,10 +12,10 @@ args=()
 for t in "${TARGETS[@]}"; do args+=(-t "$t"); done
 cargo ndk "${args[@]}" -o android/app/src/main/jniLibs build --profile "$PROFILE" -p ig-mobile
 
-# Any one of the built libraries works as the metadata source for bindgen.
-lib="$(find target -path "*linux-android/$PROFILE/libig_mobile.so" | head -1)"
-if [ "$PROFILE" = "dev" ]; then lib="$(find target -path "*linux-android/debug/libig_mobile.so" | head -1)"; fi
+# Bindgen reads UniFFI metadata from a library. The Android release build is
+# stripped, so use a host debug build of the same crate as the source.
+cargo build -q -p ig-mobile
 cargo run -q -p ig-mobile --features bindgen --bin uniffi-bindgen -- \
-  generate --library "$lib" --language kotlin --no-format \
+  generate --library target/debug/libig_mobile.so --language kotlin --no-format \
   --out-dir android/app/src/main/generated
 echo "ok: native libs in android/app/src/main/jniLibs, bindings in android/app/src/main/generated"

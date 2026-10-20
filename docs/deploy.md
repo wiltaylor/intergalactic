@@ -95,8 +95,14 @@ hosts file).
 3. To run in the foreground instead: `ig-node.exe run`.
 
 Peer names are made resolvable with Name Resolution Policy Table rules, so only
-`*.ig.internal` queries go to the overlay. `ig-node.exe service uninstall` or stopping the
-daemon removes the rules.
+`*.ig.internal` queries go to the overlay. The daemon also adds one inbound Windows Firewall
+rule per overlay interface (group "Intergalactic"), because Windows treats a new adapter as a
+public network and would otherwise drop every unsolicited packet, ping included. Network
+policies remain the access control. `service uninstall`, `ig leave` and a clean stop remove
+the rules they added.
+
+`ig-node.exe service stop` waits until the service has stopped, so `stop` followed by
+`start` is safe.
 
 ## Containers and ephemeral environments
 

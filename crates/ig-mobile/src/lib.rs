@@ -18,21 +18,21 @@ uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileError {
-    #[error("{message}")]
-    Failed { message: String },
+    #[error("{reason}")]
+    Failed { reason: String },
 }
 
 impl From<anyhow::Error> for MobileError {
     fn from(e: anyhow::Error) -> Self {
         MobileError::Failed {
-            message: e.to_string(),
+            reason: e.to_string(),
         }
     }
 }
 
 fn err<E: std::fmt::Display>(e: E) -> MobileError {
     MobileError::Failed {
-        message: e.to_string(),
+        reason: e.to_string(),
     }
 }
 

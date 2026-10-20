@@ -619,6 +619,7 @@ impl Inner {
         }
 
         let me = self.keypair.public;
+        let mut renegotiate: Vec<Arc<Mutex<Peer>>> = Vec::new();
         let mut t = self.peers.write();
         let mut present: HashSet<NodeId> = HashSet::new();
         for pi in peers {
@@ -679,7 +680,25 @@ impl Inner {
                 }
             };
             if primary {
+                // A peer that restarted shows up with new endpoints. Our confirmed
+                // direct endpoint and WireGuard session are then stale: drop the
+                // path and start a fresh handshake towards the new candidates so
+                // traffic resumes in milliseconds rather than after the WireGuard
+                // retry timers (15 s or more).
+                let stale_direct = p.direct.is_some_and(|d| !pi.endpoints.contains(&d));
+                let changed = {
+                    let mut old = p.candidates.clone();
+                    let mut new = pi.endpoints.clone();
+                    old.sort();
+                    new.sort();
+                    old != new
+                };
                 p.set_candidates(&pi.endpoints);
+                if changed && stale_direct {
+                    tracing::info!(peer = %p.hostname, "peer endpoints changed; renegotiating");
+                    p.direct = None;
+                    renegotiate.push(arc.clone());
+                }
             } else {
                 p.merge_candidates(&pi.endpoints);
             }
@@ -702,6 +721,17 @@ impl Inner {
         }
         t.rebuild_routes();
         drop(t);
+        let mut out = vec![0u8; OUT_BUF];
+        for arc in renegotiate {
+            let mut p = arc.lock();
+            if let TunnResult::WriteToNetwork(b) =
+                p.tunn.format_handshake_initiation(&mut out, true)
+            {
+                let b = b.to_vec();
+                p.last_punch = None;
+                self.transmit(&mut p, &b);
+            }
+        }
         self.rebuild_dns();
         self.emit(EngineEvent::PeersChanged);
     }
