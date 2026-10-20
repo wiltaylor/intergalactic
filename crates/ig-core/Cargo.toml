@@ -1,0 +1,20 @@
+[package]
+name = "ig-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Intergalactic node engine: WireGuard data plane, NAT traversal and lighthouse control client"
+
+[dependencies]
+ig-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+postcard.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+async-trait.workspace = true
+boringtun.workspace = true
+if-addrs.workspace = true

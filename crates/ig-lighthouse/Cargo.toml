@@ -1,0 +1,25 @@
+[package]
+name = "ig-lighthouse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Intergalactic lighthouse: coordination, NAT traversal assistance and relay for overlay networks"
+
+[[bin]]
+name = "ig-lighthouse"
+path = "src/main.rs"
+
+[dependencies]
+ig-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+clap.workspace = true
+humantime.workspace = true
+interprocess.workspace = true

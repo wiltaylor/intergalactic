@@ -1,0 +1,306 @@
+use anyhow::Context;
+use clap::{Parser, Subcommand};
+use ig_lighthouse::admin_socket;
+use ig_lighthouse::{Lighthouse, LighthouseConfig};
+use ig_proto::admin::{AdminRequest, AdminResponse};
+use ig_proto::{Keypair, NodeId, Policy, PrivateKey, Rule, DEFAULT_LIGHTHOUSE_PORT};
+use ipnet::Ipv4Net;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "ig-lighthouse", version, about = "Intergalactic lighthouse: coordination, NAT traversal and relay")]
+struct Cli {
+    /// Directory holding the key, state and admin socket.
+    #[arg(long, env = "IG_LIGHTHOUSE_STATE", default_value = default_state_dir())]
+    state_dir: PathBuf,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+fn default_state_dir() -> &'static str {
+    if cfg!(windows) {
+        r"C:\ProgramData\Intergalactic\lighthouse"
+    } else {
+        "/var/lib/intergalactic/lighthouse"
+    }
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the lighthouse daemon.
+    Serve {
+        /// TCP and UDP listen address.
+        #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DEFAULT_LIGHTHOUSE_PORT)))]
+        listen: SocketAddr,
+        /// Public host name or IP written into invites.
+        #[arg(long)]
+        public_host: String,
+        /// Public port written into invites (defaults to the listen port).
+        #[arg(long)]
+        public_port: Option<u16>,
+    },
+    /// Show lighthouse identity and counters.
+    Info,
+    /// Manage overlay networks.
+    Network {
+        #[command(subcommand)]
+        cmd: NetworkCmd,
+    },
+    /// Manage invites.
+    Invite {
+        #[command(subcommand)]
+        cmd: InviteCmd,
+    },
+    /// Manage member nodes.
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Create a network, e.g. `network create dev 10.90.0.0/24`.
+    Create { name: String, cidr: Ipv4Net },
+    List,
+    Delete { network: String },
+    /// Set the inbound policy. Without --allow the network allows everything.
+    Policy {
+        network: String,
+        /// Allow rule, repeatable: `tcp:22,80`, `udp:27015-27030`, `icmp`.
+        #[arg(long = "allow")]
+        allow: Vec<Rule>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InviteCmd {
+    /// Create an invite for a network and print it.
+    Create {
+        network: String,
+        /// How many nodes may use this invite.
+        #[arg(long, default_value_t = 1)]
+        uses: u32,
+        /// Lifetime, e.g. `24h`, `7d`, `30m`.
+        #[arg(long, default_value = "24h")]
+        ttl: humantime::Duration,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    List { network: String },
+    Revoke { network: String, invite_id: String },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// List members, optionally of one network.
+    List { network: Option<String> },
+    /// Remove a node from a network.
+    Remove { network: String, node: NodeId },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+    let cli = Cli::parse();
+    let admin_sock = cli.state_dir.join("admin.sock");
+
+    match cli.cmd {
+        Cmd::Serve { listen, public_host, public_port } => {
+            std::fs::create_dir_all(&cli.state_dir)
+                .with_context(|| format!("creating {}", cli.state_dir.display()))?;
+            let keypair = load_or_create_key(&cli.state_dir.join("lighthouse.key"))?;
+            let config = LighthouseConfig {
+                keypair,
+                listen,
+                public_host,
+                public_port: public_port.unwrap_or(listen.port()),
+                state_path: Some(cli.state_dir.join("lighthouse.json")),
+            };
+            let lh = Lighthouse::start(config).await?;
+            println!("lighthouse public key: {}", lh.public_key());
+            let admin = tokio::spawn(admin_socket::serve(lh.clone(), admin_sock.clone()));
+            tokio::signal::ctrl_c().await?;
+            tracing::info!("shutting down");
+            admin.abort();
+            lh.shutdown().await;
+            Ok(())
+        }
+        Cmd::Info => {
+            let r = admin_socket::request(&admin_sock, &AdminRequest::Info).await?;
+            if let AdminResponse::Info(i) = r {
+                println!("public key   {}", i.public_key);
+                println!("invite host  {}:{}", i.public_host, i.port);
+                println!("networks     {}", i.networks);
+                println!("nodes online {}", i.nodes_online);
+                println!("uptime       {}", humantime::format_duration(std::time::Duration::from_secs(i.uptime_secs)));
+                Ok(())
+            } else {
+                fail(r)
+            }
+        }
+        Cmd::Network { cmd } => match cmd {
+            NetworkCmd::Create { name, cidr } => {
+                let r = admin_socket::request(&admin_sock, &AdminRequest::NetworkCreate { name, cidr }).await?;
+                print_networks(r)
+            }
+            NetworkCmd::List => {
+                let r = admin_socket::request(&admin_sock, &AdminRequest::NetworkList).await?;
+                print_networks(r)
+            }
+            NetworkCmd::Delete { network } => {
+                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NetworkDelete { network }).await?)
+            }
+            NetworkCmd::Policy { network, allow } => {
+                let policy = Policy { rules: allow };
+                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NetworkSetPolicy { network, policy }).await?)
+            }
+        },
+        Cmd::Invite { cmd } => match cmd {
+            InviteCmd::Create { network, uses, ttl, label } => {
+                let r = admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::InviteCreate { network, uses, ttl_secs: ttl.as_secs(), label },
+                )
+                .await?;
+                match r {
+                    AdminResponse::Invite { invite, invite_id } => {
+                        eprintln!("invite {invite_id} created. On the joining machine run:\n");
+                        println!("ig join {invite}");
+                        Ok(())
+                    }
+                    other => fail(other),
+                }
+            }
+            InviteCmd::List { network } => {
+                let r = admin_socket::request(&admin_sock, &AdminRequest::InviteList { network }).await?;
+                match r {
+                    AdminResponse::Invites(list) => {
+                        println!("{:<10} {:<8} {:<20} LABEL", "ID", "USES", "EXPIRES");
+                        let now = ig_lighthouse::store::now_secs();
+                        for i in list {
+                            let left = i.expires_at.saturating_sub(now);
+                            println!(
+                                "{:<10} {:<8} {:<20} {}",
+                                i.id,
+                                i.uses_left,
+                                format!("in {}", humantime::format_duration(std::time::Duration::from_secs(left))),
+                                i.label
+                            );
+                        }
+                        Ok(())
+                    }
+                    other => fail(other),
+                }
+            }
+            InviteCmd::Revoke { network, invite_id } => {
+                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::InviteRevoke { network, invite_id }).await?)
+            }
+        },
+        Cmd::Node { cmd } => match cmd {
+            NodeCmd::List { network } => {
+                let r = admin_socket::request(&admin_sock, &AdminRequest::NodeList { network }).await?;
+                match r {
+                    AdminResponse::Nodes(nodes) => {
+                        println!("{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} ENDPOINTS", "NODE", "HOSTNAME", "OS", "ADDRESS", "NETWORK", "STATE");
+                        for n in nodes {
+                            let state = if n.online {
+                                "online".to_string()
+                            } else {
+                                match n.last_seen_secs_ago {
+                                    Some(s) => format!("{}ago", humantime::format_duration(std::time::Duration::from_secs(s.min(86400 * 365)))),
+                                    None => "never".into(),
+                                }
+                            };
+                            let eps: Vec<String> = n.endpoints.iter().map(|e| e.to_string()).collect();
+                            println!(
+                                "{:<12} {:<20} {:<9} {:<16} {:<8} {:<8} {}",
+                                n.node.short(),
+                                truncate(&n.hostname, 20),
+                                truncate(&n.os, 9),
+                                n.address,
+                                truncate(&n.network_name, 8),
+                                state,
+                                eps.join(",")
+                            );
+                        }
+                        Ok(())
+                    }
+                    other => fail(other),
+                }
+            }
+            NodeCmd::Remove { network, node } => {
+                expect_ok(admin_socket::request(&admin_sock, &AdminRequest::NodeRemove { network, node }).await?)
+            }
+        },
+    }
+}
+
+fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<Keypair> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let key: PrivateKey = serde_json::from_slice(&bytes).context("parsing lighthouse.key")?;
+            Ok(Keypair::from_private(key))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let kp = Keypair::generate();
+            std::fs::write(path, serde_json::to_vec(&kp.private)?)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            tracing::info!(path = %path.display(), "generated new lighthouse key");
+            Ok(kp)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn print_networks(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Networks(list) => {
+            println!("{:<16} {:<16} {:<18} {:<8} {:<7} POLICY", "ID", "NAME", "CIDR", "MEMBERS", "ONLINE");
+            for n in list {
+                let policy = if n.policy.is_allow_all() {
+                    "allow all".to_string()
+                } else {
+                    n.policy.rules.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ")
+                };
+                println!("{:<16} {:<16} {:<18} {:<8} {:<7} {}", n.id, truncate(&n.name, 16), n.cidr, n.members, n.online, policy);
+            }
+            Ok(())
+        }
+        other => fail(other),
+    }
+}
+
+fn expect_ok(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Ok => {
+            println!("ok");
+            Ok(())
+        }
+        other => fail(other),
+    }
+}
+
+fn fail(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n - 1).collect();
+        t.push('…');
+        t
+    }
+}
