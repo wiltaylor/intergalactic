@@ -4,14 +4,21 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Replace lighthouse.example.com with the public DNS name or IP of this VPS.
-ExecStart=/usr/local/bin/ig-lighthouse serve --listen [::]:7777 --public-host lighthouse.example.com --dns-domain ig.internal
+# Replace lighthouse.example.com with the public DNS name or IP of this VPS, and
+# --name with the name members will see (lh.<network>.<domain>).
+# A replica adds: --replica-of primary.example.com:7777 --primary-key <key>
+# A coordination-only lighthouse without a TUN device adds: --no-overlay
+ExecStart=/usr/local/bin/ig-lighthouse serve --listen [::]:7777 --public-host lighthouse.example.com --name lh --dns-domain ig.internal
 Restart=on-failure
 RestartSec=2
-DynamicUser=yes
+# The lighthouse owns a TUN device per network and installs nftables rules for
+# public forwards, so it runs as root with the network capabilities only.
 StateDirectory=intergalactic/lighthouse
 Environment=IG_LIGHTHOUSE_STATE=/var/lib/intergalactic/lighthouse
 Environment=RUST_LOG=info
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

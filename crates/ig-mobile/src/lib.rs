@@ -200,6 +200,11 @@ impl MobileEngine {
         Ok(to_mobile_network(
             &ig_core::Membership {
                 lighthouse: lh,
+                extra_lighthouses: inv
+                    .extra_lighthouses
+                    .iter()
+                    .map(ig_core::LighthouseAddr::from_ref)
+                    .collect(),
                 network: info,
             },
             true,

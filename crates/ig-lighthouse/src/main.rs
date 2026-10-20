@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ig_lighthouse::admin_socket;
+use ig_lighthouse::server::{Overlay, Role};
 use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
 use ig_proto::{
@@ -62,6 +63,18 @@ enum Cmd {
         /// Open this range in the firewall. `none` disables ephemeral forwards.
         #[arg(long, default_value = "20000-20999")]
         forward_range: String,
+        /// This lighthouse's name (its hostname and DNS label in every network).
+        #[arg(long, default_value = "lighthouse")]
+        name: String,
+        /// Run as a replica of the primary at HOST:PORT. Requires --primary-key.
+        #[arg(long)]
+        replica_of: Option<String>,
+        /// The primary's public key (printed by `ig-lighthouse info` there).
+        #[arg(long)]
+        primary_key: Option<NodeId>,
+        /// Do not join the overlay (no TUN device). Public forwards are then unavailable.
+        #[arg(long)]
+        no_overlay: bool,
     },
     /// Show lighthouse identity and counters.
     Info,
@@ -90,6 +103,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ForwardCmd,
     },
+    /// Manage replica lighthouses.
+    Lighthouse {
+        #[command(subcommand)]
+        cmd: LighthouseCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum LighthouseCmd {
+    /// Register a replica: `lighthouse add lh-eu lh-eu.example.com 7777 <its public key>`.
+    /// Then start it with `serve --replica-of <this host>:7777 --primary-key <this key>`.
+    Add {
+        name: String,
+        host: String,
+        port: u16,
+        key: NodeId,
+    },
+    List,
+    Remove {
+        key: NodeId,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,12 +134,15 @@ enum ForwardCmd {
         network: String,
         node: NodeId,
         public_port: u16,
-        /// `host:port` as seen from the node, e.g. `127.0.0.1:8080` or `192.168.1.50:80`.
+        /// Overlay target: `self:PORT` (the node's own address), `<device>:PORT` or `<overlay ip>:PORT`.
         target: String,
         #[arg(long)]
         udp: bool,
         #[arg(long, default_value = "")]
         label: String,
+        /// Lighthouse that publishes the port, by name or key. Default: the primary.
+        #[arg(long)]
+        lighthouse: Option<String>,
     },
     /// List permanent and ephemeral forwards.
     List,
@@ -231,6 +268,10 @@ async fn main() -> anyhow::Result<()> {
             relay_limit_per_node_kbps,
             relay_limit_total_kbps,
             forward_range,
+            name,
+            replica_of,
+            primary_key,
+            no_overlay,
         } => {
             std::fs::create_dir_all(&cli.state_dir)
                 .with_context(|| format!("creating {}", cli.state_dir.display()))?;
@@ -247,6 +288,27 @@ async fn main() -> anyhow::Result<()> {
                     total_kbps: relay_limit_total_kbps,
                 },
                 forward_range: parse_range(&forward_range)?,
+                name: name.clone(),
+                role: match (replica_of, primary_key) {
+                    (Some(hp), Some(key)) => {
+                        let (h, p) = hp
+                            .rsplit_once(':')
+                            .ok_or_else(|| anyhow::anyhow!("--replica-of must be HOST:PORT"))?;
+                        Role::Replica(ig_proto::control::LighthouseRef {
+                            host: h.to_string(),
+                            port: p.parse()?,
+                            key,
+                            name: String::new(),
+                        })
+                    }
+                    (None, None) => Role::Primary,
+                    _ => anyhow::bail!("--replica-of and --primary-key go together"),
+                },
+                overlay: if no_overlay {
+                    Overlay::Off
+                } else {
+                    Overlay::Kernel
+                },
             };
             let lh = Lighthouse::start(config).await?;
             println!("lighthouse public key: {}", lh.public_key());
@@ -262,6 +324,10 @@ async fn main() -> anyhow::Result<()> {
             if let AdminResponse::Info(i) = r {
                 println!("public key   {}", i.public_key);
                 println!("invite host  {}:{}", i.public_host, i.port);
+                println!("role         {}", i.role);
+                for (net, addr) in &i.overlay {
+                    println!("overlay      {net} = {addr}");
+                }
                 println!("dns domain   {}", i.dns_domain);
                 println!("networks     {}", i.networks);
                 println!("nodes online {}", i.nodes_online);
@@ -398,7 +464,30 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 udp,
                 label,
+                lighthouse,
             } => {
+                let lighthouse = match lighthouse {
+                    None => None,
+                    Some(want) => {
+                        if let Ok(k) = want.parse::<NodeId>() {
+                            Some(k)
+                        } else {
+                            match admin_socket::request(&admin_sock, &AdminRequest::LighthouseList)
+                                .await?
+                            {
+                                AdminResponse::Lighthouses(list) => Some(
+                                    list.iter()
+                                        .find(|l| l.name == want || l.host == want)
+                                        .map(|l| l.key)
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("no lighthouse named `{want}`")
+                                        })?,
+                                ),
+                                other => return fail(other),
+                            }
+                        }
+                    }
+                };
                 let proto = if udp {
                     ig_proto::tunnel::ForwardProto::Udp
                 } else {
@@ -413,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
                         public_port,
                         target,
                         label,
+                        lighthouse,
                     },
                 )
                 .await?;
@@ -423,6 +513,31 @@ async fn main() -> anyhow::Result<()> {
             ),
             ForwardCmd::Remove { id } => expect_ok(
                 admin_socket::request(&admin_sock, &AdminRequest::ForwardRemove { id }).await?,
+            ),
+        },
+        Cmd::Lighthouse { cmd } => match cmd {
+            LighthouseCmd::Add {
+                name,
+                host,
+                port,
+                key,
+            } => print_lighthouses(
+                admin_socket::request(
+                    &admin_sock,
+                    &AdminRequest::LighthouseAdd {
+                        name,
+                        host,
+                        port,
+                        key,
+                    },
+                )
+                .await?,
+            ),
+            LighthouseCmd::List => print_lighthouses(
+                admin_socket::request(&admin_sock, &AdminRequest::LighthouseList).await?,
+            ),
+            LighthouseCmd::Remove { key } => expect_ok(
+                admin_socket::request(&admin_sock, &AdminRequest::LighthouseRemove { key }).await?,
             ),
         },
         Cmd::Device { cmd } => match cmd {
@@ -592,12 +707,35 @@ fn parse_range(s: &str) -> anyhow::Result<(u16, u16)> {
     Ok((lo, hi))
 }
 
+fn print_lighthouses(r: AdminResponse) -> anyhow::Result<()> {
+    match r {
+        AdminResponse::Lighthouses(list) => {
+            println!(
+                "{:<14} {:<30} {:<8} {:<10} KEY",
+                "NAME", "HOST:PORT", "ROLE", "LINK"
+            );
+            for l in list {
+                println!(
+                    "{:<14} {:<30} {:<8} {:<10} {}",
+                    truncate(&l.name, 14),
+                    format!("{}:{}", l.host, l.port),
+                    if l.primary { "primary" } else { "replica" },
+                    if l.connected { "up" } else { "down" },
+                    l.key
+                );
+            }
+            Ok(())
+        }
+        other => fail(other),
+    }
+}
+
 fn print_forwards(r: AdminResponse) -> anyhow::Result<()> {
     match r {
         AdminResponse::Forwards(list) => {
             println!(
-                "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<8} LABEL",
-                "ID", "KIND", "PUBLIC", "PROTO", "NETWORK", "NODE", "TARGET", "STREAMS"
+                "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<12} LABEL",
+                "ID", "KIND", "PUBLIC", "PROTO", "NETWORK", "NODE", "TARGET", "LIGHTHOUSE"
             );
             for f in list {
                 let kind = match f.info.kind {
@@ -610,7 +748,7 @@ fn print_forwards(r: AdminResponse) -> anyhow::Result<()> {
                     if f.node_online { "" } else { " (off)" }
                 );
                 println!(
-                    "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<8} {}",
+                    "{:<10} {:<10} {:<24} {:<6} {:<12} {:<18} {:<22} {:<12} {}",
                     f.info.id,
                     kind,
                     format!("{}:{}", f.info.public_host, f.info.public_port),
@@ -618,7 +756,7 @@ fn print_forwards(r: AdminResponse) -> anyhow::Result<()> {
                     truncate(&f.network_name, 12),
                     node,
                     truncate(&f.info.target, 22),
-                    f.active_streams,
+                    truncate(&f.lighthouse_name, 12),
                     f.info.label
                 );
             }

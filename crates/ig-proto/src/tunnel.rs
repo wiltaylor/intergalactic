@@ -1,20 +1,13 @@
-//! Port forwarding through the lighthouse.
-//!
-//! The lighthouse has the public address. A **forward** binds one public port on
-//! it to a target a node can reach (`127.0.0.1:8080` on the node itself, or any
-//! `host:port` behind it). Permanent forwards are created by the admin and
-//! persisted; ephemeral forwards are requested by a node and live as long as its
-//! session.
-//!
-//! Bytes travel over the node's **tunnel channel**: a second Noise/TCP
-//! connection to the lighthouse whose hello sets `tunnel = true`. The lighthouse
-//! opens one stream per public TCP connection (or per remote UDP peer) and both
-//! sides exchange [`TunnelMsg`] frames.
+//! Public port forwards. The lighthouse has the public address and is itself a
+//! member of every network it serves, so a forward is a kernel NAT rule on the
+//! lighthouse: public port -> an overlay address and port, carried to the node
+//! over WireGuard like any other overlay traffic. Permanent forwards are created
+//! by the admin and persisted; ephemeral forwards are requested by a node and
+//! live as long as its session with that lighthouse.
 
 use crate::{NetworkId, NodeId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ForwardProto {
@@ -46,51 +39,25 @@ impl std::str::FromStr for ForwardProto {
 pub enum ForwardKind {
     /// Created by the admin, persisted, independent of sessions.
     Permanent,
-    /// Requested by the node, gone when its session ends.
+    /// Requested by the node, gone when its session with the lighthouse ends.
     Ephemeral,
 }
 
-/// Everything a node (and `ig exposes`) needs to know about a forward that
-/// points at it.
+/// A forward as nodes and admins see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardInfo {
     pub id: String,
     pub network: NetworkId,
+    /// Member the traffic is for.
     pub node: NodeId,
+    /// Lighthouse that publishes the port.
+    pub lighthouse: NodeId,
     pub proto: ForwardProto,
     pub kind: ForwardKind,
-    /// Where the internet connects: the lighthouse's public host and this port.
     pub public_host: String,
     pub public_port: u16,
-    /// Where the node connects for each stream, e.g. `127.0.0.1:8080`.
+    /// Overlay target: `self:PORT` for the node's own address, `<device>:PORT`
+    /// for a registered gateway device, or `<overlay ip>:PORT`.
     pub target: String,
     pub label: String,
 }
-
-/// Frames on the tunnel channel, in both directions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum TunnelMsg {
-    /// Lighthouse -> node: a public client connected (TCP) or sent its first
-    /// datagram (UDP). The node connects to `target` and answers with data or
-    /// with `Close`.
-    Open {
-        stream: u32,
-        forward: String,
-        proto: ForwardProto,
-        target: String,
-        remote: SocketAddr,
-    },
-    Data {
-        stream: u32,
-        data: Vec<u8>,
-    },
-    Close {
-        stream: u32,
-        reason: String,
-    },
-    /// Keepalive in either direction.
-    Ping,
-}
-
-/// Largest payload in one `Data` frame.
-pub const CHUNK: usize = 16 * 1024;

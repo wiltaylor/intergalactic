@@ -4,7 +4,9 @@
 
 1. Build or download `ig-lighthouse`, copy it to `/usr/local/bin/`.
 2. Open TCP **and** UDP 7777 (or the port you choose).
-3. Install `deploy/ig-lighthouse.service`, set `--public-host` to the public DNS name or IP:
+3. Install `nftables` (the `nft` binary) if public forwards are wanted.
+4. Install `deploy/ig-lighthouse.service`, set `--public-host` to the public DNS name or IP
+   and `--name` to the name members will see (`lh.dev.ig.internal`):
 
 ```sh
 sudo cp deploy/ig-lighthouse.service /etc/systemd/system/
@@ -24,6 +26,41 @@ sudo ig-lighthouse node remove dev <node-id>
 
 Pick non-overlapping CIDRs for networks a single device may join. Each network needs a prefix
 of /30 or larger.
+
+The lighthouse joins every network it creates. It takes the second address (`10.90.0.2`), owns
+a TUN device `ig-<network>` and answers to `<name>.<network>.<domain>` like any member. The
+unit runs as root with `CAP_NET_ADMIN`, because the TUN device and the forward NAT rules need
+it. Pass `--no-overlay` for a coordination-only lighthouse without a TUN device; public
+forwards are then unavailable on that lighthouse.
+
+### Second lighthouse (replica)
+
+A replica holds a copy of the primary's store, serves existing members while the primary is
+down, and publishes its own forwards. Nodes connect to every lighthouse of a network, so a
+member keeps its sessions when one lighthouse goes away.
+
+```sh
+# On the primary: print its public key.
+sudo ig-lighthouse info
+
+# On the replica VPS (own key, own state directory):
+sudo ig-lighthouse serve --public-host lh2.example.com --name lh2 \
+    --replica-of lighthouse.example.com:7777 --primary-key <primary-key>
+sudo ig-lighthouse info                   # prints the replica's key
+
+# Back on the primary: register the replica so members and invites learn it.
+sudo ig-lighthouse lighthouse add lh2 lh2.example.com 7777 <replica-key>
+sudo ig-lighthouse lighthouse list
+```
+
+Online nodes learn the replica on the next push and connect to it. New invites name both
+lighthouses; a node that holds an old invite learns the replica after its first join.
+
+Only the primary writes the store. A replica proxies joins and leaves to the primary and
+refuses admin changes; while the primary is unreachable, members keep working through the
+replica but new joins wait with the message `the primary lighthouse is unreachable`. Settings
+given on the command line (`--dns-domain`, `--relay-limit-*`, `--forward-range`) belong to
+each lighthouse and are not replicated, so give replicas the same values.
 
 ### Policies
 
@@ -60,21 +97,24 @@ Limits apply only to traffic relayed through the lighthouse. Direct paths are ne
 
 ## Public port forwards
 
-The lighthouse has the public address, so it can publish ports for members: the developer
-who needs a webhook to reach a dev server, or a home server that must be reachable from the
-internet.
+A lighthouse has a public address, so it can publish ports for members: the developer who
+needs a webhook to reach a dev server, or a home server that must be reachable from the
+internet. The public connection is translated into the overlay on the lighthouse, so the
+bytes cross the internet only inside WireGuard.
 
 ```sh
 # Ephemeral, from the node, gone when the node disconnects:
-ig expose 8080                        # tcp://lighthouse.example.com:20017 -> 127.0.0.1:8080
+ig expose 8080                        # tcp://lighthouse.example.com:20017 -> this node:8080
 ig expose 27015 --udp --public-port 20500
-ig expose 192.168.1.50:80 --label nas  # anything this node can reach, gateway devices included
+ig expose nas:80 --label nas          # a gateway device of this network
+ig expose 8080 --lighthouse lh2       # publish on a specific lighthouse
 ig exposes
 ig unexpose <id>
 
 # Permanent, by the admin, persisted on the lighthouse:
-sudo ig-lighthouse forward add dev <node-id> 20022 127.0.0.1:22 --label ssh
-sudo ig-lighthouse forward add dev <node-id> 443 127.0.0.1:8443
+sudo ig-lighthouse forward add dev <node-id> 20022 self:22 --label ssh
+sudo ig-lighthouse forward add dev <node-id> 443 self:8443 --lighthouse lh2
+sudo ig-lighthouse forward add dev <node-id> 8080 nas:80
 sudo ig-lighthouse forward list
 sudo ig-lighthouse forward remove <id>
 
@@ -82,14 +122,19 @@ sudo ig-lighthouse forward remove <id>
 sudo ig-lighthouse network expose game --deny
 ```
 
-Ephemeral ports come from `serve --forward-range 20000-20999` (default); open that range
-in the VPS firewall, plus any permanent ports. `--forward-range none` disables ephemeral
+A target is `self:PORT` (the node's own overlay address), `<device>:PORT` (a gateway device
+of the network) or `<overlay-ip>:PORT`. The service must listen on the overlay address, not
+only on `127.0.0.1`.
+
+Ephemeral ports come from `serve --forward-range 20000-20999` (default); open that range in
+the VPS firewall, plus any permanent ports. `--forward-range none` disables ephemeral
 forwards for the whole lighthouse. Each node may hold eight ephemeral forwards at a time.
 
-Bytes travel over a second encrypted connection from the node to the lighthouse, the tunnel
-channel, so a forward works for any member, including nodes behind NATs that never get a
-direct path. The service on the node sees connections coming from `127.0.0.1`; the
-lighthouse logs the real client address.
+The lighthouse installs the forwards as nftables rules in the tables `ig_forwards` (`ip` and
+`ip6`): a destination NAT from the public port to the overlay target and a masquerade on its
+`ig-*` interfaces. The node sees connections coming from the lighthouse's overlay address.
+A forward works for any member, including nodes behind NATs that never get a direct path,
+because the lighthouse reaches them over the relay.
 
 ## Gateway devices
 
@@ -105,7 +150,7 @@ sudo ig-lighthouse device add dev nas 192.168.1.60 --ipv6 fd00:1::60 --via <node
 sudo ig-lighthouse device list dev
 ```
 
-The device gets an overlay address from the network and a name (`printer.dev.ig.internal`).
+A physical address can be registered once per network. The device gets an overlay address from the network and a name (`printer.dev.ig.internal`).
 With `--ipv6` it also gets an overlay IPv6 address (same host number, in the network's IPv6
 prefix) and an AAAA record; the network must have been created with `--ipv6`.
 Without `--via`, any online `--gateway` member whose LAN contains the device's address can
@@ -189,3 +234,9 @@ a dedicated short-lived network and delete the whole network afterwards.
   invite's host resolves. `RUST_LOG=debug ig-node run` shows the reason.
 - No interface created: on Linux check `CAP_NET_ADMIN`; on Windows check `wintun.dll` and
   Administrator rights.
+- `ig expose` fails with `the primary lighthouse is unreachable`: the forward was requested
+  through a replica while the primary is down. Ephemeral forwards are not persisted and wait
+  for the primary.
+- A forward does not answer: check that `nft list table ip ig_forwards` on the lighthouse
+  lists the port, that the service on the node listens on the overlay address, and that the
+  network policy allows the port from the lighthouse's overlay address.

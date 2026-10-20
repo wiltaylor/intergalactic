@@ -58,14 +58,29 @@ pub enum AdminRequest {
         network: String,
         name: String,
     },
-    /// Permanent forward: public port on the lighthouse -> `target` reached from `node`.
+    /// Permanent forward: public port on a lighthouse -> overlay target of `node`.
     ForwardAdd {
         network: String,
         node: NodeId,
         proto: crate::tunnel::ForwardProto,
         public_port: u16,
+        /// `self:PORT`, `<device>:PORT` or `<overlay ip>:PORT`.
         target: String,
         label: String,
+        /// Which lighthouse publishes the port; default the primary.
+        lighthouse: Option<NodeId>,
+    },
+    /// Register a replica lighthouse. It becomes a member of every network and
+    /// may connect to replicate the store.
+    LighthouseAdd {
+        name: String,
+        host: String,
+        port: u16,
+        key: NodeId,
+    },
+    LighthouseList,
+    LighthouseRemove {
+        key: NodeId,
     },
     ForwardList,
     ForwardRemove {
@@ -93,6 +108,18 @@ pub enum AdminResponse {
     Nodes(Vec<NodeSummary>),
     Devices(Vec<DeviceSummary>),
     Forwards(Vec<ForwardSummary>),
+    Lighthouses(Vec<LighthouseSummary>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LighthouseSummary {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub key: NodeId,
+    pub primary: bool,
+    /// For replicas as seen from the primary: is the replication link up.
+    pub connected: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,8 +128,7 @@ pub struct ForwardSummary {
     pub network_name: String,
     pub node_hostname: String,
     pub node_online: bool,
-    /// Streams currently open through this forward.
-    pub active_streams: usize,
+    pub lighthouse_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,6 +158,10 @@ pub struct LighthouseInfo {
     pub nodes_online: usize,
     pub uptime_secs: u64,
     pub dns_domain: String,
+    /// `primary` or `replica of <host:port>`.
+    pub role: String,
+    /// This lighthouse's overlay addresses, one per network, if it runs the overlay.
+    pub overlay: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

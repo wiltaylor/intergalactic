@@ -31,6 +31,20 @@ pub struct Store {
     /// Permanent public port forwards, by id.
     #[serde(default)]
     pub forwards: BTreeMap<String, ForwardRecord>,
+    /// Every lighthouse serving these networks, the primary included. Each is a
+    /// member of every network.
+    #[serde(default)]
+    pub lighthouses: BTreeMap<NodeId, LighthouseRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LighthouseRecord {
+    pub key: NodeId,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +57,9 @@ pub struct ForwardRecord {
     pub target: String,
     #[serde(default)]
     pub label: String,
+    /// Lighthouse that publishes the port; `None` means the primary.
+    #[serde(default)]
+    pub lighthouse: Option<NodeId>,
     pub created_at: u64,
 }
 
@@ -137,8 +154,14 @@ pub enum StoreError {
     NotMember,
     #[error("a device named `{0}` already exists in this network")]
     DuplicateDevice(String),
+    #[error("lighthouse not found: {0}")]
+    NoSuchLighthouse(String),
+    #[error("a lighthouse with that key is already registered")]
+    DuplicateLighthouse,
     #[error("device not found: {0}")]
     NoSuchDevice(String),
+    #[error("device `{0}` already has that physical address in this network")]
+    DuplicateTarget(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("state file is corrupt: {0}")]
@@ -274,7 +297,113 @@ impl Store {
             created_at: now_secs(),
         };
         self.networks.insert(id, net);
+        let lhs: Vec<(NodeId, String)> = self
+            .lighthouses
+            .values()
+            .map(|l| (l.key, l.name.clone()))
+            .collect();
+        for (key, name) in lhs {
+            let _ = self.add_member_direct(id, key, &name);
+        }
         Ok(&self.networks[&id])
+    }
+
+    /// Add a member without an invite (lighthouses). Idempotent.
+    pub fn add_member_direct(
+        &mut self,
+        network: NetworkId,
+        node: NodeId,
+        hostname: &str,
+    ) -> Result<Ipv4Addr, StoreError> {
+        {
+            let rec = self.nodes.entry(node).or_default();
+            if rec.hostname.is_empty() {
+                rec.hostname = hostname.to_string();
+                rec.os = "lighthouse".into();
+            }
+        }
+        let net = self
+            .networks
+            .get_mut(&network)
+            .ok_or_else(|| StoreError::NoSuchNetwork(network.to_string()))?;
+        if let Some(m) = net.members.get(&node) {
+            return Ok(m.address);
+        }
+        let address = net.allocate().ok_or(StoreError::Full)?;
+        let address6 = net.address6_for(address);
+        let dns_name = net.unique_label(hostname);
+        net.members.insert(
+            node,
+            Member {
+                address,
+                address6,
+                dns_name,
+                joined_at: now_secs(),
+            },
+        );
+        Ok(address)
+    }
+
+    /// Register a lighthouse and make it a member of every network.
+    pub fn add_lighthouse(&mut self, rec: LighthouseRecord) -> Result<(), StoreError> {
+        if self.lighthouses.contains_key(&rec.key) {
+            return Err(StoreError::DuplicateLighthouse);
+        }
+        self.lighthouses.insert(rec.key, rec.clone());
+        self.touch_node(rec.key, &rec.name, "lighthouse");
+        let ids: Vec<NetworkId> = self.networks.keys().copied().collect();
+        for id in ids {
+            let _ = self.add_member_direct(id, rec.key, &rec.name);
+        }
+        Ok(())
+    }
+
+    /// Make sure the lighthouse itself is registered and a member everywhere.
+    pub fn ensure_lighthouse(&mut self, rec: LighthouseRecord) -> bool {
+        let mut changed = false;
+        match self.lighthouses.get_mut(&rec.key) {
+            Some(existing) => {
+                if existing.host != rec.host
+                    || existing.port != rec.port
+                    || existing.name != rec.name
+                    || existing.primary != rec.primary
+                {
+                    *existing = rec.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                self.lighthouses.insert(rec.key, rec.clone());
+                self.touch_node(rec.key, &rec.name, "lighthouse");
+                changed = true;
+            }
+        }
+        let ids: Vec<NetworkId> = self.networks.keys().copied().collect();
+        for id in ids {
+            if !self.networks[&id].members.contains_key(&rec.key) {
+                let _ = self.add_member_direct(id, rec.key, &rec.name);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn remove_lighthouse(&mut self, key: &NodeId) -> Result<(), StoreError> {
+        self.lighthouses
+            .remove(key)
+            .ok_or_else(|| StoreError::NoSuchLighthouse(key.short()))?;
+        for net in self.networks.values_mut() {
+            net.members.remove(key);
+        }
+        self.forwards.retain(|_, f| f.lighthouse != Some(*key));
+        Ok(())
+    }
+
+    /// Lighthouses with the primary first, then by name.
+    pub fn lighthouses_ordered(&self) -> Vec<LighthouseRecord> {
+        let mut v: Vec<LighthouseRecord> = self.lighthouses.values().cloned().collect();
+        v.sort_by(|a, b| b.primary.cmp(&a.primary).then(a.name.cmp(&b.name)));
+        v
     }
 
     /// Consume an invite and add the node. Re-joining an existing member returns
@@ -355,6 +484,13 @@ impl Store {
             .ok_or_else(|| StoreError::NoSuchNetwork(network.to_string()))?;
         if net.devices.contains_key(name) {
             return Err(StoreError::DuplicateDevice(name.to_string()));
+        }
+        if let Some(d) = net
+            .devices
+            .values()
+            .find(|d| d.target == target || (target6.is_some() && d.target6 == target6))
+        {
+            return Err(StoreError::DuplicateTarget(d.name.clone()));
         }
         let address = net.allocate().ok_or(StoreError::Full)?;
         let dns_name = net.unique_label(name);

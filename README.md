@@ -14,7 +14,7 @@ The lighthouse never holds data-plane keys. It cannot read relayed traffic.
 | --- | --- | --- |
 | `ig-proto` | | Identities, invite format, wire protocols |
 | `ig-core` | | Node engine: WireGuard sessions, routing, NAT traversal, policy filter |
-| `ig-lighthouse` | `ig-lighthouse` | Coordination server plus its admin CLI |
+| `ig-lighthouse` | `ig-lighthouse` | Coordination server, overlay member, public forwards, admin CLI |
 | `ig-node` | `ig-node` | Node daemon for Linux and Windows (real TUN devices) |
 | `ig-cli` | `ig` | Command line for the node daemon |
 | `ig-mobile` | `libig_mobile.so` | UniFFI bindings for the Android app |
@@ -42,6 +42,9 @@ sudo ig-lighthouse serve --public-host lighthouse.example.com
 ```
 
 A systemd unit is in `deploy/ig-lighthouse.service`. The key and state live in `/var/lib/intergalactic/lighthouse/`.
+The lighthouse is a member of every network it serves: it owns a TUN device and the second
+address of each network. A second lighthouse can replicate the first for redundancy; see
+`docs/deploy.md`.
 
 ### 2. Create networks and invites
 
@@ -91,7 +94,9 @@ See `docs/architecture.md` for the full design. In short:
 - **Windows service**: `ig-node service install` registers the daemon with the Service Control Manager and starts it at boot.
 - **Relay rate limits** per network (per member and total), with a lighthouse-wide default. Direct peer-to-peer traffic is never limited.
 - **Policies** per network: allow lists of inbound flows, stateful, so an untrusted network can be restricted to a game's ports.
-- **Public port forwards** through the lighthouse: `ig expose 8080` publishes a local port on the lighthouse's public address for as long as the node is up, and admins create permanent forwards (`forward add dev <node> 20022 127.0.0.1:22`). TCP and UDP, with per-network opt-out.
+- **Lighthouses are members** of their networks. Each lighthouse has an overlay address and a name (`lh.dev.ig.internal`), so members reach it over the tunnel like any peer.
+- **Multiple lighthouses**: a replica follows the primary's store and serves nodes while the primary is down (`serve --replica-of`). Nodes connect to every lighthouse of a network; invites name all of them.
+- **Public port forwards**: `ig expose 8080` publishes a port of the node on a lighthouse's public address for as long as the node is up, and admins create permanent forwards (`forward add dev <node> 20022 self:22`). The lighthouse translates the public connection into the overlay with a kernel NAT rule, so the bytes cross the internet only inside WireGuard. TCP and UDP, with per-network opt-out.
 - **Gateway devices**: register a printer, NAS or any machine on a physical LAN (IPv4, and IPv6 with `--ipv6`) and members reach it at an overlay address and name. Nodes started with `--gateway` on that LAN forward and translate for it; the lighthouse picks one and fails over within a minute when it leaves.
 
 ## Verification
@@ -105,5 +110,8 @@ punching through two netfilter NATs, and the Android app on an emulator. See
 ## Status and limits
 
 - The Android app has been verified on an emulator (see `lab/README.md`), not yet on a physical phone.
-- The lighthouse itself must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
+- Each lighthouse must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
+- Only the primary lighthouse accepts writes. While it is down, existing members keep working through the replicas, but new joins wait until it is back.
+- Lighthouse-wide settings (default relay limit, forward range, DNS domain) are set per lighthouse on its command line and are not replicated.
+- Public forwards need a Linux lighthouse with `nft` and `CAP_NET_ADMIN`. `--no-overlay` runs a coordination-only lighthouse without forwards.
 - Hostnames that collide inside one network get a numeric suffix (`laptop`, `laptop-2`).

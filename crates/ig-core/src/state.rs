@@ -22,6 +22,26 @@ impl LighthouseAddr {
         }
     }
 
+    /// Every lighthouse an invite names, primary first.
+    pub fn all_from_invite(inv: &ig_proto::Invite) -> Vec<Self> {
+        let mut v = vec![Self::from_invite(inv)];
+        for r in &inv.extra_lighthouses {
+            let a = Self::from_ref(r);
+            if !v.contains(&a) {
+                v.push(a);
+            }
+        }
+        v
+    }
+
+    pub fn from_ref(r: &ig_proto::control::LighthouseRef) -> Self {
+        LighthouseAddr {
+            host: r.host.clone(),
+            port: r.port,
+            key: r.key,
+        }
+    }
+
     pub fn host_port(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -36,8 +56,51 @@ impl fmt::Display for LighthouseAddr {
 /// One joined network. The engine resumes these on start.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Membership {
+    /// Primary lighthouse.
     pub lighthouse: LighthouseAddr,
+    /// Replica lighthouses that also serve the network.
+    #[serde(default)]
+    pub extra_lighthouses: Vec<LighthouseAddr>,
     pub network: NetworkInfo,
+}
+
+impl Membership {
+    /// All lighthouses of the network, primary first.
+    pub fn lighthouses(&self) -> Vec<LighthouseAddr> {
+        let mut v = vec![self.lighthouse.clone()];
+        for l in &self.extra_lighthouses {
+            if !v.contains(l) {
+                v.push(l.clone());
+            }
+        }
+        v
+    }
+
+    pub fn has_lighthouse(&self, lh: &LighthouseAddr) -> bool {
+        self.lighthouse == *lh || self.extra_lighthouses.contains(lh)
+    }
+
+    /// Replace the lighthouse list with what the lighthouse reports in the
+    /// network info (keeps the primary first).
+    pub fn sync_lighthouses_from_info(&mut self) {
+        let refs: Vec<LighthouseAddr> = self
+            .network
+            .lighthouses
+            .iter()
+            .map(LighthouseAddr::from_ref)
+            .collect();
+        if refs.is_empty() {
+            return;
+        }
+        if refs.contains(&self.lighthouse) {
+            self.extra_lighthouses = refs.into_iter().filter(|l| *l != self.lighthouse).collect();
+        } else {
+            // Our primary is no longer listed; adopt the reported primary.
+            let mut it = refs.into_iter();
+            self.lighthouse = it.next().expect("non-empty");
+            self.extra_lighthouses = it.collect();
+        }
+    }
 }
 
 /// Everything a node must keep across restarts.

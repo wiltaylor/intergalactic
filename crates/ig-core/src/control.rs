@@ -192,7 +192,7 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         hostname: inner.hostname.clone(),
         os: inner.os.clone(),
         gateway: inner.gateway,
-        tunnel: false,
+        replica: false,
     };
     let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -265,8 +265,6 @@ async fn session_loop(
         }
     }
 
-    // The tunnel channel for public port forwards lives alongside the control session.
-    let tunnel_task = tokio::spawn(crate::tunnel::run(inner.clone(), h.addr.clone()));
     let mut pending_exposes: HashMap<
         String,
         oneshot::Sender<Result<ig_proto::tunnel::ForwardInfo, String>>,
@@ -283,7 +281,6 @@ async fn session_loop(
             })
             .await
         {
-            tunnel_task.abort();
             return SessionEnd::Lost(e.to_string());
         }
     }
@@ -407,7 +404,6 @@ async fn session_loop(
         }
     };
     reader.abort();
-    tunnel_task.abort();
     for (_, reply) in pending_leaves.drain() {
         let _ = reply.send(());
     }

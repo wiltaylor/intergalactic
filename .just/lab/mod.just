@@ -19,7 +19,7 @@ bins: require-cargo
 	cp target/x86_64-unknown-linux-musl/release/ig target/x86_64-unknown-linux-musl/release/ig-node target/x86_64-unknown-linux-musl/release/ig-lighthouse lab/bin/
 	cp target/x86_64-pc-windows-gnu/release/ig.exe target/x86_64-pc-windows-gnu/release/ig-node.exe lab/bin/
 
-# Bring the flat lab up (lighthouse, two Linux nodes, one Windows node)
+# Bring the flat lab up (two lighthouses, two Linux nodes, one Windows node)
 [group('lab')]
 flat-up: require-vmlab
 	cd lab/flat && vmlab up
@@ -39,6 +39,11 @@ flat-windows: require-vmlab
 flat-forward: require-vmlab
 	cd lab/flat && vmlab script scripts/forward.ws
 
+# Run the replica-lighthouse scenario against the flat lab (after flat-forward)
+[group('lab')]
+flat-replica: require-vmlab
+	cd lab/flat && vmlab script scripts/replica.ws
+
 # Run the gateway-device scenario against the flat lab (after flat-windows)
 [group('lab')]
 flat-gateway: require-vmlab
@@ -51,7 +56,7 @@ flat-gateway-more: require-vmlab
 
 # Run all flat scenarios
 [group('lab')]
-flat-test: flat-linux flat-windows flat-forward flat-gateway flat-gateway-more
+flat-test: flat-linux flat-windows flat-forward flat-replica flat-gateway flat-gateway-more
 
 # Stop the flat lab, keeping the clones
 [group('lab')]

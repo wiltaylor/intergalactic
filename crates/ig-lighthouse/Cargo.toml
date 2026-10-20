@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 ig-proto.workspace = true
+ig-core.workspace = true
+ig-node.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

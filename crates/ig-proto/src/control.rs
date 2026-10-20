@@ -17,10 +17,10 @@ pub struct ClientHello {
     /// LANs it is attached to (`ig-node run --gateway`).
     #[serde(default)]
     pub gateway: bool,
-    /// This connection is the node's tunnel channel for port forwards, not its
-    /// control channel. Carries [`crate::tunnel::TunnelMsg`] frames.
+    /// This connection comes from another lighthouse that replicates our store
+    /// (see [`crate::replication`]). Its static key must be a registered replica.
     #[serde(default)]
-    pub tunnel: bool,
+    pub replica: bool,
 }
 
 /// Payload of the second Noise handshake message (lighthouse -> node).
@@ -69,8 +69,9 @@ pub enum ToLighthouse {
     Ping {
         nonce: u64,
     },
-    /// Ask for an ephemeral port forward. `public_port = None` lets the
-    /// lighthouse pick one from its range. Answered with `Exposed` or `ExposeFailed`.
+    /// Ask the lighthouse this message reaches for an ephemeral port forward on
+    /// its public address. `public_port = None` lets it pick one from its range.
+    /// Answered with `Exposed` or `ExposeFailed`.
     Expose {
         network: NetworkId,
         proto: crate::tunnel::ForwardProto,
@@ -162,6 +163,21 @@ pub struct NetworkInfo {
     /// Whether members may request ephemeral forwards in this network.
     #[serde(default = "default_true")]
     pub exposes_allowed: bool,
+    /// Every lighthouse serving this network (primary first). Nodes keep a
+    /// control session with each of them.
+    #[serde(default)]
+    pub lighthouses: Vec<LighthouseRef>,
+}
+
+/// How to reach a lighthouse and which key to expect from it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LighthouseRef {
+    pub host: String,
+    pub port: u16,
+    pub key: NodeId,
+    /// Human name, e.g. `lh-eu`.
+    #[serde(default)]
+    pub name: String,
 }
 
 fn default_true() -> bool {

@@ -78,7 +78,8 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let devs = wait_sh(lab, lh, admin + "device list dev | grep -q 'alpha\\|bravo'", 20)?
     let listing = must(lab, lh, admin + "device list dev")?
     lab.log(listing)
-    let active_is_alpha = listing.contains("alpha (")
+    let active = must(lab, lh, admin + "device list dev | sed -n 2p | tr -s ' ' | cut -d' ' -f6 | tr -d '\\n'")?
+    let active_is_alpha = active == "alpha"
     let first = if active_is_alpha { alpha } else { bravo }
     let second = if active_is_alpha { bravo } else { alpha }
     lab.log(fmt("active gateway: {}", first.name()))
@@ -105,22 +106,21 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let t1 = must(lab, lh, "date +%s")?
     lab.log(fmt("failover to {} after {} -> {} s (idle session reaped)", second.name(), t0.trim(), t1.trim()))
     lab.log(must(lab, lh, admin + "device list dev")?)
-    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 10.90.0.5))", 30)?
+    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 10.90.0.6))", 30)?
     let body2 = must_ps(lab, win, "[Text.Encoding]::UTF8.GetString((Invoke-WebRequest -UseBasicParsing http://lhbox.dev.ig.test:8080/hostname).Content).Trim()")?
     if body2.trim() != "lh" { return Err("win got unexpected body after failover: " + body2) }
     lab.log("win still reaches the device, now through " + second.name())
     // The new gateway reaches its own device locally (hairpin through its TUN).
     must(lab, second, "curl -sS --max-time 4 http://lhbox.dev.ig.test:8080/hostname | grep -qx lh")?
 
-    lab.log(fmt("{} comes back; the active gateway stays put", first.name()))
+    lab.log(fmt("{} comes back; the device stays reachable (the choice is deterministic across lighthouses)", first.name()))
     let up = sh(first, "ip link set enp0s3 up; sleep 2; dhclient -1 enp0s3 2>/dev/null || true")?
     wait_sh(lab, first, "ig status | grep -q 'lhbox'", 60)?
-    let after = must(lab, lh, admin + "device list dev")?
-    lab.log(after)
-    let active_after = must(lab, lh, admin + "device list dev | awk 'NR>1' | awk '$6 != \"\" ' | awk 'NR==1' | cut -d' ' -f6- | tr -s ' ' | cut -c1-200")?
-    let col = must(lab, lh, admin + "device list dev | awk 'NR>1 ' | awk '$6 == \"" + second.name() + "\"' | grep -c . || true")?
-    if col.trim() != "1" { return Err("gateway should have stayed with " + second.name() + ":\n" + after + active_after) }
+    wait_sh(lab, lh, admin + "device list dev | sed -n 2p | tr -s ' ' | cut -d' ' -f6 | grep -qE 'alpha|bravo'", 30)?
+    lab.log(must(lab, lh, admin + "device list dev")?)
     wait_sh(lab, first, "curl -sS --max-time 4 http://lhbox.dev.ig.test:8080/hostname | grep -qx lh", 30)?
+    wait_sh(lab, second, "curl -sS --max-time 4 http://lhbox.dev.ig.test:8080/hostname | grep -qx lh", 30)?
+    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet lhbox.dev.ig.test))", 15)?
     lab.log("GATEWAY OK")
     Ok(())
 }

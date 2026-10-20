@@ -33,7 +33,8 @@ enum Cmd {
     /// Publish a local port on the lighthouse's public address while this node is up.
     /// `ig expose 8080` forwards <lighthouse>:<public port> to 127.0.0.1:8080.
     Expose {
-        /// Local port, or `host:port` for something else this node can reach.
+        /// Local port (published as this node's overlay address), or
+        /// `<device>:PORT` for a registered gateway device.
         target: String,
         /// Network whose lighthouse should publish it (default: the only or first one).
         #[arg(long)]
@@ -45,6 +46,9 @@ enum Cmd {
         udp: bool,
         #[arg(long, default_value = "")]
         label: String,
+        /// Lighthouse (name or host) that should publish the port. Default: the first connected one.
+        #[arg(long)]
+        lighthouse: Option<String>,
     },
     /// Remove an ephemeral forward by id.
     Unexpose { id: String },
@@ -116,11 +120,12 @@ async fn main() -> anyhow::Result<()> {
             public_port,
             udp,
             label,
+            lighthouse,
         } => {
             let target = if target.contains(':') {
                 target
             } else {
-                format!("127.0.0.1:{target}")
+                format!("self:{target}")
             };
             let network = match network {
                 Some(n) => n,
@@ -145,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
                     public_port,
                     target,
                     label,
+                    lighthouse,
                 },
             )
             .await?
@@ -154,10 +160,10 @@ async fn main() -> anyhow::Result<()> {
                         "{}://{}:{}  ->  {}   (id {})",
                         f.proto, f.public_host, f.public_port, f.target, f.id
                     );
-                    println!(
-                        "ephemeral: gone when this node disconnects or after `ig unexpose {}`",
-                        f.id
-                    );
+                    println!("ephemeral: gone when this node disconnects from that lighthouse or after `ig unexpose {}`", f.id);
+                    if f.target.starts_with("self:") {
+                        println!("note: the service must listen on this node's overlay address (or 0.0.0.0), not only on localhost");
+                    }
                     Ok(())
                 }
                 other => fail(other),
@@ -223,7 +229,7 @@ fn print_networks(st: &StatusReport) {
         return;
     }
     println!(
-        "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} LIGHTHOUSE",
+        "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} LIGHTHOUSES",
         "NETWORK", "ADDRESS", "IPV6", "DNS NAME", "INTERFACE", "POLICY", "RELAY LIMIT"
     );
     for n in &st.networks {
@@ -232,8 +238,13 @@ fn print_networks(st: &StatusReport) {
         } else {
             format!("{} rules", n.info.policy.rules.len())
         };
+        let lhs: Vec<String> = n
+            .lighthouses
+            .iter()
+            .map(|(h, up)| format!("{h}{}", if *up { "" } else { " (down)" }))
+            .collect();
         println!(
-            "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} {}{}",
+            "{:<12} {:<16} {:<24} {:<28} {:<10} {:<12} {:<20} {}",
             truncate(&n.info.name, 12),
             format!("{}/{}", n.info.address, n.info.cidr.prefix_len()),
             n.info
@@ -248,11 +259,18 @@ fn print_networks(st: &StatusReport) {
             n.interface.clone().unwrap_or_else(|| "-".into()),
             policy,
             n.info.relay_limit.to_string(),
-            n.lighthouse,
-            if n.lighthouse_connected {
-                ""
+            if lhs.is_empty() {
+                format!(
+                    "{}{}",
+                    n.lighthouse,
+                    if n.lighthouse_connected {
+                        ""
+                    } else {
+                        " (down)"
+                    }
+                )
             } else {
-                " (disconnected)"
+                lhs.join(", ")
             }
         );
     }

@@ -74,23 +74,26 @@ fn setup(lab: Lab) -> Result[unit, string] {
     wait_sh(lab, lh, admin + "device list dev | awk 'NR>1 && $8 != \"none\"' | grep -q .", 30)?
     let listing = must(lab, lh, admin + "device list dev")?
     lab.log(listing)
-    let active_is_alpha = listing.contains("alpha (")
+    let active = must(lab, lh, admin + "device list dev | grep lhbox | tr -s ' ' | cut -d' ' -f8 | tr -d '\\n'")?
+    let dev6 = must(lab, lh, admin + "device list dev | grep lhbox | tr -s ' ' | cut -d' ' -f4 | tr -d '\\n'")?
+    lab.log("device IPv6 overlay address: " + dev6)
+    let active_is_alpha = active == "alpha"
     let first = if active_is_alpha { alpha } else { bravo }
     let second = if active_is_alpha { bravo } else { alpha }
     wait_sh(lab, first, "nft list table ip6 ig_gateway | grep -q masquerade", 30)?
     lab.log(must(lab, first, "nft list table ip6 ig_gateway")?)
 
     lab.log("IPv6 device traffic through the Linux gateway")
-    wait_sh(lab, second, "curl -sS -6 --max-time 4 'http://[fd42:9a:1::5]:8080/hostname' | grep -qx lh", 30)?
+    wait_sh(lab, second, "curl -sS -6 --max-time 4 'http://[" + dev6 + "]:8080/hostname' | grep -qx lh", 30)?
     let q = must(lab, second, "resolvectl query lhbox.dev.ig.test")?
-    if !q.contains("fd42:9a:1::5") { return Err("no AAAA for the device: " + q) }
+    if !q.contains(dev6) { return Err("no AAAA for the device: " + q) }
     lab.log(q.trim())
-    must(lab, second, "ping -6 -c 2 -W 2 fd42:9a:1::5")?
+    must(lab, second, "ping -6 -c 2 -W 2 " + dev6)?
     must(lab, second, "curl -sS --max-time 4 http://lhbox.dev.ig.test:8080/hostname | grep -qx lh")?
     // The gateway reaches its own IPv6 device through the kernel output DNAT.
-    must(lab, first, "curl -sS -6 --max-time 4 'http://[fd42:9a:1::5]:8080/hostname' | grep -qx lh")?
-    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 'fd42:9a:1::5'))", 15)?
-    let body6 = must_ps(lab, win, "[Text.Encoding]::UTF8.GetString((Invoke-WebRequest -UseBasicParsing 'http://[fd42:9a:1::5]:8080/hostname').Content).Trim()")?
+    must(lab, first, "curl -sS -6 --max-time 4 'http://[" + dev6 + "]:8080/hostname' | grep -qx lh")?
+    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet '" + dev6 + "'))", 15)?
+    let body6 = must_ps(lab, win, "[Text.Encoding]::UTF8.GetString((Invoke-WebRequest -UseBasicParsing 'http://[" + dev6 + "]:8080/hostname').Content).Trim()")?
     if body6.trim() != "lh" { return Err("win got unexpected body over IPv6: " + body6) }
     lab.log("IPv6 device OK from the other gateway, from the active gateway itself, and from Windows")
 
@@ -101,14 +104,15 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let win_id = must_ps(lab, win, "(C:\\ig\\ig.exe status | Select-String '^node').ToString().Split(' ')[-1].Trim()")?
     lab.log("win node id: " + win_id.trim())
     let k2 = sh(lh, admin + "device remove dev lhwin")?
-    lab.log(must(lab, lh, admin + "device add dev lhwin 10.70.0.10 --via " + win_id.trim())?)
+    lab.log(must(lab, lh, admin + "device add dev lhwin 10.70.0.12 --via " + win_id.trim())?)
     wait_sh(lab, lh, admin + "device list dev | grep lhwin | grep -q 'win ('", 30)?
     lab.log(must(lab, lh, admin + "device list dev")?)
     let nat = wait_ps(lab, win, "exit [int](-not (Get-NetNat | Where-Object Name -like 'ig-*'))", 30)?
     lab.log(must_ps(lab, win, "Get-NetNat | Format-Table -AutoSize Name,InternalIPInterfaceAddressPrefix,Active | Out-String -Width 200; Get-NetIPInterface -AddressFamily IPv4 | Where-Object Forwarding -eq Enabled | Format-Table -AutoSize InterfaceAlias,Forwarding | Out-String -Width 200")?)
     lab.log(must_ps(lab, win, "Get-Content C:\\ProgramData\\Intergalactic\\node\\ig-node.log | Select-String 'gateway' | Select -Last 4 | Out-String -Width 200")?)
     // lhwin is .6 (lhbox is .5). alpha reaches it through win.
-    wait_sh(lab, alpha, "curl -sS --max-time 4 http://lhwin.dev.ig.test:8080/hostname | grep -qx lh", 40)?
+    // lhwin is bravo's LAN address: bravo's HTTP server (from linux.ws) answers.
+    wait_sh(lab, alpha, "curl -sS --max-time 4 http://lhwin.dev.ig.test:8080/hostname | grep -qx bravo", 40)?
     must(lab, alpha, "ping -c 2 -W 2 lhwin.dev.ig.test")?
     lab.log("alpha reached the device through the Windows gateway")
     lab.log("GATEWAY-MORE OK")

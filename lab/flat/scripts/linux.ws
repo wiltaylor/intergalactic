@@ -75,7 +75,7 @@ fn setup(lab: Lab) -> Result[unit, string] {
     install_linux(bravo)?
 
     lab.log("starting lighthouse on lh (10.70.0.10)")
-    let lhcmd = "pkill -x ig-lighthouse; sleep 0.5; rm -rf /var/lib/ig-lh; mkdir -p /var/lib/ig-lh; setsid nohup ig-lighthouse --state-dir /var/lib/ig-lh --admin-socket /run/ig-lh.sock serve --listen '[::]:7777' --public-host 10.70.0.10 --dns-domain ig.test --relay-limit-per-node-kbps 20000 > /var/log/ig-lh.log 2>&1 < /dev/null & sleep 1; test -S /run/ig-lh.sock"
+    let lhcmd = "pkill -x ig-lighthouse; sleep 0.5; rm -rf /var/lib/ig-lh; mkdir -p /var/lib/ig-lh; setsid nohup ig-lighthouse --state-dir /var/lib/ig-lh --admin-socket /run/ig-lh.sock serve --listen '[::]:7777' --public-host 10.70.0.10 --name lh --dns-domain ig.test --relay-limit-per-node-kbps 20000 > /var/log/ig-lh.log 2>&1 < /dev/null & sleep 1; test -S /run/ig-lh.sock"
     must(lab, lh, lhcmd)?
     let admin = "ig-lighthouse --state-dir /var/lib/ig-lh --admin-socket /run/ig-lh.sock "
     must(lab, lh, admin + "network create dev 10.90.0.0/24 --ipv6 fd42:9a:1::/64")?
@@ -97,9 +97,9 @@ fn setup(lab: Lab) -> Result[unit, string] {
 
     // Addresses are allocated in join order: alpha .2, bravo .3.
     lab.log("IPv4 over dev")
-    must(lab, alpha, "ping -c 3 -W 3 10.90.0.3")?
+    must(lab, alpha, "ping -c 3 -W 3 10.90.0.4")?
     lab.log("IPv6 over dev")
-    must(lab, alpha, "ping -c 3 -W 3 fd42:9a:1::3")?
+    must(lab, alpha, "ping -c 3 -W 3 fd42:9a:1::4")?
     lab.log("direct path established?")
     let st = wait_sh(lab, alpha, "ig peers | grep -q direct", 30)?
     lab.log(must(lab, alpha, "ig status")?)
@@ -107,11 +107,11 @@ fn setup(lab: Lab) -> Result[unit, string] {
     lab.log("peer DNS through systemd-resolved")
     let q = must(lab, alpha, "resolvectl query bravo.dev.ig.test")?
     lab.log(q)
-    if !q.contains("10.90.0.3") { return Err("resolvectl did not return bravo's dev address: " + q) }
-    if !q.contains("fd42:9a:1::3") { return Err("resolvectl did not return bravo's IPv6 address: " + q) }
+    if !q.contains("10.90.0.4") { return Err("resolvectl did not return bravo's dev address: " + q) }
+    if !q.contains("fd42:9a:1::4") { return Err("resolvectl did not return bravo's IPv6 address: " + q) }
     must(lab, alpha, "ping -c 2 -W 3 bravo.dev.ig.test")?
     must(lab, alpha, "ping -c 2 -W 3 bravo.game.ig.test")?
-    let rq = must(lab, alpha, "resolvectl query 10.90.0.3")?
+    let rq = must(lab, alpha, "resolvectl query 10.90.0.4")?
     if !rq.contains("bravo.dev.ig.test") { return Err("reverse lookup failed: " + rq) }
     lab.log("reverse: " + rq.trim())
 
@@ -120,20 +120,20 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let body = must(lab, alpha, "curl -sS --max-time 5 http://bravo.dev.ig.test:8080/hostname")?
     if body.trim() != "bravo" { return Err("unexpected body over dev: " + body) }
     lab.log("GET /etc/hostname over dev -> " + body.trim())
-    let body6 = must(lab, alpha, "curl -sS --max-time 5 'http://[fd42:9a:1::3]:8080/hostname'")?
+    let body6 = must(lab, alpha, "curl -sS --max-time 5 'http://[fd42:9a:1::4]:8080/hostname'")?
     if body6.trim() != "bravo" { return Err("unexpected body over IPv6: " + body6) }
     lab.log("GET over IPv6 -> " + body6.trim())
-    must(lab, alpha, "ping -c 2 -W 3 10.91.0.3")?
-    must_fail(lab, alpha, "curl -sS --max-time 4 http://10.91.0.3:8080/hostname")?
+    must(lab, alpha, "ping -c 2 -W 3 10.91.0.4")?
+    must_fail(lab, alpha, "curl -sS --max-time 4 http://10.91.0.4:8080/hostname")?
     lab.log("game network: ping allowed, TCP blocked by policy")
 
     lab.log("isolation: a dev address is unreachable through the game interface")
-    must_fail(lab, alpha, "ping -c 1 -W 2 -I ig-game 10.90.0.3")?
+    must_fail(lab, alpha, "ping -c 1 -W 2 -I ig-game 10.90.0.4")?
 
     lab.log("leave game on bravo; alpha should lose the game peer address")
     must(lab, bravo, "ig leave game")?
-    wait_sh(lab, alpha, "! ig peers | grep -q 10.91.0.3", 30)?
-    must(lab, alpha, "ping -c 1 -W 2 10.90.0.3")?
+    wait_sh(lab, alpha, "! ig peers | grep -q 10.91.0.4", 30)?
+    must(lab, alpha, "ping -c 1 -W 2 10.90.0.4")?
 
     let nodes = must(lab, lh, admin + "node list")?
     lab.log("lighthouse node list:\n" + nodes)

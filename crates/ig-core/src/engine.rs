@@ -157,6 +157,11 @@ pub struct Inner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Ephemeral forwards we asked for, re-requested after a reconnect.
     exposes: Mutex<Vec<(LighthouseAddr, ExposeRequest)>>,
+    /// Joins in flight: network -> every lighthouse named by the invite, so the
+    /// membership records all of them when `Joined` arrives.
+    pending_joins: Mutex<HashMap<NetworkId, Vec<LighthouseAddr>>>,
+    /// Back-reference so `&self` methods can spawn control tasks.
+    me: Mutex<std::sync::Weak<Inner>>,
 }
 
 /// An ephemeral forward as the node remembers it.
@@ -192,10 +197,9 @@ impl Engine {
         let mut networks = HashMap::new();
         let mut by_lighthouse: HashMap<LighthouseAddr, Vec<NetworkId>> = HashMap::new();
         for m in &config.memberships {
-            by_lighthouse
-                .entry(m.lighthouse.clone())
-                .or_default()
-                .push(m.network.id);
+            for lh in m.lighthouses() {
+                by_lighthouse.entry(lh).or_default().push(m.network.id);
+            }
             networks.insert(
                 m.network.id,
                 NetworkEntry {
@@ -226,7 +230,10 @@ impl Engine {
             protector,
             tasks: Mutex::new(Vec::new()),
             exposes: Mutex::new(Vec::new()),
+            pending_joins: Mutex::new(HashMap::new()),
+            me: Mutex::new(std::sync::Weak::new()),
         });
+        *inner.me.lock() = Arc::downgrade(&inner);
 
         let udp_task = tokio::spawn(udp_loop(inner.clone()));
         let timer_task = tokio::spawn(timer_loop(inner.clone()));
@@ -259,11 +266,28 @@ impl Engine {
 
     /// Join a network with an invite. Resolves once the lighthouse has accepted.
     pub async fn join(&self, invite: &Invite) -> Result<NetworkInfo, EngineError> {
-        let lh = LighthouseAddr::from_invite(invite);
+        let all = LighthouseAddr::all_from_invite(invite);
         if let Some(existing) = self.inner.networks.read().get(&invite.network) {
             return Ok(existing.membership.network.clone());
         }
-        let handle = self.inner.ensure_lighthouse(lh);
+        self.inner
+            .pending_joins
+            .lock()
+            .insert(invite.network, all.clone());
+        let mut handles = Vec::new();
+        for lh in &all {
+            handles.push(self.inner.ensure_lighthouse(lh.clone()));
+        }
+        // Join through the first lighthouse that answers; a replica proxies the
+        // request to the primary. Give the connections a moment to come up.
+        let mut handle = handles[0].clone();
+        for _ in 0..30 {
+            if let Some(h) = handles.iter().find(|h| h.is_connected()) {
+                handle = h.clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         handle
             .cmd
@@ -274,7 +298,7 @@ impl Engine {
             })
             .await
             .map_err(|_| EngineError::Stopped)?;
-        match tokio::time::timeout(JOIN_TIMEOUT, rx).await {
+        let result = match tokio::time::timeout(JOIN_TIMEOUT, rx).await {
             Ok(Ok(Ok(info))) => Ok(info),
             Ok(Ok(Err(reason))) => Err(EngineError::JoinRejected(reason)),
             Ok(Err(_)) => Err(EngineError::Stopped),
@@ -287,33 +311,51 @@ impl Engine {
                     .unwrap_or_default();
                 Err(EngineError::JoinTimeout(detail))
             }
+        };
+        self.inner.pending_joins.lock().remove(&invite.network);
+        if result.is_err() {
+            // Drop lighthouses we only connected to for this join.
+            for lh in &all {
+                if !self.inner.has_memberships_with(lh) {
+                    self.inner.drop_lighthouse(lh);
+                }
+            }
         }
+        result
     }
 
     /// Leave a network. Works even if the lighthouse is unreachable; the
     /// lighthouse side is cleaned up when it next hears from us or by an admin.
     pub async fn leave(&self, network: NetworkId) -> Result<(), EngineError> {
-        let lh = self
+        let all = self
             .inner
             .networks
             .read()
             .get(&network)
-            .map(|e| e.membership.lighthouse.clone())
+            .map(|e| e.membership.lighthouses())
             .ok_or(EngineError::UnknownNetwork(network))?;
-        let handle = self.inner.lighthouses.lock().get(&lh).cloned();
-        if let Some(h) = &handle {
+        // Tell the first lighthouse that answers; replicas proxy to the primary.
+        for lh in &all {
+            let handle = self.inner.lighthouses.lock().get(lh).cloned();
+            let Some(h) = handle else { continue };
+            if !h.is_connected() {
+                continue;
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.cmd
                 .send(ControlCmd::Leave { network, reply: tx })
                 .await
                 .is_ok()
+                && tokio::time::timeout(LEAVE_TIMEOUT, rx).await.is_ok()
             {
-                let _ = tokio::time::timeout(LEAVE_TIMEOUT, rx).await;
+                break;
             }
         }
-        self.inner.membership_removed(&lh, network);
-        if !self.inner.has_memberships_with(&lh) {
-            self.inner.drop_lighthouse(&lh);
+        self.inner.membership_removed(&all[0], network);
+        for lh in &all {
+            if !self.inner.has_memberships_with(lh) {
+                self.inner.drop_lighthouse(lh);
+            }
         }
         Ok(())
     }
@@ -358,21 +400,45 @@ impl Engine {
         public_port: Option<u16>,
         target: String,
         label: String,
+        lighthouse: Option<String>,
     ) -> Result<ig_proto::tunnel::ForwardInfo, EngineError> {
-        let lh = self
-            .inner
-            .networks
-            .read()
-            .get(&network)
-            .map(|e| e.membership.lighthouse.clone())
-            .ok_or(EngineError::UnknownNetwork(network))?;
-        let handle = self
-            .inner
-            .lighthouses
-            .lock()
-            .get(&lh)
-            .cloned()
-            .ok_or(EngineError::Stopped)?;
+        let (all, names) = {
+            let nets = self.inner.networks.read();
+            let e = nets
+                .get(&network)
+                .ok_or(EngineError::UnknownNetwork(network))?;
+            let names: HashMap<LighthouseAddr, String> = e
+                .membership
+                .network
+                .lighthouses
+                .iter()
+                .map(|r| (LighthouseAddr::from_ref(r), r.name.clone()))
+                .collect();
+            (e.membership.lighthouses(), names)
+        };
+        let handle = {
+            let handles = self.inner.lighthouses.lock();
+            let chosen = match &lighthouse {
+                Some(want) => all
+                    .iter()
+                    .find(|lh| {
+                        lh.host == *want
+                            || lh.host_port() == *want
+                            || names.get(lh).is_some_and(|n| n == want)
+                            || lh.key.to_string() == *want
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::Refused(format!("no lighthouse `{want}` in this network"))
+                    })?,
+                None => all
+                    .iter()
+                    .find(|lh| handles.get(lh).is_some_and(|h| h.is_connected()))
+                    .cloned()
+                    .ok_or_else(|| EngineError::Refused("no lighthouse is connected".into()))?,
+            };
+            handles.get(&chosen).cloned().ok_or(EngineError::Stopped)?
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         handle
             .cmd
@@ -420,6 +486,13 @@ impl Engine {
             .send(ControlCmd::Unexpose { id: id.to_string() })
             .await
             .map_err(|_| EngineError::Stopped)
+    }
+
+    /// Open a control session with a lighthouse without joining anything. The
+    /// lighthouse's own embedded engine uses this: its memberships arrive with
+    /// the `Resume` reply.
+    pub fn connect_lighthouse(&self, addr: LighthouseAddr) {
+        self.inner.ensure_lighthouse(addr);
     }
 
     /// Tell every lighthouse our local addresses may have changed.
@@ -510,9 +583,22 @@ impl Inner {
         if let Some(h) = map.get(&addr) {
             return h.clone();
         }
+        // One lighthouse reachable under two names is still one lighthouse:
+        // keep a single session per key.
+        if let Some(h) = map.values().find(|h| h.addr.key == addr.key).cloned() {
+            return h;
+        }
         let h = control::spawn(self.clone(), addr.clone());
         map.insert(addr, h.clone());
         h
+    }
+
+    /// `ensure_lighthouse` for callers that only hold `&self`.
+    fn ensure_lighthouse_arc(&self, addr: LighthouseAddr) {
+        let me = self.me.lock().upgrade();
+        if let Some(me) = me {
+            me.ensure_lighthouse(addr);
+        }
     }
 
     fn drop_lighthouse(&self, addr: &LighthouseAddr) {
@@ -567,7 +653,8 @@ impl Inner {
         self.networks
             .read()
             .values()
-            .any(|e| e.membership.lighthouse == *lh)
+            .any(|e| e.membership.has_lighthouse(lh))
+            || self.pending_joins.lock().values().any(|v| v.contains(lh))
     }
 
     fn overlay_cidrs(&self) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
@@ -616,11 +703,28 @@ impl Inner {
         None
     }
 
-    /// Device we gateway whose physical address is `src`: (network, overlay address).
-    fn my_device_by_target(&self, src: &IpAddr) -> Option<(NetworkId, IpAddr)> {
+    /// Device we gateway whose physical address is `src`, for a reply going to
+    /// `dst`: (network, overlay address). The network is the one `dst` belongs
+    /// to, so the same physical address may be a device in several networks.
+    fn my_device_by_target(&self, src: &IpAddr, dst: &IpAddr) -> Option<(NetworkId, IpAddr)> {
         let me = self.keypair.public;
+        let net_of_dst = {
+            let nets = self.networks.read();
+            nets.values()
+                .find(|e| e.membership.network.addresses().contains(dst))
+                .map(|e| e.membership.network.id)
+                .or_else(|| {
+                    let t = self.peers.read();
+                    let id = t.by_addr.get(dst)?;
+                    t.by_id.get(id).and_then(|p| p.lock().network_of(dst))
+                })
+        };
         let nets = self.networks.read();
-        for e in nets.values() {
+        let candidates: Vec<&NetworkEntry> = match net_of_dst {
+            Some(n) => nets.get(&n).into_iter().collect(),
+            None => nets.values().collect(),
+        };
+        for e in candidates {
             for d in e.membership.network.my_devices(&me) {
                 if let Some(o) = d.overlay_for(src) {
                     return Some((e.membership.network.id, o));
@@ -703,6 +807,25 @@ impl Inner {
     // ---- membership changes (called from control tasks) -------------------
 
     pub fn membership_added(&self, lh: &LighthouseAddr, info: NetworkInfo) {
+        let extra: Vec<LighthouseAddr> = {
+            let pending = self
+                .pending_joins
+                .lock()
+                .get(&info.id)
+                .cloned()
+                .unwrap_or_default();
+            let mut v: Vec<LighthouseAddr> = pending.into_iter().filter(|l| l != lh).collect();
+            for r in &info.lighthouses {
+                let a = LighthouseAddr::from_ref(r);
+                if a != *lh && !v.contains(&a) {
+                    v.push(a);
+                }
+            }
+            v
+        };
+        for l in &extra {
+            self.ensure_lighthouse_arc(l.clone());
+        }
         {
             let mut nets = self.networks.write();
             for other in nets.values() {
@@ -721,6 +844,7 @@ impl Inner {
                 NetworkEntry {
                     membership: Membership {
                         lighthouse: lh.clone(),
+                        extra_lighthouses: extra.clone(),
                         network: info.clone(),
                     },
                     tun: None,
@@ -774,6 +898,10 @@ impl Inner {
                 Some(entry) => {
                     if entry.membership.network != info {
                         entry.membership.network = info.clone();
+                        entry.membership.sync_lighthouses_from_info();
+                        for l in entry.membership.lighthouses() {
+                            self.ensure_lighthouse_arc(l);
+                        }
                         membership_changed = true;
                     }
                 }
@@ -784,6 +912,12 @@ impl Inner {
                         NetworkEntry {
                             membership: Membership {
                                 lighthouse: h.addr.clone(),
+                                extra_lighthouses: info
+                                    .lighthouses
+                                    .iter()
+                                    .map(LighthouseAddr::from_ref)
+                                    .filter(|l| *l != h.addr)
+                                    .collect(),
                                 network: info.clone(),
                             },
                             tun: None,
@@ -1007,7 +1141,7 @@ impl Inner {
         let mut owned: Vec<u8>;
         let mut pkt = pkt;
         let mut src = src;
-        if let Some((_, overlay)) = self.my_device_by_target(&src) {
+        if let Some((_, overlay)) = self.my_device_by_target(&src, &dst) {
             owned = pkt.to_vec();
             if !crate::nat::rewrite_src(&mut owned, overlay) {
                 return;
@@ -1326,6 +1460,12 @@ impl Inner {
                         .get(&e.membership.lighthouse)
                         .copied()
                         .unwrap_or(false),
+                    lighthouses: e
+                        .membership
+                        .lighthouses()
+                        .iter()
+                        .map(|l| (l.host_port(), lhs.get(l).copied().unwrap_or(false)))
+                        .collect(),
                     interface: e.tun.as_ref().map(|t| t.dev.name()),
                 })
                 .collect();

@@ -91,9 +91,9 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let ifs = must_ps(lab, win, "Get-NetIPAddress -InterfaceAlias ig-dev | Format-Table -AutoSize InterfaceAlias,IPAddress,PrefixLength | Out-String -Width 200")?
     lab.log(ifs)
 
-    lab.log("traffic from Windows to alpha (10.90.0.2)")
-    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 10.90.0.2))", 20)?
-    must_ps(lab, win, "exit [int](-not (Test-Connection -Count 2 -Quiet 'fd42:9a:1::2'))")?
+    lab.log("traffic from Windows to alpha (10.90.0.3)")
+    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 10.90.0.3))", 20)?
+    must_ps(lab, win, "exit [int](-not (Test-Connection -Count 2 -Quiet 'fd42:9a:1::3'))")?
     lab.log("IPv4 and IPv6 ping to alpha OK")
 
     lab.log("DNS through NRPT")
@@ -101,11 +101,11 @@ fn setup(lab: Lab) -> Result[unit, string] {
     lab.log(nrpt)
     let dns = must_ps(lab, win, "(Resolve-DnsName alpha.dev.ig.test -Type A).IPAddress")?
     lab.log("alpha.dev.ig.test -> " + dns.trim())
-    if !dns.contains("10.90.0.2") { return Err("Windows did not resolve alpha.dev.ig.test: " + dns) }
+    if !dns.contains("10.90.0.3") { return Err("Windows did not resolve alpha.dev.ig.test: " + dns) }
     must_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet alpha.dev.ig.test))")?
 
-    lab.log("traffic from alpha to Windows (10.90.0.4) and by name")
-    must(lab, alpha, "ping -c 2 -W 3 10.90.0.4")?
+    lab.log("traffic from alpha to Windows (10.90.0.5) and by name")
+    must(lab, alpha, "ping -c 2 -W 3 10.90.0.5")?
     let q = must(lab, alpha, "resolvectl query win.dev.ig.test")?
     lab.log(q.trim())
     must(lab, alpha, "ping -c 2 -W 3 win.dev.ig.test")?
@@ -119,7 +119,7 @@ fn setup(lab: Lab) -> Result[unit, string] {
     must_ps(lab, win, "C:\\ig\\ig-node.exe service stop; Start-Sleep 2; C:\\ig\\ig-node.exe service start")?
     wait_ps(lab, win, "exit [int](-not (C:\\ig\\ig.exe peers | Select-String -Quiet online))", 30)?
     let t0 = must(lab, alpha, "date +%s")?
-    wait_sh(lab, alpha, "ping -c 1 -W 2 10.90.0.4", 30)?
+    wait_sh(lab, alpha, "ping -c 1 -W 2 10.90.0.5", 30)?
     let t1 = must(lab, alpha, "date +%s")?
     lab.log(fmt("alpha reached the restarted Windows node after about {}..{} s", t0.trim(), t1.trim()))
     lab.log("WINDOWS OK")

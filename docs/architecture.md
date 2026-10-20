@@ -19,13 +19,19 @@ Noise transport messages so peer lists of any size fit.
 
 | Direction | Message | Purpose |
 | --- | --- | --- |
+| node → LH | `ClientHello {hostname, os, gateway, replica}` | First message; `replica` marks a lighthouse-to-lighthouse link |
 | node → LH | `Join {network, token}` | Consume an invite, get an address |
 | node → LH | `Leave`, `Resume` | Leave, or ask for all memberships after reconnect |
 | node → LH | `Endpoints {local}` | LAN candidate endpoints |
 | node → LH | `Punch {network, target}` | Ask the target to send towards us |
 | LH → node | `NetworkState {network, peers}` | Full membership of a network. Pushed on every change |
 | LH → node | `PunchRequest {from, endpoints}` | A peer wants to reach us |
+| node → LH | `Expose`, `Unexpose` | Ephemeral public forwards |
 | LH → node | `Removed` | Admin removed us or deleted the network |
+
+`NetworkInfo.lighthouses` lists every lighthouse of the network (key, host, port, primary
+flag). A node connects to all of them and sends its joins and endpoints to each. Duplicate
+lighthouse records are merged by key.
 
 The lighthouse coalesces changes for 150 ms and then pushes `NetworkState` to every online member.
 
@@ -130,7 +136,8 @@ is never limited. Limits are shown to members in `ig status`.
 ## Gateway devices
 
 A **device** is a record in a network: name, overlay address (from the network's pool),
-physical address, and an optional ordered list of preferred gateways. Nodes started with
+physical address (unique within the network), and an optional ordered list of preferred
+gateways. Nodes started with
 `--gateway` set a flag in their hello and report the IPv4 prefixes of their LANs with their
 endpoints. For each device the lighthouse computes the **active gateway**: the current one if
 it still qualifies, else the first qualifying candidate (online, gateway-capable member; on the
@@ -147,7 +154,8 @@ to that peer and accepted as a source from it. The gateway itself, on receiving 
 device, rewrites the destination to the physical address (`ig_core::nat`, incremental checksum
 update) and writes it to its TUN. The kernel forwards it with source NAT; the reply returns
 through the TUN with the physical source, which the engine rewrites back to the overlay
-address before encrypting it to the member. The gateway's own traffic to its devices is
+address before encrypting it to the member. The reverse lookup is scoped to the network the
+reply's destination belongs to, so one physical host can be a device in several networks. The gateway's own traffic to its devices is
 handled by a kernel output DNAT rule, because Linux refuses a TUN packet whose source is one of
 the host's own addresses.
 
@@ -156,25 +164,54 @@ dropped (nodes ping every 15 s), the networks of that node are re-pushed, and th
 to the next candidate. Members already hold WireGuard sessions with every peer, so the switch
 is one route change.
 
+## Lighthouses as members
+
+A lighthouse runs the same engine as a node (`ig_core::Engine`) with a TUN device per
+network. On start it connects to itself through its public address, so it holds a control
+session like any member. When it creates a network it joins it with the second address
+(`10.90.0.2`, `fd42:9a:1::2`), the hostname given by `--name`, and the lighthouse flag. Members
+see it as one more peer: it has a WireGuard session, a direct or relayed path, and a DNS name.
+`Overlay::Off` (`--no-overlay`) skips the engine; the lighthouse then coordinates only.
+
+## Replication
+
+A lighthouse is either the **primary** or a **replica** of one primary. A replica opens a
+Noise control connection to the primary with `ClientHello.replica = true` and keeps it open.
+The primary sends `Snapshot {store_json}` on connect and after every change to the store; the
+replica replaces its store, re-pushes `NetworkState` to its own sessions, and reconciles its
+TUN devices and forward rules. A replica never writes the store: `Join` and `Leave` from a
+node are wrapped in `Proxy {node, hostname, os, msg}` and the primary's `ProxyReply` carries
+the answer back. Admin requests that write are refused on a replica. Ephemeral forwards
+`Expose` are the exception: they live in the memory of the lighthouse that owns the public
+port, so each lighthouse accepts them itself.
+
+Nodes connect to every lighthouse in `NetworkInfo.lighthouses` and merge the states they
+receive. Endpoints, punches and relays work through whichever lighthouse is up. When the
+primary is down, members keep their sessions and replicas keep relaying; joins wait for the
+primary with a clear refusal. The admin command `lighthouse add <name> <host> <port> <key>`
+registers a replica so invites and pushes name it.
+
 ## Public port forwards
 
-A forward binds a public port on the lighthouse to a `host:port` target that one node
-reaches. Permanent forwards live in the store; ephemeral ones live in memory with the node's
-session and are re-requested by the node after a reconnect. The lighthouse keeps one listener
-per forward (TCP accept loop or UDP socket) and refuses to bind its own control port.
+A forward binds a public port on one lighthouse to an overlay target: `self:PORT` resolves to
+the node's overlay address, `<device>:PORT` to a gateway device of the network, and a literal
+overlay address is used as given. Permanent forwards live in the store with the lighthouse
+that owns the port; ephemeral ones live in the memory of that lighthouse with the node's
+session and are re-requested by the node after a reconnect.
 
-Each node holds a second Noise/TCP connection to each lighthouse, the **tunnel channel**
-(`ClientHello.tunnel = true`). The lighthouse multiplexes streams over it: `Open` for every
-accepted TCP connection or new UDP peer, `Data` frames of at most 16 KiB, `Close`. The node
-connects to the target and pumps bytes both ways; the lighthouse pumps between the public
-socket and the frames. Nothing is decrypted on the lighthouse beyond the Noise layer of the
-tunnel channel itself, which it terminates by design: unlike relayed WireGuard traffic, the
-lighthouse sees forwarded bytes in the clear, exactly as any reverse proxy would.
+The lighthouse installs each forward as kernel NAT (`ig_node::forward_os`): nftables tables
+`ig_forwards` in the `ip` and `ip6` families with a `prerouting` DNAT for public clients, an
+`output` DNAT for clients on the lighthouse itself, and a masquerade on `ig-*` so the reply
+returns through the lighthouse's TUN. The packet then takes the normal data plane to the node:
+the WireGuard session with the lighthouse peer, direct or relayed, and the network policy
+filter on the node. Nothing is decrypted on the lighthouse; it sees the public client's bytes
+exactly as the public socket delivers them and forwards them inside WireGuard.
 
 ## Persistence
 
-- Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, invite hashes) in the
-  state directory. Written atomically on every change.
+- Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, devices, permanent
+  forwards, lighthouses, invite hashes) in the state directory. Written atomically on every
+  change and sent to replicas as a snapshot.
 - Node: `node.json` (private key and memberships). The daemon rewrites it on every
   `MembershipsChanged` event. On start the node resumes all memberships.
 - Android: the same JSON, stored in the app's private files directory.

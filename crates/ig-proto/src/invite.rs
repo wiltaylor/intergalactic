@@ -26,6 +26,10 @@ pub struct Invite {
     pub network_name: String,
     /// Secret proving the invite. The lighthouse stores only a hash of it.
     pub token: [u8; 16],
+    /// Additional lighthouses serving the network (replicas). `host`/`port`/
+    /// `lighthouse` above describe the primary.
+    #[serde(default)]
+    pub extra_lighthouses: Vec<crate::control::LighthouseRef>,
 }
 
 impl Invite {
@@ -81,6 +85,12 @@ mod tests {
             network: NetworkId::random(),
             network_name: "dev".into(),
             token: crate::random_array(),
+            extra_lighthouses: vec![crate::control::LighthouseRef {
+                host: "lh2.example.com".into(),
+                port: 7777,
+                key: NodeId(crate::random_array()),
+                name: "lh2".into(),
+            }],
         };
         let s = inv.encode();
         assert!(s.starts_with("ig1:"));

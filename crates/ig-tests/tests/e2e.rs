@@ -4,11 +4,13 @@
 use ig_core::packet::{build_tcp, build_udp, TCP_SYN};
 use ig_core::tun::channel::{ChannelTun, OsSide};
 use ig_core::{Engine, EngineConfig, EngineEvent, Membership, NoProtector, TunScope};
+use ig_lighthouse::server::{Overlay, Role};
 use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
 use ig_proto::control::NetworkInfo;
 use ig_proto::ipc::PeerPath;
 use ig_proto::{Invite, Keypair, Policy, RelayLimit, Rule};
+use parking_lot::Mutex as PlMutex;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +25,18 @@ fn init_tracing() {
         .try_init();
 }
 
-async fn lighthouse() -> Lighthouse {
-    Lighthouse::start(LighthouseConfig {
+/// OS sides of the TUNs the lighthouse's embedded engine attached, by network name.
+type LhTuns = Arc<PlMutex<std::collections::HashMap<String, OsSide>>>;
+
+fn lighthouse_config(name: &str, role: Role) -> (LighthouseConfig, LhTuns) {
+    let tuns: LhTuns = Arc::new(PlMutex::new(std::collections::HashMap::new()));
+    let sink = tuns.clone();
+    let factory: ig_lighthouse::server::TunFactory = Arc::new(move |info: &NetworkInfo| {
+        let (tun, os) = ChannelTun::new(&format!("lh-{}", info.name));
+        sink.lock().insert(info.name.clone(), os);
+        Ok(Arc::new(tun) as Arc<dyn ig_core::TunDevice>)
+    });
+    let cfg = LighthouseConfig {
         keypair: Keypair::generate(),
         listen: "127.0.0.1:0".parse().unwrap(),
         public_host: "127.0.0.1".into(),
@@ -33,9 +45,16 @@ async fn lighthouse() -> Lighthouse {
         dns_domain: "ig.test".into(),
         default_relay_limit: RelayLimit::unlimited(),
         forward_range: (30000, 30099),
-    })
-    .await
-    .unwrap()
+        name: name.into(),
+        role,
+        overlay: Overlay::Custom(factory),
+    };
+    (cfg, tuns)
+}
+
+async fn lighthouse() -> Lighthouse {
+    let (cfg, _) = lighthouse_config("lh", Role::Primary);
+    Lighthouse::start(cfg).await.unwrap()
 }
 
 fn create_network(lh: &Lighthouse, name: &str, cidr: &str, cidr6: Option<&str>) {
@@ -115,6 +134,35 @@ async fn join_with_tun(n: &Node, inv: &Invite) -> (NetworkInfo, OsSide) {
     (info, os)
 }
 
+fn first_member(engine: &Engine) -> ig_proto::ipc::PeerStatus {
+    engine
+        .status()
+        .peers
+        .into_iter()
+        .find(|p| {
+            p.hostname != "lh"
+                && p.hostname != "beacon"
+                && p.hostname != "primary"
+                && p.hostname != "replica"
+        })
+        .expect("a member peer")
+}
+
+/// Peers that are nodes, not lighthouses (which are members too).
+fn member_peers(engine: &Engine) -> usize {
+    engine
+        .status()
+        .peers
+        .iter()
+        .filter(|p| {
+            p.hostname != "lh"
+                && p.hostname != "beacon"
+                && p.hostname != "primary"
+                && p.hostname != "replica"
+        })
+        .count()
+}
+
 async fn wait_for<F: FnMut() -> bool>(what: &str, mut f: F) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !f() {
@@ -173,7 +221,7 @@ async fn two_nodes_exchange_packets_and_go_direct() {
     assert_eq!(ia.fqdn(), "alpha.dev.ig.test");
 
     wait_for("peers visible", || {
-        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+        member_peers(&a.engine) == 1 && member_peers(&b.engine) == 1
     })
     .await;
 
@@ -188,15 +236,16 @@ async fn two_nodes_exchange_packets_and_go_direct() {
     assert_eq!(got, reply);
 
     wait_for("direct path", || {
-        a.engine.status().peers[0].path == PeerPath::Direct
-            && b.engine.status().peers[0].path == PeerPath::Direct
+        first_member(&a.engine).path == PeerPath::Direct
+            && first_member(&b.engine).path == PeerPath::Direct
     })
     .await;
     let st = a.engine.status();
-    assert!(st.peers[0].tx_bytes > 0 && st.peers[0].rx_bytes > 0);
-    assert_eq!(st.peers[0].hostname, "bravo");
+    let bravo_peer = first_member(&a.engine);
+    assert!(bravo_peer.tx_bytes > 0 && bravo_peer.rx_bytes > 0);
+    assert_eq!(bravo_peer.hostname, "bravo");
     assert_eq!(
-        st.peers[0].names,
+        bravo_peer.names,
         vec![(ia.id, "bravo.dev.ig.test".to_string())]
     );
     assert!(st.networks[0].lighthouse_connected);
@@ -233,7 +282,7 @@ async fn ipv6_addresses_work_end_to_end() {
         host as u128
     );
     wait_for("peers visible", || {
-        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+        member_peers(&a.engine) == 1 && member_peers(&b.engine) == 1
     })
     .await;
     let pkt = build_udp(v6(&ia), 7000, v6(&ib), 7001, b"over six");
@@ -242,8 +291,7 @@ async fn ipv6_addresses_work_end_to_end() {
     let pkt4 = build_udp(v4(&ia), 7000, v4(&ib), 7001, b"over four");
     assert_eq!(deliver(&os_a, &mut os_b, pkt4.clone()).await, pkt4);
     // Peer status lists both families.
-    let st = a.engine.status();
-    assert_eq!(st.peers[0].addresses.len(), 2);
+    assert_eq!(first_member(&a.engine).addresses.len(), 2);
     a.engine.shutdown().await;
     b.engine.shutdown().await;
     lh.shutdown().await;
@@ -272,7 +320,7 @@ async fn dns_names_resolve_through_the_tun() {
     let (ia, mut os_a) = join_with_tun(&a, &inv).await;
     let (ib, _os_b) = join_with_tun(&b, &inv).await;
     assert_eq!(ia.fqdn(), "alpha-laptop.dev-net.ig.test");
-    wait_for("peers visible", || a.engine.status().peers.len() == 1).await;
+    wait_for("peers visible", || member_peers(&a.engine) == 1).await;
 
     // A query for bravo's full name, sent to the network's DNS address.
     let dns4 = IpAddr::V4(ia.dns_server_v4());
@@ -354,17 +402,17 @@ async fn relay_only_nodes_still_talk() {
     let (ia, os_a) = join_with_tun(&a, &inv).await;
     let (ib, mut os_b) = join_with_tun(&b, &inv).await;
     wait_for("peers visible", || {
-        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+        member_peers(&a.engine) == 1 && member_peers(&b.engine) == 1
     })
     .await;
     let pkt = build_udp(v4(&ia), 1, v4(&ib), 2, b"via relay");
     let got = deliver(&os_a, &mut os_b, pkt.clone()).await;
     assert_eq!(got, pkt);
     wait_for("relay path reported", || {
-        a.engine.status().peers[0].path == PeerPath::Relay
+        first_member(&a.engine).path == PeerPath::Relay
     })
     .await;
-    assert_eq!(a.engine.status().peers[0].endpoint, None);
+    assert_eq!(first_member(&a.engine).endpoint, None);
     a.engine.shutdown().await;
     b.engine.shutdown().await;
     lh.shutdown().await;
@@ -381,7 +429,7 @@ async fn relay_limit_caps_relayed_traffic_per_network() {
     let (ia, os_a) = join_with_tun(&a, &inv).await;
     let (ib, mut os_b) = join_with_tun(&b, &inv).await;
     wait_for("peers visible", || {
-        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+        member_peers(&a.engine) == 1 && member_peers(&b.engine) == 1
     })
     .await;
     // Warm the session while unlimited.
@@ -471,7 +519,7 @@ async fn policy_blocks_unsolicited_traffic_but_allows_rules_and_replies() {
     let (ia, mut os_a) = join_with_tun(&a, &inv).await;
     let (ib, mut os_b) = join_with_tun(&b, &inv).await;
     wait_for("peers visible", || {
-        a.engine.status().peers.len() == 1 && b.engine.status().peers.len() == 1
+        member_peers(&a.engine) == 1 && member_peers(&b.engine) == 1
     })
     .await;
 
@@ -543,12 +591,9 @@ async fn networks_are_isolated_and_a_node_can_be_in_several() {
     let (b_dev, os_b) = join_with_tun(&b, &dev_inv).await;
     let (c_game, os_c) = join_with_tun(&c, &game_inv).await;
 
-    wait_for("alpha sees two peers", || {
-        a.engine.status().peers.len() == 2
-    })
-    .await;
+    wait_for("alpha sees two peers", || member_peers(&a.engine) == 2).await;
     wait_for("bravo and charlie see one peer each", || {
-        b.engine.status().peers.len() == 1 && c.engine.status().peers.len() == 1
+        member_peers(&b.engine) == 1 && member_peers(&c.engine) == 1
     })
     .await;
     assert_eq!(a.engine.memberships().len(), 2);
@@ -581,14 +626,8 @@ async fn networks_are_isolated_and_a_node_can_be_in_several() {
 
     // Leaving game removes charlie from alpha's view.
     a.engine.leave(a_game.id).await.unwrap();
-    wait_for("alpha down to one peer", || {
-        a.engine.status().peers.len() == 1
-    })
-    .await;
-    wait_for("charlie has no peers", || {
-        c.engine.status().peers.is_empty()
-    })
-    .await;
+    wait_for("alpha down to one peer", || member_peers(&a.engine) == 1).await;
+    wait_for("charlie has no peers", || member_peers(&c.engine) == 0).await;
     assert_eq!(a.engine.memberships().len(), 1);
 
     a.engine.shutdown().await;
@@ -623,10 +662,7 @@ async fn restart_resumes_memberships_and_admin_can_kick() {
     let key = a.keypair.clone();
     let a2 = node_with_key("alpha", key, saved, false).await;
     assert_eq!(a2.engine.memberships().len(), 1);
-    wait_for("resumed node sees bravo", || {
-        a2.engine.status().peers.len() == 1
-    })
-    .await;
+    wait_for("resumed node sees bravo", || member_peers(&a2.engine) == 1).await;
     wait_for("same address kept", || {
         a2.engine.status().networks[0].info.address == ia.address
     })
@@ -638,7 +674,7 @@ async fn restart_resumes_memberships_and_admin_can_kick() {
         node: b.engine.node_id(),
     });
     assert!(matches!(r, AdminResponse::Ok));
-    wait_for("alpha has no peers", || a2.engine.status().peers.is_empty()).await;
+    wait_for("alpha has no peers", || member_peers(&a2.engine) == 0).await;
     wait_for("bravo has no networks", || {
         b.engine.memberships().is_empty()
     })
@@ -646,10 +682,11 @@ async fn restart_resumes_memberships_and_admin_can_kick() {
 
     match lh.admin(AdminRequest::NodeList { network: None }) {
         AdminResponse::Nodes(nodes) => {
-            assert_eq!(nodes.len(), 1);
-            assert_eq!(nodes[0].hostname, "alpha");
-            assert_eq!(nodes[0].dns_name, "alpha");
-            assert!(nodes[0].online);
+            let members: Vec<_> = nodes.iter().filter(|n| n.os != "lighthouse").collect();
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].hostname, "alpha");
+            assert_eq!(members[0].dns_name, "alpha");
+            assert!(members[0].online);
         }
         other => panic!("{other:?}"),
     }
@@ -694,7 +731,7 @@ async fn gateway_translates_device_traffic_and_fails_over() {
     let (ia, mut os_a) = join_with_tun(&alpha, &inv).await;
     let (ib, mut os_b) = join_with_tun(&bravo, &inv).await;
     let (ic, mut os_c) = join_with_tun(&charlie, &inv).await;
-    wait_for("peers visible", || charlie.engine.status().peers.len() == 2).await;
+    wait_for("peers visible", || member_peers(&charlie.engine) == 2).await;
 
     // Register a printer on a LAN this host is on (the test process reports its
     // real interfaces), preferring alpha then bravo explicitly.
@@ -823,7 +860,7 @@ async fn ipv6_devices_are_translated_too() {
     let client = mk("client", false).await;
     let (_ig, mut os_gw) = join_with_tun(&gw, &inv).await;
     let (ic, mut os_c) = join_with_tun(&client, &inv).await;
-    wait_for("peer visible", || client.engine.status().peers.len() == 1).await;
+    wait_for("peer visible", || member_peers(&client.engine) == 1).await;
 
     // IPv6 devices need the network's IPv6 prefix; the overlay v6 address gets
     // the same host number as the v4 one.
@@ -895,7 +932,7 @@ async fn ipv6_devices_are_translated_too() {
 }
 
 #[tokio::test]
-async fn public_port_forwards_carry_tcp_and_udp() {
+async fn public_port_forwards_become_overlay_nat_rules() {
     init_tracing();
     let lh = lighthouse().await;
     create_network(&lh, "dev", "10.96.0.0/24", None);
@@ -903,138 +940,85 @@ async fn public_port_forwards_carry_tcp_and_udp() {
     let a = node("alpha", vec![], false).await;
     let (ia, _os_a) = join_with_tun(&a, &inv).await;
 
-    // A TCP echo service and a UDP echo service on the node's host (this process).
-    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_port = echo.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = echo.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let (mut r, mut w) = s.split();
-                let _ = tokio::io::copy(&mut r, &mut w).await;
-            });
-        }
-    });
-    let uecho = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let uecho_port = uecho.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 2048];
-        while let Ok((n, from)) = uecho.recv_from(&mut buf).await {
-            let _ = uecho.send_to(&buf[..n], from).await;
-        }
-    });
-
-    // Ephemeral TCP forward with an automatic public port.
+    // Ephemeral TCP forward to the node's own overlay address.
     let f = a
         .engine
         .expose(
             ia.id,
             ig_proto::tunnel::ForwardProto::Tcp,
             None,
-            format!("127.0.0.1:{echo_port}"),
-            "echo".into(),
+            "self:8080".into(),
+            "web".into(),
+            None,
         )
         .await
         .expect("expose");
     assert!((30000..=30099).contains(&f.public_port));
     assert_eq!(f.kind, ig_proto::tunnel::ForwardKind::Ephemeral);
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // The tunnel channel comes up right after the control channel; retry until
-    // a round trip succeeds.
-    let mut echoed = None;
-    for _ in 0..50 {
-        let Ok(mut client) = tokio::net::TcpStream::connect(("127.0.0.1", f.public_port)).await
-        else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        client
-            .write_all(b"hello through the lighthouse")
-            .await
-            .unwrap();
-        let mut buf = [0u8; 64];
-        if let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf)).await
-        {
-            if n > 0 {
-                echoed = Some((buf[..n].to_vec(), client));
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let (first, client) = echoed.expect("echo through the public port");
-    assert_eq!(first, b"hello through the lighthouse");
-    // A large payload survives chunking.
-    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-    let (mut r, mut w) = client.into_split();
-    let payload = big.clone();
-    let writer = tokio::spawn(async move {
-        w.write_all(&payload).await.unwrap();
-        w
-    });
-    let mut got = vec![0u8; big.len()];
-    tokio::time::timeout(Duration::from_secs(10), r.read_exact(&mut got))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(got, big);
-    drop(writer.await.unwrap());
-    drop(r);
-
-    // Node status lists the forward; the lighthouse lists it as ephemeral and online.
+    assert_eq!(f.lighthouse, lh.public_key());
+    let rules = lh.forward_rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].dst, std::net::SocketAddr::new(v4(&ia), 8080));
+    assert_eq!(rules[0].public_port, f.public_port);
     wait_for("forward in status", || {
         a.engine.status().networks[0].info.forwards.len() == 1
     })
     .await;
-    match lh.admin(AdminRequest::ForwardList) {
-        AdminResponse::Forwards(list) => {
-            assert_eq!(list.len(), 1);
-            assert!(list[0].node_online);
-        }
-        other => panic!("{other:?}"),
-    }
 
-    // UDP forward with an explicit public port.
+    // A device target resolves to the device's overlay address.
+    lh.admin(AdminRequest::DeviceAdd {
+        network: "dev".into(),
+        name: "nas".into(),
+        target: "192.0.2.9".parse().unwrap(),
+        target6: None,
+        gateways: vec![a.engine.node_id()],
+    });
     let fu = a
         .engine
         .expose(
             ia.id,
             ig_proto::tunnel::ForwardProto::Udp,
             Some(30050),
-            format!("127.0.0.1:{uecho_port}"),
-            "udp".into(),
+            "nas:445".into(),
+            String::new(),
+            None,
         )
         .await
-        .expect("expose udp");
-    assert_eq!(fu.public_port, 30050);
-    let us = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut got = None;
-    for _ in 0..30 {
-        us.send_to(b"ping over udp", ("127.0.0.1", 30050))
-            .await
-            .unwrap();
-        let mut buf = [0u8; 64];
-        if let Ok(Ok((n, _))) =
-            tokio::time::timeout(Duration::from_millis(300), us.recv_from(&mut buf)).await
-        {
-            got = Some(buf[..n].to_vec());
-            break;
-        }
-    }
-    assert_eq!(got.expect("udp echo"), b"ping over udp");
+        .expect("expose device");
+    let nas_addr = match lh.admin(AdminRequest::DeviceList {
+        network: "dev".into(),
+    }) {
+        AdminResponse::Devices(d) => d[0].address,
+        other => panic!("{other:?}"),
+    };
+    assert!(lh
+        .forward_rules()
+        .iter()
+        .any(|r| r.public_port == 30050
+            && r.dst == std::net::SocketAddr::new(IpAddr::V4(nas_addr), 445)));
 
-    // Taken port and out-of-range port are refused; a denied network refuses everything.
+    // Refusals: localhost targets, taken and out-of-range ports, denied network.
+    assert!(a
+        .engine
+        .expose(
+            ia.id,
+            ig_proto::tunnel::ForwardProto::Tcp,
+            None,
+            "127.0.0.1:80".into(),
+            String::new(),
+            None
+        )
+        .await
+        .is_err());
     assert!(a
         .engine
         .expose(
             ia.id,
             ig_proto::tunnel::ForwardProto::Udp,
             Some(30050),
-            "127.0.0.1:1".into(),
-            String::new()
+            "self:1".into(),
+            String::new(),
+            None
         )
         .await
         .is_err());
@@ -1044,8 +1028,9 @@ async fn public_port_forwards_carry_tcp_and_udp() {
             ia.id,
             ig_proto::tunnel::ForwardProto::Tcp,
             Some(40000),
-            "127.0.0.1:1".into(),
-            String::new()
+            "self:1".into(),
+            String::new(),
+            None
         )
         .await
         .is_err());
@@ -1066,35 +1051,206 @@ async fn public_port_forwards_carry_tcp_and_udp() {
             ia.id,
             ig_proto::tunnel::ForwardProto::Tcp,
             None,
-            "127.0.0.1:1".into(),
-            String::new()
+            "self:1".into(),
+            String::new(),
+            None
         )
         .await
         .is_err());
 
-    // A permanent forward created by the admin survives the node going away;
-    // the ephemeral ones are gone.
+    // Permanent forward survives the node going away; ephemeral ones vanish.
     let r = lh.admin(AdminRequest::ForwardAdd {
         network: "dev".into(),
         node: a.engine.node_id(),
         proto: ig_proto::tunnel::ForwardProto::Tcp,
         public_port: 30080,
-        target: format!("127.0.0.1:{echo_port}"),
-        label: "perm".into(),
+        target: "self:22".into(),
+        label: "ssh".into(),
+        lighthouse: None,
     });
     assert!(matches!(r, AdminResponse::Forwards(_)), "{r:?}");
+    assert_eq!(lh.forward_rules().len(), 3);
     a.engine.unexpose(&f.id).await.unwrap();
     wait_for("ephemeral tcp removed", || {
-        matches!(lh.admin(AdminRequest::ForwardList), AdminResponse::Forwards(l) if l.iter().all(|x| x.info.id != f.id))
+        lh.forward_rules()
+            .iter()
+            .all(|r| r.public_port != f.public_port)
     })
     .await;
-    assert!(tokio::net::TcpStream::connect(("127.0.0.1", f.public_port))
-        .await
-        .is_err());
+    let _ = fu;
     a.engine.shutdown().await;
-    wait_for("udp ephemeral removed on disconnect", || {
-        matches!(lh.admin(AdminRequest::ForwardList), AdminResponse::Forwards(l) if l.len() == 1 && l[0].info.public_port == 30080)
+    wait_for("only the permanent rule stays", || {
+        let r = lh.forward_rules();
+        r.len() == 1 && r[0].public_port == 30080
     })
     .await;
     lh.shutdown().await;
+}
+
+#[tokio::test]
+async fn lighthouse_is_a_member_of_its_networks() {
+    init_tracing();
+    let (cfg, lh_tuns) = lighthouse_config("beacon", Role::Primary);
+    let lh = Lighthouse::start(cfg).await.unwrap();
+    create_network(&lh, "dev", "10.99.1.0/24", None);
+    let inv = invite(&lh, "dev", 5);
+    let a = node("alpha", vec![], false).await;
+    let (ia, os_a) = join_with_tun(&a, &inv).await;
+
+    // The lighthouse shows up as a peer with its own overlay address and name.
+    wait_for("lighthouse peer visible", || {
+        a.engine
+            .status()
+            .peers
+            .iter()
+            .any(|p| p.hostname == "beacon")
+    })
+    .await;
+    let st = a.engine.status();
+    let lh_peer = st.peers.iter().find(|p| p.hostname == "beacon").unwrap();
+    assert_eq!(lh_peer.node, lh.public_key());
+    let lh_addr = lh_peer.addresses[0].1;
+    assert!(ia.cidr.contains(&match lh_addr {
+        IpAddr::V4(a) => a,
+        _ => panic!(),
+    }));
+    assert_eq!(lh_peer.names[0].1, "beacon.dev.ig.test");
+    // Its own engine agrees, and has a TUN for the network.
+    wait_for("lighthouse tun", || lh_tuns.lock().contains_key("dev")).await;
+    let lh_status = lh.engine_status().unwrap();
+    assert_eq!(
+        lh_status.networks[0].info.address.to_string(),
+        lh_addr.to_string()
+    );
+
+    // Traffic from a member reaches the lighthouse's TUN over WireGuard.
+    let pkt = build_udp(v4(&ia), 5000, lh_addr, 53, b"hello beacon");
+    let mut os_lh = lh_tuns.lock().remove("dev").unwrap();
+    let got = deliver(&os_a, &mut os_lh, pkt.clone()).await;
+    assert_eq!(got, pkt);
+    // And back.
+    let reply = build_udp(lh_addr, 53, v4(&ia), 5000, b"hello alpha");
+    let mut os_a = os_a;
+    let got = deliver(&os_lh, &mut os_a, reply.clone()).await;
+    assert_eq!(got, reply);
+    // Invites carry the lighthouse list; the network info does too.
+    assert_eq!(a.engine.status().networks[0].info.lighthouses.len(), 1);
+    a.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+#[tokio::test]
+async fn replica_lighthouse_serves_and_proxies() {
+    init_tracing();
+    let (pcfg, _) = lighthouse_config("primary", Role::Primary);
+    let primary = Lighthouse::start(pcfg).await.unwrap();
+    let (mut rcfg, _) = lighthouse_config("replica", Role::Primary);
+    rcfg.overlay = Overlay::Off;
+    rcfg.role = Role::Replica(ig_proto::control::LighthouseRef {
+        host: "127.0.0.1".into(),
+        port: primary.local_addr().port(),
+        key: primary.public_key(),
+        name: "primary".into(),
+    });
+    let replica_key = rcfg.keypair.public;
+    let replica = Lighthouse::start(rcfg).await.unwrap();
+    // Register the replica on the primary; it then receives the store.
+    let r = primary.admin(AdminRequest::LighthouseAdd {
+        name: "replica".into(),
+        host: "127.0.0.1".into(),
+        port: replica.local_addr().port(),
+        key: replica_key,
+    });
+    assert!(matches!(r, AdminResponse::Lighthouses(_)), "{r:?}");
+    create_network(&primary, "dev", "10.99.2.0/24", None);
+    wait_for("replica has the network", || {
+        matches!(replica.admin(AdminRequest::NetworkList), AdminResponse::Networks(n) if n.len() == 1)
+    })
+    .await;
+    // Replica refuses admin writes.
+    assert!(matches!(
+        replica.admin(AdminRequest::NetworkCreate {
+            name: "x".into(),
+            cidr: "10.1.0.0/24".parse().unwrap(),
+            cidr6: None
+        }),
+        AdminResponse::Error { .. }
+    ));
+
+    // The invite names both lighthouses.
+    let inv = invite(&primary, "dev", 5);
+    assert_eq!(inv.extra_lighthouses.len(), 1);
+    assert_eq!(inv.extra_lighthouses[0].key, replica_key);
+
+    // alpha joins through the primary; bravo's invite is rehosted so its first
+    // lighthouse is the replica, which proxies the join to the primary.
+    let a = node("alpha", vec![], false).await;
+    let (ia, os_a) = join_with_tun(&a, &inv).await;
+    let mut inv_r = inv.clone();
+    inv_r.host = "127.0.0.1".into();
+    inv_r.port = replica.local_addr().port();
+    inv_r.lighthouse = replica_key;
+    inv_r.extra_lighthouses = vec![ig_proto::control::LighthouseRef {
+        host: "127.0.0.1".into(),
+        port: primary.local_addr().port(),
+        key: primary.public_key(),
+        name: "primary".into(),
+    }];
+    let b = node("bravo", vec![], false).await;
+    let (ib, mut os_b) = join_with_tun(&b, &inv_r).await;
+    assert_ne!(ia.address, ib.address);
+    // Both nodes hold sessions with both lighthouses.
+    wait_for("alpha sees both lighthouses up", || {
+        a.engine.status().networks[0]
+            .lighthouses
+            .iter()
+            .filter(|(_, up)| *up)
+            .count()
+            == 2
+    })
+    .await;
+    wait_for("peers", || {
+        a.engine
+            .status()
+            .peers
+            .iter()
+            .any(|p| p.hostname == "bravo")
+            && b.engine
+                .status()
+                .peers
+                .iter()
+                .any(|p| p.hostname == "alpha")
+    })
+    .await;
+    let pkt = build_udp(v4(&ia), 1, v4(&ib), 2, b"via either");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+
+    // The primary goes down: existing members keep talking, the replica keeps
+    // serving, and a new join is refused with a clear reason.
+    primary.shutdown().await;
+    wait_for("primary reported down", || {
+        a.engine.status().networks[0]
+            .lighthouses
+            .iter()
+            .any(|(_, up)| !*up)
+    })
+    .await;
+    let pkt = build_udp(v4(&ia), 3, v4(&ib), 4, b"still works");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+    wait_for("replica noticed the primary is gone", || {
+        matches!(replica.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.iter().any(|x| x.primary && !x.connected))
+    })
+    .await;
+    let c = node("charlie", vec![], false).await;
+    let err = c
+        .engine
+        .join(&inv_r)
+        .await
+        .expect_err("join must fail without the primary");
+    assert!(err.to_string().contains("primary"), "{err}");
+
+    a.engine.shutdown().await;
+    b.engine.shutdown().await;
+    c.engine.shutdown().await;
+    replica.shutdown().await;
 }

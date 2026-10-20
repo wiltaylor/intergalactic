@@ -20,14 +20,19 @@ cp /path/to/wintun/bin/amd64/wintun.dll lab/bin/
 
 ## flat: one segment, Linux and Windows nodes
 
-`lab/flat`: a lighthouse VM (`lh`), two Ubuntu 24.04 nodes (`alpha`, `bravo`) and a
-Windows Server 2025 node (`win`) on one segment.
+`lab/flat`: a lighthouse VM (`lh`), a second lighthouse VM (`lh2`), two Ubuntu 24.04 nodes
+(`alpha`, `bravo`) and a Windows Server 2025 node (`win`) on one segment. In the `dev` network
+the lighthouse is `10.90.0.2`, alpha `.3`, bravo `.4`, win `.5`; devices start at `.6`.
 
 ```sh
 cd lab/flat
 vmlab up                          # pulls the published templates on first use
 vmlab script scripts/linux.ws     # lighthouse, networks, invites, two nodes
 vmlab script scripts/windows.ws   # service install, join, DNS, traffic, restart
+vmlab script scripts/forward.ws   # public forwards through the lighthouse into the overlay
+vmlab script scripts/replica.ws   # second lighthouse, primary down and back
+vmlab script scripts/gateway.ws   # gateway devices and failover
+vmlab script scripts/gateway-more.ws  # IPv6 devices, Windows gateway
 vmlab down
 ```
 
@@ -38,25 +43,31 @@ and IPv6 by name; the `game` policy (icmp only) lets ping through and blocks TCP
 address is unreachable through the `game` interface; leaving a network removes the peer.
 
 `gateway.ws` (run after the two above) checks gateway devices: alpha and bravo restart with
-`--gateway`; the lighthouse VM itself (not a member) is registered as device `lhbox`; the
+`--gateway`; the lighthouse VM's LAN address is registered as device `lhbox`; the
 active gateway installs `ip_forward` and the `ig_gateway` nftables table; the Windows node
 fetches a file from the device by name through the gateway; alpha's link goes down and within
 the 45 s idle timeout the device moves to bravo while Windows keeps working; bravo reaches its
 own device through the kernel DNAT; alpha returns and the active gateway stays with bravo.
 
 `forward.ws` (after `windows.ws`) checks public port forwards: `ig expose 8080` on alpha
-publishes a localhost-only HTTP server; the lighthouse VM and the Windows VM (both outside the
-overlay path) fetch through the public port; a 20 MiB transfer keeps its checksum; a UDP echo
-works on a chosen public port; an admin permanent forward serves bravo's SSH banner; stopping
-alpha's daemon removes its ephemeral forwards and keeps the permanent one; `network expose
-game --deny` makes `ig expose` fail in that network.
+publishes an HTTP server bound on its overlay address; the lighthouse VM and the Windows VM
+fetch through the public port; a 20 MiB transfer keeps its checksum; a UDP echo works on a
+chosen public port; an admin permanent forward with target `self:22` serves bravo's SSH
+banner; stopping alpha's daemon removes its ephemeral forwards and keeps the permanent one;
+`network expose game --deny` makes `ig expose` fail in that network.
+
+`replica.ws` (after `forward.ws`) starts `lh2` with `--replica-of` and registers it on `lh`:
+online nodes learn `lh2` and connect to it; a new invite names both; `lh` is killed and ping
+between alpha and bravo keeps working; bravo restarts and finds its peers through `lh2`
+alone; a join through `lh2` is refused with `the primary lighthouse is unreachable`; `ig
+expose --lighthouse lh2` publishes a port on `lh2`; `lh` returns and joins work again.
 
 `gateway-more.ws` (after `gateway.ws`) adds IPv6 ULA addresses to the LAN and re-registers the
 device with `--ipv6`: the active Linux gateway gets an `ip6` nftables table, the device
 resolves with an AAAA record, and it is reached over IPv6 from the other gateway, from the
 active gateway itself and from Windows. It then reinstalls the Windows service with `--gateway`,
-registers a second device `--via` the Windows node, and alpha fetches from it through Windows
-NetNat.
+registers bravo's LAN address as a second device `--via` the Windows node, and alpha fetches
+from it through Windows NetNat.
 
 `windows.ws` checks: `ig-node service install` registers and starts the service as
 LocalSystem; the Wintun adapter carries both addresses; ping to a Linux peer over IPv4
@@ -106,9 +117,9 @@ extra (`--es invite ... --ez connect true`), accepts the VPN consent dialog, and
 node's name resolves through the VPN's DNS server; the node pings the emulator and resolves
 its name; the lighthouse lists both members.
 
-## Results on 2026-10-20
+## Results on 2026-10-21
 
-All seven scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
+All eight scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and
 Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by these labs:
 
 - The Windows service did not exit on stop: the tokio runtime waited forever during
@@ -126,3 +137,12 @@ Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by the
 - On Android, `attachTun` was called from the main thread outside the tokio runtime and
   the app crashed when the VPN came up. The mobile bindings now enter the runtime for
   every call that touches the engine.
+- The embedded lighthouse engine connected to its own lighthouse under two names
+  (`127.0.0.1` and the public host) and the two sessions replaced each other in a loop.
+  Lighthouse records are now merged by key and the engine connects through the public host.
+- Two lighthouses each picked a gateway for the same device and the choices differed, so
+  bravo's NAT tables flapped. Gateway selection is now deterministic: the first online
+  candidate in a fixed order.
+- Two devices with the same physical address on one gateway got the same reverse mapping,
+  so replies carried the wrong overlay source. A physical address is now unique per network
+  and the reverse lookup is scoped to the network of the reply's destination.

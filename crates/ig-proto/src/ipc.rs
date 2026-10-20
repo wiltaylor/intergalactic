@@ -23,6 +23,8 @@ pub enum IpcRequest {
         public_port: Option<u16>,
         target: String,
         label: String,
+        /// Lighthouse name or host to publish on; default the first connected one.
+        lighthouse: Option<String>,
     },
     Unexpose {
         id: String,
@@ -50,8 +52,12 @@ pub struct StatusReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub info: NetworkInfo,
+    /// Primary lighthouse as host:port.
     pub lighthouse: String,
     pub lighthouse_connected: bool,
+    /// Every lighthouse of the network and whether its control session is up.
+    #[serde(default)]
+    pub lighthouses: Vec<(String, bool)>,
     pub interface: Option<String>,
 }
 

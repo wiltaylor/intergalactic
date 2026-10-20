@@ -16,6 +16,14 @@ lab "ig-flat" {
     nic { segment = "lan" ip = "10.70.0.10" }
   }
 
+  vm "lh2" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 1GiB
+    nic { segment = "lan" ip = "10.70.0.13" }
+  }
+
   vm "alpha" {
     template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
     arch     = "x86_64"

@@ -419,6 +419,7 @@ async fn handle_ipc(engine: &Engine, req: IpcRequest) -> IpcResponse {
             public_port,
             target,
             label,
+            lighthouse,
         } => {
             let id = engine
                 .memberships()
@@ -426,7 +427,10 @@ async fn handle_ipc(engine: &Engine, req: IpcRequest) -> IpcResponse {
                 .find(|m| m.network.name == network || m.network.id.to_string() == network)
                 .map(|m| m.network.id);
             match id {
-                Some(id) => match engine.expose(id, proto, public_port, target, label).await {
+                Some(id) => match engine
+                    .expose(id, proto, public_port, target, label, lighthouse)
+                    .await
+                {
                     Ok(info) => IpcResponse::Exposed(info),
                     Err(e) => IpcResponse::Error {
                         message: e.to_string(),
