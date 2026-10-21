@@ -260,9 +260,7 @@ jobs:
         with:
           gradle-version: 8.10.2
       - name: Build the Rust core and the Kotlin bindings
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
-        run: android/build-rust.sh
+        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" android/build-rust.sh
       - name: Write the keystore
         env:
           KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
