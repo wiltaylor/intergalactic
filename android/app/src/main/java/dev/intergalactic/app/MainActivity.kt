@@ -381,7 +381,7 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
             val row = inflater.inflate(R.layout.item_network, networks, false)
             row.findViewById<View>(R.id.dot).setBackgroundResource(
                 when {
-                    !n.enabled -> R.drawable.dot_off
+                    !n.enabled || !IgVpnService.running -> R.drawable.dot_off
                     n.lighthouseConnected -> R.drawable.dot_on
                     else -> R.drawable.dot_warn
                 }
@@ -389,7 +389,11 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
             row.findViewById<TextView>(R.id.name).text = n.name
             val v6 = n.address6?.let { "  $it" } ?: ""
             row.findViewById<TextView>(R.id.detail).text = "${n.address}$v6"
-            val lh = if (n.lighthouseConnected) "lighthouse connected" else "lighthouse unreachable"
+            val lh = when {
+                !IgVpnService.running -> getString(R.string.tunnel_off_lower)
+                n.lighthouseConnected -> "lighthouse connected"
+                else -> "lighthouse unreachable"
+            }
             row.findViewById<TextView>(R.id.extra).text =
                 if (n.enabled) "${n.dnsName} · ${n.policySummary} · $lh" else "${n.dnsName} · ${getString(R.string.network_off)}"
             row.alpha = if (n.enabled) 1f else 0.6f
@@ -409,6 +413,10 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
 
     private fun renderPeers(list: List<MobilePeer>) {
         peers.removeAllViews()
+        if (!IgVpnService.running) {
+            peers.addView(emptyRow(getString(R.string.peers_when_off)))
+            return
+        }
         if (list.isEmpty()) {
             peers.addView(emptyRow(getString(R.string.no_peers)))
             return

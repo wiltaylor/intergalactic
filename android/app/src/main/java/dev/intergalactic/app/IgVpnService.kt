@@ -144,6 +144,7 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
             else -> {
                 startForeground(NOTIFICATION_ID, buildNotification(statusText()))
                 val engine = EngineHolder.ensureStarted(this)
+                engine.resume()
                 rebuild(engine.networks())
                 running = true
                 return START_STICKY
@@ -249,6 +250,8 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
 
     private fun teardown() {
         running = false
+        // Off means off: no lighthouse sessions, no peers, until the next start.
+        EngineHolder.engine?.pause()
         EngineHolder.engine?.detachTun()
         tun?.close()
         tun = null

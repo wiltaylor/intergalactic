@@ -415,6 +415,7 @@ impl Inner {
                 relay_only: false,
                 gateway: false,
                 upstream_dns: Vec::new(),
+                start_paused: false,
             },
             Arc::new(NoProtector),
         )

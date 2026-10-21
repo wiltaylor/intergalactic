@@ -65,6 +65,9 @@ pub struct EngineConfig {
     /// network's servers here because its resolver cannot split DNS; see
     /// [`Engine::set_upstream_dns`].
     pub upstream_dns: Vec<SocketAddr>,
+    /// Start without connecting to any lighthouse (see [`Engine::resume`]).
+    /// Memberships are kept; the embedder calls `resume` when its tunnel goes up.
+    pub start_paused: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -247,8 +250,10 @@ impl Engine {
         let timer_task = tokio::spawn(timer_loop(inner.clone()));
         inner.tasks.lock().extend([udp_task, timer_task]);
 
-        for lh in by_lighthouse.into_keys() {
-            inner.ensure_lighthouse(lh);
+        if !config.start_paused {
+            for lh in by_lighthouse.into_keys() {
+                inner.ensure_lighthouse(lh);
+            }
         }
         inner.rebuild_dns();
         tracing::info!(node = %inner.keypair.public, udp_port, dual_stack, "engine started");
@@ -527,6 +532,19 @@ impl Engine {
         self.inner.ensure_lighthouse(addr);
     }
 
+    /// Disconnect from every lighthouse and forget every peer. Memberships and
+    /// addresses stay; this is "tunnel off" on a device. [`Engine::resume`]
+    /// reconnects.
+    pub fn pause(&self) {
+        self.inner.pause();
+    }
+
+    /// Reconnect to every lighthouse of every membership after [`Engine::pause`]
+    /// (or a paused start). Peers come back with the lighthouses' state pushes.
+    pub fn resume(&self) {
+        self.inner.resume();
+    }
+
     /// Tell every lighthouse our local addresses may have changed.
     /// Replace the upstream resolvers used for names outside the overlay
     /// zones. Takes effect for the next query; in-flight forwards finish
@@ -637,6 +655,47 @@ impl Inner {
         let me = self.me.lock().upgrade();
         if let Some(me) = me {
             me.ensure_lighthouse(addr);
+        }
+    }
+
+    pub fn pause(&self) {
+        let handles: Vec<Arc<LighthouseHandle>> =
+            self.lighthouses.lock().drain().map(|(_, h)| h).collect();
+        for h in &handles {
+            let _ = h.cmd.try_send(ControlCmd::Shutdown);
+        }
+        {
+            let mut t = self.peers.write();
+            t.by_id.clear();
+            t.by_index.clear();
+            t.rebuild_routes();
+        }
+        self.rebuild_dns();
+        tracing::info!(
+            lighthouses = handles.len(),
+            "paused: disconnected from every lighthouse"
+        );
+        self.emit(EngineEvent::PeersChanged);
+        for h in handles {
+            self.emit(EngineEvent::LighthouseStatus {
+                lighthouse: h.addr.clone(),
+                connected: false,
+            });
+        }
+    }
+
+    pub fn resume(self: &Arc<Self>) {
+        let mut lhs: Vec<LighthouseAddr> = self
+            .networks
+            .read()
+            .values()
+            .flat_map(|e| e.membership.lighthouses())
+            .collect();
+        lhs.sort_by_key(|l| l.host_port());
+        lhs.dedup();
+        tracing::info!(lighthouses = lhs.len(), "resuming");
+        for lh in lhs {
+            self.ensure_lighthouse(lh);
         }
     }
 

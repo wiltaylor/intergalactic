@@ -36,6 +36,13 @@ Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assemb
 `lab/android/run.sh` runs it on an API 35 x86_64 emulator against a lighthouse and a Linux
 node: VPN up, IPv4 and IPv6 traffic both ways, peer DNS inside the VPN.
 
+## The tunnel switch
+
+Off means off: the service pauses the engine, which closes every lighthouse session and
+forgets its peers, and removes the VPN interface. Memberships stay. On resumes the engine,
+which reconnects to every lighthouse and gets the peers back with the state pushes. The app
+starts the engine paused when the tunnel was off, so an idle phone holds no sessions.
+
 ## Turning a network off on one device
 
 Each network row has a switch. Off keeps the membership and the address (the lighthouse still

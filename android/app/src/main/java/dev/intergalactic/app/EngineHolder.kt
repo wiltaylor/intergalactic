@@ -37,9 +37,12 @@ object EngineHolder : MobileCallbacks {
         stateFile = File(context.filesDir, "state.json")
         val state = if (stateFile.exists()) stateFile.readText() else generateState().also { stateFile.writeText(it) }
         val hostname = (Build.MODEL ?: "android").replace(' ', '-')
-        val e = MobileEngine(state, hostname, this)
+        // Off stays off across app restarts: no lighthouse is contacted until the
+        // tunnel is turned on (IgVpnService resumes the engine then).
+        val connect = IgVpnService.wanted(context)
+        val e = MobileEngine(state, hostname, this, connect)
         engine = e
-        Log.i(TAG, "engine started, node ${e.nodeId()}")
+        Log.i(TAG, "engine started, node ${e.nodeId()}, connect=$connect")
         return e
     }
 

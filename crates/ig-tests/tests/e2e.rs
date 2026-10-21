@@ -112,6 +112,7 @@ async fn node_with_key(
             relay_only,
             gateway: false,
             upstream_dns: Vec::new(),
+            start_paused: false,
         },
         Arc::new(NoProtector),
     )
@@ -705,6 +706,7 @@ async fn gateway_translates_device_traffic_and_fails_over() {
                 relay_only: false,
                 gateway,
                 upstream_dns: Vec::new(),
+                start_paused: false,
             },
             Arc::new(NoProtector),
         )
@@ -837,6 +839,7 @@ async fn ipv6_devices_are_translated_too() {
                 relay_only: false,
                 gateway,
                 upstream_dns: Vec::new(),
+                start_paused: false,
             },
             Arc::new(NoProtector),
         )

@@ -217,6 +217,7 @@ async fn run(
             relay_only: opts.relay_only,
             gateway: opts.gateway,
             upstream_dns: Vec::new(),
+            start_paused: false,
         },
         Arc::new(NoProtector),
     )

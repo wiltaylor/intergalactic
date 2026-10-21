@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 ROOT=../..
 LH_BIN="$ROOT/target/release/ig-lighthouse"
 HOST_IP="${IG_LH_HOST:-$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')}"
-PORT=17777
+PORT=17778
 APK="$ROOT/android/app/build/outputs/apk/debug/app-debug.apk"
 PKG=dev.intergalactic.app
 AVD="${IG_AVD:-ig}"

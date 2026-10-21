@@ -135,10 +135,13 @@ pub fn describe_invite(invite: String) -> Result<String, MobileError> {
 impl MobileEngine {
     /// Start the engine from persisted state JSON (see `generate_state`).
     #[uniffi::constructor]
+    /// `connect = false` starts with the tunnel off: memberships are loaded but
+    /// no lighthouse is contacted until [`MobileEngine::resume`].
     pub fn new(
         state_json: String,
         hostname: String,
         callbacks: Arc<dyn MobileCallbacks>,
+        connect: bool,
     ) -> Result<Arc<Self>, MobileError> {
         init_logging();
         let state: NodeState = serde_json::from_str(&state_json).map_err(err)?;
@@ -162,6 +165,7 @@ impl MobileEngine {
             // The app supplies the underlying network's resolvers through
             // `set_upstream_dns` once the VPN is up.
             upstream_dns: Vec::new(),
+            start_paused: !connect,
         };
         let protector = Arc::new(Protector(callbacks.clone()));
         let (engine, mut events) = rt.block_on(Engine::start(config, protector)).map_err(err)?;
@@ -242,6 +246,18 @@ impl MobileEngine {
 
     /// Call when connectivity changes (Wi-Fi to cellular) so lighthouses learn
     /// the new addresses quickly.
+    /// Tunnel off: disconnect from every lighthouse and drop the peers.
+    pub fn pause(&self) {
+        let _guard = self.rt.enter();
+        self.engine.pause();
+    }
+
+    /// Tunnel on: reconnect to every lighthouse of every membership.
+    pub fn resume(&self) {
+        let _guard = self.rt.enter();
+        self.engine.resume();
+    }
+
     pub fn network_changed(&self) {
         let _guard = self.rt.enter();
         self.engine.refresh_endpoints();
