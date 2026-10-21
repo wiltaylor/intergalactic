@@ -420,12 +420,23 @@ impl Inner {
             Arc::new(NoProtector),
         )
         .await?;
-        // Our memberships come back with the Resume reply from ourselves. Use the
-        // same name the store lists us under so the engine sees one lighthouse.
-        let _ = port;
+        // Our memberships come back with the Resume reply from ourselves. Connect
+        // over loopback so the session never depends on resolving our own public
+        // name; the engine merges lighthouses by key, so the public name that
+        // arrives in NetworkInfo later is recognised as this same session.
+        let ip = self.config.listen.ip();
+        let host = if ip.is_unspecified() {
+            if ip.is_ipv6() && !self.dual_stack {
+                "::1".to_string()
+            } else {
+                "127.0.0.1".to_string()
+            }
+        } else {
+            ip.to_string()
+        };
         engine.connect_lighthouse(ig_core::LighthouseAddr {
-            host: self.config.public_host.clone(),
-            port: self.config.public_port,
+            host,
+            port,
             key: self.config.keypair.public,
         });
         *self.engine.lock() = Some(engine);

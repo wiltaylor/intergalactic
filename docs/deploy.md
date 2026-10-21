@@ -246,6 +246,10 @@ a dedicated short-lived network and delete the whole network afterwards.
   invite's host resolves. `RUST_LOG=debug ig-node run` shows the reason.
 - No interface created: on Linux check `CAP_NET_ADMIN`; on Windows check `wintun.dll` and
   Administrator rights.
+- `journalctl -u ig-lighthouse` shows `failed to lookup address information`: the release
+  binaries are static (musl) and resolve names only through `/etc/resolv.conf`, not through
+  nss. On a systemd-resolved host, make sure `/etc/resolv.conf` names a server, for
+  example `ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf`.
 - `lighthouse list` shows a peer `down`: check TCP 7777 between the two lighthouses in both
   directions; each one dials the other. Nodes keep working in the meantime.
 - A forward does not answer: check that `nft list table ip ig_forwards` on the lighthouse
