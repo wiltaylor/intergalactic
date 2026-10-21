@@ -58,7 +58,8 @@ export IG_ANDROID_KEYSTORE_PASSWORD=... IG_ANDROID_KEY_ALIAS=intergalactic
 IG_VERSION=0.0.0-dev gradle assembleRelease      # app/build/outputs/apk/release/app-release.apk
 ```
 
-`IG_VERSION` sets `versionName`; `versionCode` is derived from it so a stable release
+After an update, and after a reboot, `BootReceiver` brings the tunnel back when it was on
+before (the VPN consent survives both). `IG_VERSION` sets `versionName`; `versionCode` is derived from it so a stable release
 outranks its own pre-release. Debug builds use the debug key and cannot be updated in place
 by a release: uninstall them first.
 

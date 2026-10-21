@@ -40,12 +40,25 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
         @Volatile var running = false
             private set
 
+        private const val PREFS = "vpn"
+        private const val KEY_WANTED = "wanted"
+
+        /** Whether the user left the tunnel on; [BootReceiver] restores it then. */
+        fun wanted(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_WANTED, false)
+
+        private fun setWanted(context: Context, on: Boolean) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_WANTED, on).apply()
+        }
+
         fun start(context: Context) {
+            setWanted(context, true)
             val i = Intent(context, IgVpnService::class.java).setAction(ACTION_START)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i) else context.startService(i)
         }
 
         fun stop(context: Context) {
+            setWanted(context, false)
             context.startService(Intent(context, IgVpnService::class.java).setAction(ACTION_STOP))
         }
     }

@@ -181,7 +181,8 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
             downloading = false
             result.onSuccess { file ->
                 updateInstall.isEnabled = true
-                updateDetail.text = getString(R.string.update_detail, BuildConfig.VERSION_NAME)
+                // Queued behind the last progress post, so it is not overwritten.
+                handler.post { updateDetail.text = getString(R.string.update_detail, BuildConfig.VERSION_NAME) }
                 if (!Updater.install(this@MainActivity, file)) showMessage(getString(R.string.update_allow))
             }.onFailure {
                 updateInstall.isEnabled = true
