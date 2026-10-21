@@ -1,0 +1,256 @@
+name: CI
+
+# Pushes run only for main: every other branch reaches CI through its pull
+# request, so a pushed PR branch is not tested twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only by default; the one job that writes (release) asks for it.
+permissions:
+  contents: read
+
+# A newer push to a PR branch supersedes the run in flight. main never
+# cancels, and every main commit gets its own group, so a queued run carrying
+# a publish trailer is never dropped in favour of a later commit.
+concurrency:
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Merge bar ─────────────────────────────────────────────────────────────
+  # The same gate as `just ci::check` locally (.just/ci/mod.just): format,
+  # clippy with warnings as errors, unit tests and the loopback end-to-end
+  # tests. The VM labs under lab/ need KVM and are not run here.
+  check:
+    name: fmt + lint + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@just
+      - uses: Swatinem/rust-cache@v2
+      - run: just ci::check
+
+  # ── Version ───────────────────────────────────────────────────────────────
+  # Trailer-gated: a release only happens when HEAD carries a publish trailer.
+  #   pre-release: true   → X.Y.Z-alpha, marked as a GitHub pre-release
+  #   release: true       → X.Y.Z stable
+  # Neither → CI runs tests only. The version is bumped from the last v* tag,
+  # scanning conventional-commit subjects since that tag for the bump level
+  # (0.x semantics: a breaking change bumps the minor, not the major). With no
+  # tag yet, the first release takes the workspace version from Cargo.toml.
+  version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      prerelease: ${{ steps.calc.outputs.prerelease }}
+      do_release: ${{ steps.calc.outputs.do_release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: calc
+        run: |
+          IS_RELEASE=$(git log -1 --format='%(trailers:key=release,valueonly)')
+          IS_PRERELEASE=$(git log -1 --format='%(trailers:key=pre-release,valueonly)')
+
+          if [[ "$IS_RELEASE" != "true" && "$IS_PRERELEASE" != "true" ]]; then
+            echo "do_release=false" >> "$GITHUB_OUTPUT"
+            echo "No release/pre-release trailer on HEAD — tests only." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          LAST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
+          if [[ -z "$LAST_TAG" ]]; then
+            # First release: the workspace version as it stands, no bump.
+            BASE=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+            BUMP="none"
+          else
+            VER="${LAST_TAG#v}"; VER="${VER%%-*}"
+            IFS='.' read -r PREV_MAJOR PREV_MINOR PREV_PATCH <<< "$VER"
+            RANGE="${LAST_TAG}..HEAD"
+
+            BUMP="none"
+            while IFS= read -r HASH; do
+              SUBJECT=$(git log -1 --format='%s' "$HASH")
+              BODY=$(git log -1 --format='%b' "$HASH")
+              if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qiE '^BREAKING[ -]CHANGE:'; then
+                BUMP="major"
+              elif echo "$SUBJECT" | grep -qE '^feat(\(.+\))?:' && [[ "$BUMP" != "major" ]]; then
+                BUMP="minor"
+              elif echo "$SUBJECT" | grep -qE '^(fix|perf|refactor|build|ci|docs|style|test|chore|revert)(\(.+\))?:' && [[ "$BUMP" == "none" ]]; then
+                BUMP="patch"
+              fi
+            done < <(git log --format='%H' "$RANGE")
+            [[ "$BUMP" == "none" ]] && BUMP="patch"
+
+            case "$BUMP" in
+              major)
+                if [[ "$PREV_MAJOR" -eq 0 ]]; then MAJOR=0; MINOR=$((PREV_MINOR + 1)); PATCH=0
+                else MAJOR=$((PREV_MAJOR + 1)); MINOR=0; PATCH=0; fi ;;
+              minor) MAJOR=$PREV_MAJOR; MINOR=$((PREV_MINOR + 1)); PATCH=0 ;;
+              patch) MAJOR=$PREV_MAJOR; MINOR=$PREV_MINOR; PATCH=$((PREV_PATCH + 1)) ;;
+            esac
+          fi
+
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          PRERELEASE=false
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            VERSION="${VERSION}-alpha"
+            PRERELEASE=true
+          fi
+
+          echo "Calculated version: $VERSION (bump=$BUMP, prerelease=$PRERELEASE, from ${LAST_TAG:-none})"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "do_release=true" >> "$GITHUB_OUTPUT"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## Release
+
+          | | |
+          |---|---|
+          | **Version** | \`$VERSION\` |
+          | **Bump** | $BUMP |
+          | **Pre-release** | $PRERELEASE |
+          | **Previous tag** | \`${LAST_TAG:-none}\` |
+          SUMMARY
+
+  # ── Binaries ──────────────────────────────────────────────────────────────
+  # The three binaries for every platform the docs install on: static Linux
+  # builds for x86_64 and aarch64 (a VPS, a home server, a Raspberry Pi) and
+  # the Windows node and CLI, cross-built with mingw exactly as the lab does.
+  # Version-stamped so `--version` matches the release. The asset names are
+  # `<bin>-<version>-<platform>`; SHA256SUMS covers them all.
+  build:
+    name: Build (${{ matrix.suffix }})
+    needs: [version, check]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            suffix: linux-x86_64
+            bins: ig ig-node ig-lighthouse
+            ext: ""
+          - target: aarch64-unknown-linux-musl
+            suffix: linux-aarch64
+            bins: ig ig-node ig-lighthouse
+            ext: ""
+          - target: x86_64-pc-windows-gnu
+            suffix: windows-x86_64
+            bins: ig ig-node
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
+      - name: Install the musl C toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install mingw-w64
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+      - name: Stamp version
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          sed -i -E '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"$/version = "'"$V"'"/' Cargo.toml
+          grep -n '^version' Cargo.toml | head -1
+      - name: Build
+        run: |
+          PKGS=""
+          for b in ${{ matrix.bins }}; do
+            case "$b" in
+              ig) PKGS="$PKGS -p ig-cli" ;;
+              *) PKGS="$PKGS -p $b" ;;
+            esac
+          done
+          if [[ "${{ matrix.target }}" == aarch64-* ]]; then
+            cross build --release --target ${{ matrix.target }} $PKGS
+          else
+            cargo build --release --target ${{ matrix.target }} $PKGS
+          fi
+      - name: Smoke-test the binaries
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          for b in ${{ matrix.bins }}; do
+            target/${{ matrix.target }}/release/$b --version
+          done
+          file target/${{ matrix.target }}/release/ig-node | grep -q 'static'
+      - name: Stage assets
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p dist
+          for b in ${{ matrix.bins }}; do
+            cp "target/${{ matrix.target }}/release/$b${{ matrix.ext }}" "dist/$b-$V-${{ matrix.suffix }}${{ matrix.ext }}"
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.suffix }}
+          path: dist/*
+          retention-days: 1
+
+  # ── Release ───────────────────────────────────────────────────────────────
+  # Gather the binaries and the systemd units, checksum them, tag the commit
+  # and cut a GitHub (pre-)release with everything attached.
+  release:
+    name: Create GitHub release
+    needs: [version, build]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Never cancelled: a half-created release would outlive the cancel.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+      - name: Add the deploy units and checksums
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          tar -C deploy -czf "dist/intergalactic-$V-systemd.tar.gz" .
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+      - name: Tag
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v$V"
+          git push origin "v$V"
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

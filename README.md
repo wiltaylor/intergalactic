@@ -30,6 +30,13 @@ cargo build --release --target x86_64-pc-windows-gnu -p ig-cli -p ig-node
 
 `just` recipes exist for these steps. Run `just` to list them.
 
+Prebuilt binaries are on the [Releases](https://github.com/wiltaylor/intergalactic/releases)
+page: `ig`, `ig-node` and `ig-lighthouse` as static Linux builds for x86_64 and aarch64, `ig.exe`
+and `ig-node.exe` for Windows, the systemd units, and `SHA256SUMS`. A release is cut by CI when a
+commit on `main` carries the trailer `pre-release: true` (an `-alpha` pre-release) or
+`release: true` (stable); the version is bumped from the last tag by the conventional-commit
+subjects since then.
+
 ## Quick start
 
 ### 1. Lighthouse on the VPS
