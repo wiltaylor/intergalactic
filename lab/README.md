@@ -125,6 +125,14 @@ resolves with the VPN up, through the engine's forwarder to the underlying netwo
 resolver; the node pings the emulator and resolves its name; the lighthouse lists both
 members.
 
+## Physical phone, 2026-10-21
+
+A Samsung SM-F976B on the same Wi-Fi as the host joined through the host lighthouse
+(`--no-overlay`, as in the Android lab) with the debug APK installed from a browser. The NATed
+Linux node reached the phone over IPv4 and IPv6 on a **direct** path (hole punched through the
+vmlab NAT), resolved its name, and the phone opened a page on the node by name and a public
+site with the VPN connected.
+
 ## Results on 2026-10-21
 
 All eight scenarios pass on this machine (vmlab 0.30.0-alpha, KVM, Ubuntu 24.04 and

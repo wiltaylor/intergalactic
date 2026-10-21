@@ -120,7 +120,7 @@ punching through two netfilter NATs, and the Android app on an emulator. See
 
 ## Status and limits
 
-- The Android app has been verified on an emulator (see `lab/README.md`), not yet on a physical phone.
+- The Android app has been verified on an emulator (see `lab/README.md`) and on one physical phone (Samsung SM-F976B, Android 15, over Wi-Fi): join, direct path to a NATed Linux node, IPv4 and IPv6, overlay names and public names with the VPN up.
 - Each lighthouse must be reachable over IPv4 or IPv6 from every member. Members on IPv4-only networks can still talk to IPv6 members through the lighthouse relay.
 - Lighthouses favour availability over strict consistency. Two lighthouses that cannot reach each other both keep working; when they meet again the newer record wins per item, and an invite's use count can be exceeded by the number of lighthouses that consumed it while apart.
 - Lighthouse-wide settings (default relay limit, forward range, DNS domain) are set per lighthouse on its command line and are not replicated.
