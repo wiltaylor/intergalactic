@@ -242,8 +242,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+      # The runner image ships the SDK and its command-line tools at $ANDROID_HOME.
+      - name: Install the SDK packages
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}" > /dev/null
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -256,7 +261,7 @@ jobs:
           gradle-version: 8.10.2
       - name: Build the Rust core and the Kotlin bindings
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
         run: android/build-rust.sh
       - name: Write the keystore
         env:
@@ -280,7 +285,7 @@ jobs:
         run: |
           V="${{ needs.version.outputs.version }}"
           APK=android/app/build/outputs/apk/release/app-release.apk
-          "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | head -3
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | head -3
           mkdir -p dist
           cp "$APK" "dist/intergalactic-$V.apk"
       - uses: actions/upload-artifact@v7
