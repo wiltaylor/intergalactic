@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.jpg" alt="Intergalactic" width="760">
+  <img src="docs/logo-robot.jpg" alt="Intergalactic" width="760">
 </p>
 
 # Intergalactic
