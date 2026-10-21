@@ -175,7 +175,9 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
     private fun statusText(): String {
         val status = runCatching { EngineHolder.engine?.status() }.getOrNull() ?: return getString(R.string.notification_no_networks)
         if (status.networks.isEmpty()) return getString(R.string.notification_no_networks)
-        val nets = status.networks.joinToString(", ") { it.name }
+        val on = status.networks.filter { it.enabled }
+        if (on.isEmpty()) return getString(R.string.networks_on, 0, status.networks.size)
+        val nets = on.joinToString(", ") { it.name }
         val online = status.peers.count { it.online }
         return "$nets · " + getString(R.string.peers_online, online, status.peers.size)
     }
@@ -183,8 +185,10 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
     /** What the current interface was built from; a push that changes nothing here keeps it. */
     private var tunConfig: String? = null
 
-    private fun rebuild(networks: List<MobileNetwork>) {
+    private fun rebuild(all: List<MobileNetwork>) {
         val engine = EngineHolder.engine ?: return
+        // A network turned off on this device gets no address, route or DNS server.
+        val networks = all.filter { it.enabled }
         if (networks.isEmpty()) {
             Log.i(TAG, "no networks; tearing down interface")
             engine.detachTun()

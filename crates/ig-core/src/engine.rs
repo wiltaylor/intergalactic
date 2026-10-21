@@ -272,6 +272,30 @@ impl Engine {
         self.inner.memberships()
     }
 
+    /// Turn a joined network on or off on this device. Off keeps the membership
+    /// but drops every packet for it; the embedder removes its interface and
+    /// routes on the `MembershipsChanged` event that follows.
+    pub fn set_network_enabled(
+        &self,
+        network: NetworkId,
+        enabled: bool,
+    ) -> Result<(), EngineError> {
+        {
+            let mut nets = self.inner.networks.write();
+            let e = nets
+                .get_mut(&network)
+                .ok_or(EngineError::UnknownNetwork(network))?;
+            if e.membership.enabled == enabled {
+                return Ok(());
+            }
+            e.membership.enabled = enabled;
+        }
+        tracing::info!(%network, enabled, "network toggled");
+        self.inner
+            .emit(EngineEvent::MembershipsChanged(self.inner.memberships()));
+        Ok(())
+    }
+
     /// Join a network with an invite. Resolves once the lighthouse has accepted.
     pub async fn join(&self, invite: &Invite) -> Result<NetworkInfo, EngineError> {
         let all = LighthouseAddr::all_from_invite(invite);
@@ -865,6 +889,7 @@ impl Inner {
                         lighthouse: lh.clone(),
                         extra_lighthouses: extra.clone(),
                         network: info.clone(),
+                        enabled: true,
                     },
                     tun: None,
                 },
@@ -938,6 +963,7 @@ impl Inner {
                                     .filter(|l| *l != h.addr)
                                     .collect(),
                                 network: info.clone(),
+                                enabled: true,
                             },
                             tun: None,
                         },
@@ -1237,6 +1263,9 @@ impl Inner {
         let Some(src) = packet::src(pkt) else {
             return;
         };
+        if self.in_disabled_network(&src) {
+            return;
+        }
         // Gateway: a reply from a device we front comes back from the kernel
         // with the physical source; put the overlay address on it first.
         let mut owned: Vec<u8>;
@@ -1459,6 +1488,10 @@ impl Inner {
         let Some(entry) = nets.get(&net) else {
             return false;
         };
+        if !entry.membership.enabled {
+            tracing::trace!(network = %entry.membership.network.name, "network is off on this device");
+            return false;
+        }
         let device = entry
             .membership
             .network
@@ -1509,6 +1542,14 @@ impl Inner {
             .read()
             .values()
             .any(|e| e.membership.network.addresses().contains(addr))
+    }
+
+    /// True when `addr` is this node's address in a network that is turned off.
+    fn in_disabled_network(&self, addr: &IpAddr) -> bool {
+        self.networks
+            .read()
+            .values()
+            .any(|e| !e.membership.enabled && e.membership.network.addresses().contains(addr))
     }
 
     fn tick(&self, out: &mut [u8]) {
@@ -1580,6 +1621,7 @@ impl Inner {
                         .map(|l| (l.host_port(), lhs.get(l).copied().unwrap_or(false)))
                         .collect(),
                     interface: e.tun.as_ref().map(|t| t.dev.name()),
+                    enabled: e.membership.enabled,
                 })
                 .collect();
             v.sort_by(|a, b| a.info.name.cmp(&b.info.name));

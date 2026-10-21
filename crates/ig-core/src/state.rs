@@ -62,6 +62,14 @@ pub struct Membership {
     #[serde(default)]
     pub extra_lighthouses: Vec<LighthouseAddr>,
     pub network: NetworkInfo,
+    /// Off: the membership and address are kept, but this device takes no part
+    /// in the network until it is turned on again (no interface, no traffic).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Membership {

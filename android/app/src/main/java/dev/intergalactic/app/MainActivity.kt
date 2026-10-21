@@ -358,9 +358,12 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
                 else -> R.drawable.dot_warn
             }
         )
+        val on = status.networks.filter { it.enabled }
         statusDetail.text = when {
             status.networks.isEmpty() -> getString(R.string.no_networks)
-            else -> status.networks.joinToString(", ") { it.name } + " · " + getString(R.string.peers_online, online, status.peers.size)
+            on.isEmpty() -> getString(R.string.networks_on, 0, status.networks.size)
+            on.size < status.networks.size -> on.joinToString(", ") { it.name } + " · " + getString(R.string.networks_on, on.size, status.networks.size) + " · " + getString(R.string.peers_online, online, status.peers.size)
+            else -> on.joinToString(", ") { it.name } + " · " + getString(R.string.peers_online, online, status.peers.size)
         }
 
         renderNetworks(status.networks)
@@ -376,12 +379,29 @@ class MainActivity : AppCompatActivity(), EngineHolder.Listener {
         val inflater = LayoutInflater.from(this)
         for (n in list) {
             val row = inflater.inflate(R.layout.item_network, networks, false)
-            row.findViewById<View>(R.id.dot).setBackgroundResource(if (n.lighthouseConnected) R.drawable.dot_on else R.drawable.dot_warn)
+            row.findViewById<View>(R.id.dot).setBackgroundResource(
+                when {
+                    !n.enabled -> R.drawable.dot_off
+                    n.lighthouseConnected -> R.drawable.dot_on
+                    else -> R.drawable.dot_warn
+                }
+            )
             row.findViewById<TextView>(R.id.name).text = n.name
             val v6 = n.address6?.let { "  $it" } ?: ""
             row.findViewById<TextView>(R.id.detail).text = "${n.address}$v6"
             val lh = if (n.lighthouseConnected) "lighthouse connected" else "lighthouse unreachable"
-            row.findViewById<TextView>(R.id.extra).text = "${n.dnsName} · ${n.policySummary} · $lh"
+            row.findViewById<TextView>(R.id.extra).text =
+                if (n.enabled) "${n.dnsName} · ${n.policySummary} · $lh" else "${n.dnsName} · ${getString(R.string.network_off)}"
+            row.alpha = if (n.enabled) 1f else 0.6f
+            val sw = row.findViewById<MaterialSwitch>(R.id.enabled)
+            sw.isChecked = n.enabled
+            sw.setOnCheckedChangeListener { _, checked ->
+                scope.launch {
+                    val r = withContext(Dispatchers.IO) { runCatching { EngineHolder.engine?.setNetworkEnabled(n.id, checked) } }
+                    r.onFailure { showMessage(it.message ?: "toggle failed") }
+                    render()
+                }
+            }
             row.findViewById<ImageButton>(R.id.leave).setOnClickListener { confirmLeave(n) }
             networks.addView(row)
         }

@@ -59,6 +59,8 @@ pub struct MobileNetwork {
     pub lighthouse_connected: bool,
     pub policy_summary: String,
     pub relay_limit: String,
+    /// False when the user turned this network off on this device.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -210,6 +212,7 @@ impl MobileEngine {
                     .map(ig_core::LighthouseAddr::from_ref)
                     .collect(),
                 network: info,
+                enabled: true,
             },
             true,
         ))
@@ -259,8 +262,21 @@ impl MobileEngine {
         let st = self.engine.status();
         st.networks
             .iter()
-            .map(|n| network_record(&n.info, &n.lighthouse, n.lighthouse_connected))
+            .map(|n| network_record(&n.info, &n.lighthouse, n.lighthouse_connected, n.enabled))
             .collect()
+    }
+
+    /// Turn a joined network on or off on this device (the membership stays).
+    pub fn set_network_enabled(
+        &self,
+        network_id: String,
+        enabled: bool,
+    ) -> Result<(), MobileError> {
+        let _g = self.rt.enter();
+        let id: ig_proto::NetworkId = network_id.parse().map_err(|_| MobileError::Failed {
+            reason: "bad network id".into(),
+        })?;
+        self.engine.set_network_enabled(id, enabled).map_err(err)
     }
 
     pub fn status(&self) -> MobileStatus {
@@ -350,13 +366,14 @@ fn policy_summary(p: &ig_proto::Policy) -> String {
 }
 
 fn to_mobile_network(m: &ig_core::Membership, connected: bool) -> MobileNetwork {
-    network_record(&m.network, &m.lighthouse.host_port(), connected)
+    network_record(&m.network, &m.lighthouse.host_port(), connected, m.enabled)
 }
 
 fn network_record(
     n: &ig_proto::control::NetworkInfo,
     lighthouse: &str,
     connected: bool,
+    enabled: bool,
 ) -> MobileNetwork {
     MobileNetwork {
         id: n.id.to_string(),
@@ -375,6 +392,7 @@ fn network_record(
         lighthouse_connected: connected,
         policy_summary: policy_summary(&n.policy),
         relay_limit: n.relay_limit.to_string(),
+        enabled,
     }
 }
 

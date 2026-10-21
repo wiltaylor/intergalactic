@@ -36,6 +36,17 @@ Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assemb
 `lab/android/run.sh` runs it on an API 35 x86_64 emulator against a lighthouse and a Linux
 node: VPN up, IPv4 and IPv6 traffic both ways, peer DNS inside the VPN.
 
+## Turning a network off on one device
+
+Each network row has a switch. Off keeps the membership and the address (the lighthouse still
+lists the device) but takes the network off this device: the VPN interface is rebuilt
+without its address, route and DNS server, and the engine drops every packet for it in both
+directions, so peers cannot reach the device there. The flag is stored with the membership
+(`Membership.enabled`) and survives restarts. The desktop daemon honours the same flag (no
+interface for a network that is off); the `ig` CLI has no command for it yet. After a network
+is turned back on, peers that kept sending while it was off need up to about fifteen seconds
+to re-handshake.
+
 ## Releases, signing and in-app updates
 
 CI builds the APK on every release (`.github/workflows/ci.yml`, job `build-android`) and

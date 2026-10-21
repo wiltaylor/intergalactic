@@ -59,6 +59,13 @@ pub struct NetworkStatus {
     #[serde(default)]
     pub lighthouses: Vec<(String, bool)>,
     pub interface: Option<String>,
+    /// False when the network is turned off on this device.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

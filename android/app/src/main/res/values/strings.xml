@@ -17,6 +17,8 @@
     <string name="tunnel_on">Connected</string>
     <string name="tunnel_off">Tunnel off</string>
     <string name="tunnel_starting">Connecting…</string>
+    <string name="network_off">off on this device</string>
+    <string name="networks_on">%1$d of %2$d networks on</string>
     <string name="no_networks">No networks yet. Tap Join network and scan an invite.</string>
     <string name="no_peers">No peers in your networks yet.</string>
     <string name="peers_online">%1$d of %2$d peers online</string>

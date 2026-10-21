@@ -359,8 +359,12 @@ fn reconcile(
     dns_mode: DnsMode,
     dns_plan: &mut Option<DnsPlan>,
 ) {
-    let wanted: HashMap<NetworkId, Membership> =
-        memberships.into_iter().map(|m| (m.network.id, m)).collect();
+    // A network turned off on this device gets no interface.
+    let wanted: HashMap<NetworkId, Membership> = memberships
+        .into_iter()
+        .filter(|m| m.enabled)
+        .map(|m| (m.network.id, m))
+        .collect();
     let stale: Vec<NetworkId> = tuns
         .iter()
         .filter(|(id, (m, _))| {
