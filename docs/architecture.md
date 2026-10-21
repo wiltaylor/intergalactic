@@ -19,7 +19,7 @@ Noise transport messages so peer lists of any size fit.
 
 | Direction | Message | Purpose |
 | --- | --- | --- |
-| node → LH | `ClientHello {hostname, os, gateway, replica}` | First message; `replica` marks a lighthouse-to-lighthouse link |
+| node → LH | `ClientHello {hostname, os, gateway, peer}` | First message; `peer` marks a lighthouse-to-lighthouse link |
 | node → LH | `Join {network, token}` | Consume an invite, get an address |
 | node → LH | `Leave`, `Resume` | Leave, or ask for all memberships after reconnect |
 | node → LH | `Endpoints {local}` | LAN candidate endpoints |
@@ -29,8 +29,8 @@ Noise transport messages so peer lists of any size fit.
 | node → LH | `Expose`, `Unexpose` | Ephemeral public forwards |
 | LH → node | `Removed` | Admin removed us or deleted the network |
 
-`NetworkInfo.lighthouses` lists every lighthouse of the network (key, host, port, primary
-flag). A node connects to all of them and sends its joins and endpoints to each. Duplicate
+`NetworkInfo.lighthouses` lists every lighthouse of the network (key, host, port,
+name). A node connects to all of them and sends its joins and endpoints to each. Duplicate
 lighthouse records are merged by key.
 
 The lighthouse coalesces changes for 150 ms and then pushes `NetworkState` to every online member.
@@ -169,27 +169,45 @@ is one route change.
 A lighthouse runs the same engine as a node (`ig_core::Engine`) with a TUN device per
 network. On start it connects to itself through its public address, so it holds a control
 session like any member. When it creates a network it joins it with the second address
-(`10.90.0.2`, `fd42:9a:1::2`), the hostname given by `--name`, and the lighthouse flag. Members
+(the first free address in its slice of the pool), the hostname given by `--name`, and the
+lighthouse flag. Members
 see it as one more peer: it has a WireGuard session, a direct or relayed path, and a DNS name.
 `Overlay::Off` (`--no-overlay`) skips the engine; the lighthouse then coordinates only.
 
-## Replication
+## Lighthouse peering
 
-A lighthouse is either the **primary** or a **replica** of one primary. A replica opens a
-Noise control connection to the primary with `ClientHello.replica = true` and keeps it open.
-The primary sends `Snapshot {store_json}` on connect and after every change to the store; the
-replica replaces its store, re-pushes `NetworkState` to its own sessions, and reconciles its
-TUN devices and forward rules. A replica never writes the store: `Join` and `Leave` from a
-node are wrapped in `Proxy {node, hostname, os, msg}` and the primary's `ProxyReply` carries
-the answer back. Admin requests that write are refused on a replica. Ephemeral forwards
-`Expose` are the exception: they live in the memory of the lighthouse that owns the public
-port, so each lighthouse accepts them itself.
+Lighthouses are equals: every one holds the whole store, accepts every write, and exchanges
+state with the others. Two lighthouses that are registered with each other each dial the
+other (hello `peer = true`; the remote key must be a registered lighthouse) and keep the link
+open. On connect, and after every local change, a lighthouse sends its whole store as JSON
+(`Gossip::State`); the receiver merges it and, if that changed anything, sends its own store
+back. Links idle for 45 s are dropped and redialled with backoff.
+
+The store merges without coordination:
+
+- Every record (network settings, member, device, invite, forward, lighthouse) carries a
+  `Version { ts, by }`: a hybrid clock in milliseconds that never goes backwards plus the
+  writing lighthouse as the tie breaker. Of two copies the greater version wins.
+- A removal leaves a tombstone with its own version. A copy older than the tombstone cannot
+  come back; a record written later than the tombstone can (re-adding a removed device).
+- An invite stores its uses per lighthouse (`used: {lighthouse: n}`) and merges by taking the
+  maximum per key, so uses add up instead of overwriting each other.
+- Each lighthouse allocates addresses starting at its own offset into the pool (its rank among
+  the registered lighthouses times the pool size over their count), scanning forward and
+  wrapping. Concurrent joins on different lighthouses therefore land in different ranges.
+- After every merge a deterministic pass walks the members and devices of each network in
+  version order. The older record keeps its address, label and (for devices) physical target;
+  a newer record that duplicates an address or label is moved to the next free one, a newer
+  device that duplicates a physical target is dropped with a tombstone. Both lighthouses run
+  the same walk on the same data, so they end with identical stores. A member whose address
+  moved learns it on the next push and its node recreates the TUN.
+- Networks with the same name created on both sides are both kept; admin commands then need
+  the id.
 
 Nodes connect to every lighthouse in `NetworkInfo.lighthouses` and merge the states they
-receive. Endpoints, punches and relays work through whichever lighthouse is up. When the
-primary is down, members keep their sessions and replicas keep relaying; joins wait for the
-primary with a clear refusal. The admin command `lighthouse add <name> <host> <port> <key>`
-registers a replica so invites and pushes name it.
+receive. Joins, endpoints, punches and relays work through whichever lighthouse answers. The
+admin command `lighthouse add <name> <host> <port> <key>`, run on each side for the other,
+makes two lighthouses a pair; `lighthouse remove` evicts one.
 
 ## Public port forwards
 
@@ -210,8 +228,8 @@ exactly as the public socket delivers them and forwards them inside WireGuard.
 ## Persistence
 
 - Lighthouse: `lighthouse.key` and `lighthouse.json` (networks, members, devices, permanent
-  forwards, lighthouses, invite hashes) in the state directory. Written atomically on every
-  change and sent to replicas as a snapshot.
+  forwards, lighthouses, invite hashes, tombstones, clock) in the state directory. Written
+  atomically on every change and sent to peer lighthouses.
 - Node: `node.json` (private key and memberships). The daemon rewrites it on every
   `MembershipsChanged` event. On start the node resumes all memberships.
 - Android: the same JSON, stored in the app's private files directory.

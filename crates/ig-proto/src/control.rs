@@ -17,10 +17,10 @@ pub struct ClientHello {
     /// LANs it is attached to (`ig-node run --gateway`).
     #[serde(default)]
     pub gateway: bool,
-    /// This connection comes from another lighthouse that replicates our store
-    /// (see [`crate::replication`]). Its static key must be a registered replica.
+    /// This connection comes from another lighthouse (see [`crate::replication`]).
+    /// Its static key must be a registered lighthouse.
     #[serde(default)]
-    pub replica: bool,
+    pub peer: bool,
 }
 
 /// Payload of the second Noise handshake message (lighthouse -> node).
@@ -163,7 +163,7 @@ pub struct NetworkInfo {
     /// Whether members may request ephemeral forwards in this network.
     #[serde(default = "default_true")]
     pub exposes_allowed: bool,
-    /// Every lighthouse serving this network (primary first). Nodes keep a
+    /// Every lighthouse serving this network, by name. Nodes keep a
     /// control session with each of them.
     #[serde(default)]
     pub lighthouses: Vec<LighthouseRef>,

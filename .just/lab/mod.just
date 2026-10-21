@@ -39,10 +39,10 @@ flat-windows: require-vmlab
 flat-forward: require-vmlab
 	cd lab/flat && vmlab script scripts/forward.ws
 
-# Run the replica-lighthouse scenario against the flat lab (after flat-forward)
+# Run the two-lighthouse peering scenario against the flat lab (after flat-forward)
 [group('lab')]
-flat-replica: require-vmlab
-	cd lab/flat && vmlab script scripts/replica.ws
+flat-peers: require-vmlab
+	cd lab/flat && vmlab script scripts/peers.ws
 
 # Run the gateway-device scenario against the flat lab (after flat-windows)
 [group('lab')]
@@ -56,7 +56,7 @@ flat-gateway-more: require-vmlab
 
 # Run all flat scenarios
 [group('lab')]
-flat-test: flat-linux flat-windows flat-forward flat-replica flat-gateway flat-gateway-more
+flat-test: flat-linux flat-windows flat-forward flat-peers flat-gateway flat-gateway-more
 
 # Stop the flat lab, keeping the clones
 [group('lab')]

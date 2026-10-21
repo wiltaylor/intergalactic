@@ -1,36 +1,72 @@
-//! Replica side of store replication: keep a Noise connection to the primary,
-//! apply every snapshot it sends, and carry proxied node requests.
+//! Outbound side of lighthouse peering: keep a Noise connection to every other
+//! lighthouse in the store. Both lighthouses dial each other; a pair may hold
+//! two links, which is harmless because state exchange is idempotent.
 
 use crate::server::Inner;
-use ig_proto::control::{ClientHello, LighthouseRef, ServerHello};
+use crate::store::LighthouseRecord;
+use ig_proto::control::{ClientHello, ServerHello};
 use ig_proto::noise::NoiseStream;
-use ig_proto::replication::{FromPrimary, ToPrimary};
-use ig_proto::PROTOCOL_VERSION;
+use ig_proto::{NodeId, PROTOCOL_VERSION};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-pub async fn run_replica(inner: Arc<Inner>, primary: LighthouseRef) {
-    let mut backoff = Duration::from_secs(1);
+/// Start and stop dialers as lighthouses are added, changed and removed.
+pub async fn run_peers(inner: Arc<Inner>) {
+    let me = inner.config.keypair.public;
+    let mut dialers: HashMap<NodeId, (LighthouseRecord, JoinHandle<()>)> = HashMap::new();
     loop {
-        match session(&inner, &primary).await {
-            Ok(()) => backoff = Duration::from_secs(1),
-            Err(e) => {
-                tracing::warn!(primary = %format!("{}:{}", primary.host, primary.port), error = %e, "replication link down");
+        let wanted: Vec<LighthouseRecord> = inner
+            .lighthouse_records()
+            .into_iter()
+            .filter(|l| l.key != me)
+            .collect();
+        let stale: Vec<NodeId> = dialers
+            .iter()
+            .filter(|(k, (rec, _))| {
+                !wanted
+                    .iter()
+                    .any(|w| w.key == **k && w.host == rec.host && w.port == rec.port)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            if let Some((_, h)) = dialers.remove(&k) {
+                h.abort();
             }
         }
-        inner.primary_link_lost();
+        for rec in wanted {
+            if dialers.contains_key(&rec.key) {
+                continue;
+            }
+            let h = tokio::spawn(dial_loop(inner.clone(), rec.clone()));
+            dialers.insert(rec.key, (rec, h));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+async fn dial_loop(inner: Arc<Inner>, rec: LighthouseRecord) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match session(&inner, &rec).await {
+            Ok(()) => backoff = Duration::from_secs(1),
+            Err(e) => {
+                tracing::debug!(lighthouse = %rec.name, error = %e, "peer link down");
+            }
+        }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-async fn session(inner: &Arc<Inner>, primary: &LighthouseRef) -> anyhow::Result<()> {
-    let addr = tokio::net::lookup_host((primary.host.as_str(), primary.port))
+async fn session(inner: &Arc<Inner>, rec: &LighthouseRecord) -> anyhow::Result<()> {
+    let addr = tokio::net::lookup_host((rec.host.as_str(), rec.port))
         .await?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve {}", primary.host))?;
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve {}", rec.host))?;
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await??;
     let _ = tcp.set_nodelay(true);
     let hello = ClientHello {
@@ -38,42 +74,12 @@ async fn session(inner: &Arc<Inner>, primary: &LighthouseRef) -> anyhow::Result<
         hostname: inner.config.name.clone(),
         os: "lighthouse".into(),
         gateway: false,
-        replica: true,
+        peer: true,
     };
     let (stream, _hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
         Duration::from_secs(10),
-        NoiseStream::connect(tcp, &inner.config.keypair.private.0, &primary.key, &hello),
+        NoiseStream::connect(tcp, &inner.config.keypair.private.0, &rec.key, &hello),
     )
     .await??;
-    tracing::info!(primary = %format!("{}:{}", primary.host, primary.port), "replication link up");
-    let (mut tx, mut rx) = stream.into_parts();
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ToPrimary>(256);
-    inner.primary_link_up(cmd_tx);
-    let writer = tokio::spawn(async move {
-        while let Some(m) = cmd_rx.recv().await {
-            if tx.send(&m).await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut ping = tokio::time::interval(Duration::from_secs(15));
-    let result: anyhow::Result<()> = async {
-        loop {
-            tokio::select! {
-                _ = ping.tick() => {
-                    inner.proxy_to_primary(ToPrimary::Ping).await;
-                }
-                m = rx.recv::<FromPrimary>() => {
-                    match m? {
-                        FromPrimary::Snapshot { store_json } => inner.apply_snapshot(&store_json)?,
-                        FromPrimary::ProxyReply { node, msg } => inner.send_to(&node, msg),
-                        FromPrimary::Pong => {}
-                    }
-                }
-            }
-        }
-    }
-    .await;
-    writer.abort();
-    result
+    crate::server::peer_session(inner.clone(), stream, rec.key).await
 }

@@ -278,8 +278,8 @@ impl Engine {
         for lh in &all {
             handles.push(self.inner.ensure_lighthouse(lh.clone()));
         }
-        // Join through the first lighthouse that answers; a replica proxies the
-        // request to the primary. Give the connections a moment to come up.
+        // Join through the first lighthouse that answers; every lighthouse accepts
+        // joins and shares the result. Give the connections a moment to come up.
         let mut handle = handles[0].clone();
         for _ in 0..30 {
             if let Some(h) = handles.iter().find(|h| h.is_connected()) {
@@ -334,7 +334,7 @@ impl Engine {
             .get(&network)
             .map(|e| e.membership.lighthouses())
             .ok_or(EngineError::UnknownNetwork(network))?;
-        // Tell the first lighthouse that answers; replicas proxy to the primary.
+        // Tell the first lighthouse that answers; lighthouses share their state.
         for lh in &all {
             let handle = self.inner.lighthouses.lock().get(lh).cloned();
             let Some(h) = handle else { continue };

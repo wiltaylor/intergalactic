@@ -4,7 +4,7 @@
 use ig_core::packet::{build_tcp, build_udp, TCP_SYN};
 use ig_core::tun::channel::{ChannelTun, OsSide};
 use ig_core::{Engine, EngineConfig, EngineEvent, Membership, NoProtector, TunScope};
-use ig_lighthouse::server::{Overlay, Role};
+use ig_lighthouse::server::Overlay;
 use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
 use ig_proto::control::NetworkInfo;
@@ -28,7 +28,7 @@ fn init_tracing() {
 /// OS sides of the TUNs the lighthouse's embedded engine attached, by network name.
 type LhTuns = Arc<PlMutex<std::collections::HashMap<String, OsSide>>>;
 
-fn lighthouse_config(name: &str, role: Role) -> (LighthouseConfig, LhTuns) {
+fn lighthouse_config(name: &str) -> (LighthouseConfig, LhTuns) {
     let tuns: LhTuns = Arc::new(PlMutex::new(std::collections::HashMap::new()));
     let sink = tuns.clone();
     let factory: ig_lighthouse::server::TunFactory = Arc::new(move |info: &NetworkInfo| {
@@ -46,14 +46,13 @@ fn lighthouse_config(name: &str, role: Role) -> (LighthouseConfig, LhTuns) {
         default_relay_limit: RelayLimit::unlimited(),
         forward_range: (30000, 30099),
         name: name.into(),
-        role,
         overlay: Overlay::Custom(factory),
     };
     (cfg, tuns)
 }
 
 async fn lighthouse() -> Lighthouse {
-    let (cfg, _) = lighthouse_config("lh", Role::Primary);
+    let (cfg, _) = lighthouse_config("lh");
     Lighthouse::start(cfg).await.unwrap()
 }
 
@@ -139,12 +138,7 @@ fn first_member(engine: &Engine) -> ig_proto::ipc::PeerStatus {
         .status()
         .peers
         .into_iter()
-        .find(|p| {
-            p.hostname != "lh"
-                && p.hostname != "beacon"
-                && p.hostname != "primary"
-                && p.hostname != "replica"
-        })
+        .find(|p| p.hostname != "lh" && p.hostname != "beacon" && !p.hostname.starts_with("lh-"))
         .expect("a member peer")
 }
 
@@ -154,12 +148,7 @@ fn member_peers(engine: &Engine) -> usize {
         .status()
         .peers
         .iter()
-        .filter(|p| {
-            p.hostname != "lh"
-                && p.hostname != "beacon"
-                && p.hostname != "primary"
-                && p.hostname != "replica"
-        })
+        .filter(|p| p.hostname != "lh" && p.hostname != "beacon" && !p.hostname.starts_with("lh-"))
         .count()
 }
 
@@ -1090,7 +1079,7 @@ async fn public_port_forwards_become_overlay_nat_rules() {
 #[tokio::test]
 async fn lighthouse_is_a_member_of_its_networks() {
     init_tracing();
-    let (cfg, lh_tuns) = lighthouse_config("beacon", Role::Primary);
+    let (cfg, lh_tuns) = lighthouse_config("beacon");
     let lh = Lighthouse::start(cfg).await.unwrap();
     create_network(&lh, "dev", "10.99.1.0/24", None);
     let inv = invite(&lh, "dev", 5);
@@ -1140,68 +1129,95 @@ async fn lighthouse_is_a_member_of_its_networks() {
 }
 
 #[tokio::test]
-async fn replica_lighthouse_serves_and_proxies() {
+async fn two_lighthouses_merge_state_and_each_serves_alone() {
     init_tracing();
-    let (pcfg, _) = lighthouse_config("primary", Role::Primary);
-    let primary = Lighthouse::start(pcfg).await.unwrap();
-    let (mut rcfg, _) = lighthouse_config("replica", Role::Primary);
-    rcfg.overlay = Overlay::Off;
-    rcfg.role = Role::Replica(ig_proto::control::LighthouseRef {
+    let dir = std::env::temp_dir().join(format!("ig-peer-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut acfg, _) = lighthouse_config("lh-a");
+    acfg.state_path = Some(dir.join("a.json"));
+    let a_key = acfg.keypair.public;
+    let a_keypair = acfg.keypair.clone();
+    let a = Lighthouse::start(acfg.clone()).await.unwrap();
+    let (mut bcfg, _) = lighthouse_config("lh-b");
+    bcfg.overlay = Overlay::Off;
+    let b_key = bcfg.keypair.public;
+    let b = Lighthouse::start(bcfg).await.unwrap();
+
+    // Each side registers the other; the links come up and the stores merge.
+    let r = a.admin(AdminRequest::LighthouseAdd {
+        name: "lh-b".into(),
         host: "127.0.0.1".into(),
-        port: primary.local_addr().port(),
-        key: primary.public_key(),
-        name: "primary".into(),
-    });
-    let replica_key = rcfg.keypair.public;
-    let replica = Lighthouse::start(rcfg).await.unwrap();
-    // Register the replica on the primary; it then receives the store.
-    let r = primary.admin(AdminRequest::LighthouseAdd {
-        name: "replica".into(),
-        host: "127.0.0.1".into(),
-        port: replica.local_addr().port(),
-        key: replica_key,
+        port: b.local_addr().port(),
+        key: b_key,
     });
     assert!(matches!(r, AdminResponse::Lighthouses(_)), "{r:?}");
-    create_network(&primary, "dev", "10.99.2.0/24", None);
-    wait_for("replica has the network", || {
-        matches!(replica.admin(AdminRequest::NetworkList), AdminResponse::Networks(n) if n.len() == 1)
-    })
-    .await;
-    // Replica refuses admin writes.
-    assert!(matches!(
-        replica.admin(AdminRequest::NetworkCreate {
-            name: "x".into(),
-            cidr: "10.1.0.0/24".parse().unwrap(),
-            cidr6: None
-        }),
-        AdminResponse::Error { .. }
-    ));
+    let r = b.admin(AdminRequest::LighthouseAdd {
+        name: "lh-a".into(),
+        host: "127.0.0.1".into(),
+        port: a.local_addr().port(),
+        key: a_key,
+    });
+    assert!(matches!(r, AdminResponse::Lighthouses(_)), "{r:?}");
+    let linked = |lh: &Lighthouse| matches!(lh.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.len() == 2 && l.iter().all(|x| x.connected));
+    wait_for("a linked to b", || linked(&a)).await;
+    wait_for("b linked to a", || linked(&b)).await;
+
+    // Writes on either side reach the other.
+    create_network(&a, "dev", "10.99.2.0/24", None);
+    create_network(&b, "ops", "10.99.3.0/24", None);
+    let names = |lh: &Lighthouse| -> Vec<String> {
+        match lh.admin(AdminRequest::NetworkList) {
+            AdminResponse::Networks(n) => {
+                let mut v: Vec<String> = n.into_iter().map(|x| x.name).collect();
+                v.sort();
+                v
+            }
+            _ => vec![],
+        }
+    };
+    wait_for("b has both networks", || names(&b) == ["dev", "ops"]).await;
+    wait_for("a has both networks", || names(&a) == ["dev", "ops"]).await;
 
     // The invite names both lighthouses.
-    let inv = invite(&primary, "dev", 5);
+    let inv = invite(&a, "dev", 5);
     assert_eq!(inv.extra_lighthouses.len(), 1);
-    assert_eq!(inv.extra_lighthouses[0].key, replica_key);
+    assert_eq!(inv.extra_lighthouses[0].key, b_key);
 
-    // alpha joins through the primary; bravo's invite is rehosted so its first
-    // lighthouse is the replica, which proxies the join to the primary.
-    let a = node("alpha", vec![], false).await;
-    let (ia, os_a) = join_with_tun(&a, &inv).await;
-    let mut inv_r = inv.clone();
-    inv_r.host = "127.0.0.1".into();
-    inv_r.port = replica.local_addr().port();
-    inv_r.lighthouse = replica_key;
-    inv_r.extra_lighthouses = vec![ig_proto::control::LighthouseRef {
+    // alpha joins through a; bravo's invite is rehosted so it joins through b,
+    // which accepts the join itself and shares it with a.
+    let alpha = node("alpha", vec![], false).await;
+    let (ia, os_a) = join_with_tun(&alpha, &inv).await;
+    let mut inv_b = inv.clone();
+    inv_b.host = "127.0.0.1".into();
+    inv_b.port = b.local_addr().port();
+    inv_b.lighthouse = b_key;
+    inv_b.extra_lighthouses = vec![ig_proto::control::LighthouseRef {
         host: "127.0.0.1".into(),
-        port: primary.local_addr().port(),
-        key: primary.public_key(),
-        name: "primary".into(),
+        port: a.local_addr().port(),
+        key: a_key,
+        name: "lh-a".into(),
     }];
-    let b = node("bravo", vec![], false).await;
-    let (ib, mut os_b) = join_with_tun(&b, &inv_r).await;
+    let bravo = node("bravo", vec![], false).await;
+    let (ib, mut os_b) = join_with_tun(&bravo, &inv_b).await;
     assert_ne!(ia.address, ib.address);
-    // Both nodes hold sessions with both lighthouses.
+    let members_of = |lh: &Lighthouse, net: &str| -> Vec<String> {
+        match lh.admin(AdminRequest::NodeList {
+            network: Some(net.into()),
+        }) {
+            AdminResponse::Nodes(n) => {
+                let mut v: Vec<String> = n.into_iter().map(|x| x.hostname).collect();
+                v.sort();
+                v
+            }
+            _ => vec![],
+        }
+    };
+    wait_for("a knows bravo", || {
+        members_of(&a, "dev") == ["alpha", "bravo", "lh-a", "lh-b"]
+    })
+    .await;
     wait_for("alpha sees both lighthouses up", || {
-        a.engine.status().networks[0]
+        alpha.engine.status().networks[0]
             .lighthouses
             .iter()
             .filter(|(_, up)| *up)
@@ -1210,12 +1226,14 @@ async fn replica_lighthouse_serves_and_proxies() {
     })
     .await;
     wait_for("peers", || {
-        a.engine
+        alpha
+            .engine
             .status()
             .peers
             .iter()
             .any(|p| p.hostname == "bravo")
-            && b.engine
+            && bravo
+                .engine
                 .status()
                 .peers
                 .iter()
@@ -1225,11 +1243,11 @@ async fn replica_lighthouse_serves_and_proxies() {
     let pkt = build_udp(v4(&ia), 1, v4(&ib), 2, b"via either");
     assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
 
-    // The primary goes down: existing members keep talking, the replica keeps
-    // serving, and a new join is refused with a clear reason.
-    primary.shutdown().await;
-    wait_for("primary reported down", || {
-        a.engine.status().networks[0]
+    // a goes down. Members keep talking, b keeps serving, and b accepts a new
+    // join and an admin change on its own.
+    a.shutdown().await;
+    wait_for("a reported down", || {
+        alpha.engine.status().networks[0]
             .lighthouses
             .iter()
             .any(|(_, up)| !*up)
@@ -1237,20 +1255,57 @@ async fn replica_lighthouse_serves_and_proxies() {
     .await;
     let pkt = build_udp(v4(&ia), 3, v4(&ib), 4, b"still works");
     assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
-    wait_for("replica noticed the primary is gone", || {
-        matches!(replica.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.iter().any(|x| x.primary && !x.connected))
+    wait_for("b noticed a is gone", || {
+        matches!(b.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.iter().any(|x| x.key == a_key && !x.connected))
     })
     .await;
-    let c = node("charlie", vec![], false).await;
-    let err = c
+    let charlie = node("charlie", vec![], false).await;
+    let ic = charlie
         .engine
-        .join(&inv_r)
+        .join(&inv_b)
         .await
-        .expect_err("join must fail without the primary");
-    assert!(err.to_string().contains("primary"), "{err}");
+        .expect("join through b alone");
+    assert_ne!(ic.address, ia.address);
+    assert_ne!(ic.address, ib.address);
+    let r = b.admin(AdminRequest::DeviceAdd {
+        network: "dev".into(),
+        name: "nas".into(),
+        target: "192.168.77.5".parse().unwrap(),
+        target6: None,
+        gateways: vec![],
+    });
+    assert!(matches!(r, AdminResponse::Devices(_)), "{r:?}");
+    wait_for("bravo sees charlie through b", || {
+        bravo
+            .engine
+            .status()
+            .peers
+            .iter()
+            .any(|p| p.hostname == "charlie")
+    })
+    .await;
 
-    a.engine.shutdown().await;
-    b.engine.shutdown().await;
-    c.engine.shutdown().await;
-    replica.shutdown().await;
+    // a comes back with its old key and state (on a new port) and learns what
+    // happened while it was away.
+    let (mut acfg2, _) = lighthouse_config("lh-a");
+    acfg2.keypair = a_keypair;
+    acfg2.state_path = acfg.state_path.clone();
+    let a2 = Lighthouse::start(acfg2).await.unwrap();
+    wait_for("a2 linked to b", || linked(&a2)).await;
+    wait_for("a2 learned charlie and the device", || {
+        members_of(&a2, "dev") == ["alpha", "bravo", "charlie", "lh-a", "lh-b"]
+            && matches!(a2.admin(AdminRequest::DeviceList { network: "dev".into() }), AdminResponse::Devices(d) if d.len() == 1)
+    })
+    .await;
+    wait_for("b learned a2's new port", || {
+        matches!(b.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.iter().any(|x| x.key == a_key && x.port == a2.local_addr().port() && x.connected))
+    })
+    .await;
+
+    alpha.engine.shutdown().await;
+    bravo.engine.shutdown().await;
+    charlie.engine.shutdown().await;
+    a2.shutdown().await;
+    b.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

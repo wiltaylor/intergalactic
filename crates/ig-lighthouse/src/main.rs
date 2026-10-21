@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ig_lighthouse::admin_socket;
-use ig_lighthouse::server::{Overlay, Role};
+use ig_lighthouse::server::Overlay;
 use ig_lighthouse::{Lighthouse, LighthouseConfig};
 use ig_proto::admin::{AdminRequest, AdminResponse};
 use ig_proto::{
@@ -66,12 +66,6 @@ enum Cmd {
         /// This lighthouse's name (its hostname and DNS label in every network).
         #[arg(long, default_value = "lighthouse")]
         name: String,
-        /// Run as a replica of the primary at HOST:PORT. Requires --primary-key.
-        #[arg(long)]
-        replica_of: Option<String>,
-        /// The primary's public key (printed by `ig-lighthouse info` there).
-        #[arg(long)]
-        primary_key: Option<NodeId>,
         /// Do not join the overlay (no TUN device). Public forwards are then unavailable.
         #[arg(long)]
         no_overlay: bool,
@@ -103,7 +97,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ForwardCmd,
     },
-    /// Manage replica lighthouses.
+    /// Manage the other lighthouses that serve the same networks.
     Lighthouse {
         #[command(subcommand)]
         cmd: LighthouseCmd,
@@ -112,8 +106,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum LighthouseCmd {
-    /// Register a replica: `lighthouse add lh-eu lh-eu.example.com 7777 <its public key>`.
-    /// Then start it with `serve --replica-of <this host>:7777 --primary-key <this key>`.
+    /// Register another lighthouse: `lighthouse add lh2 lh2.example.com 7777 <its public key>`.
+    /// Run the matching command there, naming this lighthouse. The two then link
+    /// up and merge their state; either one serves members while the other is down.
     Add {
         name: String,
         host: String,
@@ -140,7 +135,7 @@ enum ForwardCmd {
         udp: bool,
         #[arg(long, default_value = "")]
         label: String,
-        /// Lighthouse that publishes the port, by name or key. Default: the primary.
+        /// Lighthouse that publishes the port, by name or key. Default: this one.
         #[arg(long)]
         lighthouse: Option<String>,
     },
@@ -269,8 +264,6 @@ async fn main() -> anyhow::Result<()> {
             relay_limit_total_kbps,
             forward_range,
             name,
-            replica_of,
-            primary_key,
             no_overlay,
         } => {
             std::fs::create_dir_all(&cli.state_dir)
@@ -289,21 +282,6 @@ async fn main() -> anyhow::Result<()> {
                 },
                 forward_range: parse_range(&forward_range)?,
                 name: name.clone(),
-                role: match (replica_of, primary_key) {
-                    (Some(hp), Some(key)) => {
-                        let (h, p) = hp
-                            .rsplit_once(':')
-                            .ok_or_else(|| anyhow::anyhow!("--replica-of must be HOST:PORT"))?;
-                        Role::Replica(ig_proto::control::LighthouseRef {
-                            host: h.to_string(),
-                            port: p.parse()?,
-                            key,
-                            name: String::new(),
-                        })
-                    }
-                    (None, None) => Role::Primary,
-                    _ => anyhow::bail!("--replica-of and --primary-key go together"),
-                },
                 overlay: if no_overlay {
                     Overlay::Off
                 } else {
@@ -324,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
             if let AdminResponse::Info(i) = r {
                 println!("public key   {}", i.public_key);
                 println!("invite host  {}:{}", i.public_host, i.port);
-                println!("role         {}", i.role);
+                println!("peers        {}", i.role);
                 for (net, addr) in &i.overlay {
                     println!("overlay      {net} = {addr}");
                 }
@@ -710,16 +688,12 @@ fn parse_range(s: &str) -> anyhow::Result<(u16, u16)> {
 fn print_lighthouses(r: AdminResponse) -> anyhow::Result<()> {
     match r {
         AdminResponse::Lighthouses(list) => {
-            println!(
-                "{:<14} {:<30} {:<8} {:<10} KEY",
-                "NAME", "HOST:PORT", "ROLE", "LINK"
-            );
+            println!("{:<14} {:<30} {:<10} KEY", "NAME", "HOST:PORT", "LINK");
             for l in list {
                 println!(
-                    "{:<14} {:<30} {:<8} {:<10} {}",
+                    "{:<14} {:<30} {:<10} {}",
                     truncate(&l.name, 14),
                     format!("{}:{}", l.host, l.port),
-                    if l.primary { "primary" } else { "replica" },
                     if l.connected { "up" } else { "down" },
                     l.key
                 );

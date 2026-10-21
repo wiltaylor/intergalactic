@@ -22,7 +22,7 @@ impl LighthouseAddr {
         }
     }
 
-    /// Every lighthouse an invite names, primary first.
+    /// Every lighthouse an invite names, the inviting one first.
     pub fn all_from_invite(inv: &ig_proto::Invite) -> Vec<Self> {
         let mut v = vec![Self::from_invite(inv)];
         for r in &inv.extra_lighthouses {
@@ -65,7 +65,7 @@ pub struct Membership {
 }
 
 impl Membership {
-    /// All lighthouses of the network, primary first.
+    /// All lighthouses of the network, the one we joined through first.
     pub fn lighthouses(&self) -> Vec<LighthouseAddr> {
         let mut v = vec![self.lighthouse.clone()];
         for l in &self.extra_lighthouses {

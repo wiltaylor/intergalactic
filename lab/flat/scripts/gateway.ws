@@ -106,7 +106,8 @@ fn setup(lab: Lab) -> Result[unit, string] {
     let t1 = must(lab, lh, "date +%s")?
     lab.log(fmt("failover to {} after {} -> {} s (idle session reaped)", second.name(), t0.trim(), t1.trim()))
     lab.log(must(lab, lh, admin + "device list dev")?)
-    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet 10.90.0.6))", 30)?
+    let dev_addr = must(lab, lh, admin + "device list dev | grep ' lhbox ' | tr -s ' ' | cut -d' ' -f3 | tr -d '\\n'")?
+    wait_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet " + dev_addr + "))", 30)?
     let body2 = must_ps(lab, win, "[Text.Encoding]::UTF8.GetString((Invoke-WebRequest -UseBasicParsing http://lhbox.dev.ig.test:8080/hostname).Content).Trim()")?
     if body2.trim() != "lh" { return Err("win got unexpected body after failover: " + body2) }
     lab.log("win still reaches the device, now through " + second.name())

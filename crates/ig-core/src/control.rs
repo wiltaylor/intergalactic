@@ -192,7 +192,7 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         hostname: inner.hostname.clone(),
         os: inner.os.clone(),
         gateway: inner.gateway,
-        replica: false,
+        peer: false,
     };
     let (stream, server_hello): (NoiseStream<TcpStream>, ServerHello) = tokio::time::timeout(
         CONNECT_TIMEOUT,

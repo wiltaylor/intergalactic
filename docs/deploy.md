@@ -33,36 +33,48 @@ unit runs as root with `CAP_NET_ADMIN`, because the TUN device and the forward N
 it. Pass `--no-overlay` for a coordination-only lighthouse without a TUN device; public
 forwards are then unavailable on that lighthouse.
 
-### Second lighthouse (replica)
+### Second lighthouse
 
-A replica holds a copy of the primary's store, serves existing members while the primary is
-down, and publishes its own forwards. Nodes connect to every lighthouse of a network, so a
-member keeps its sessions when one lighthouse goes away.
+Two lighthouses serve the same networks as equals: there is no primary. Each holds the whole
+store, accepts joins and admin changes on its own, publishes its own forwards, and the two
+merge whenever they are connected. A typical pair is one VPS and one machine at home behind
+a forwarded port; nodes connect to both, so a member keeps working when either is down.
 
 ```sh
-# On the primary: print its public key.
+# On each lighthouse: print its public key.
 sudo ig-lighthouse info
 
-# On the replica VPS (own key, own state directory):
-sudo ig-lighthouse serve --public-host lh2.example.com --name lh2 \
-    --replica-of lighthouse.example.com:7777 --primary-key <primary-key>
-sudo ig-lighthouse info                   # prints the replica's key
+# On the second machine, start a lighthouse of its own:
+sudo ig-lighthouse serve --public-host home.example.com --name home --dns-domain ig.internal
 
-# Back on the primary: register the replica so members and invites learn it.
-sudo ig-lighthouse lighthouse add lh2 lh2.example.com 7777 <replica-key>
-sudo ig-lighthouse lighthouse list
+# Register each on the other (name, host, port, key):
+sudo ig-lighthouse lighthouse add home home.example.com 7777 <home-key>      # on the VPS
+sudo ig-lighthouse lighthouse add vps  lighthouse.example.com 7777 <vps-key>  # at home
+sudo ig-lighthouse lighthouse list                                           # LINK up on both
 ```
 
-Online nodes learn the replica on the next push and connect to it. New invites name both
-lighthouses; a node that holds an old invite learns the replica after its first join.
+The two link up, exchange their stores and from then on push every change to each other.
+Online nodes learn the second lighthouse on the next push and connect to it. New invites name
+both lighthouses; a node that holds an old invite learns the second one after its first join.
 
-Only the primary writes the store. A replica proxies joins and leaves to the primary and
-refuses admin changes; while the primary is unreachable, members keep working through the
-replica but new joins wait with the message `the primary lighthouse is unreachable`. Settings
-given on the command line (`--dns-domain`, `--relay-limit-*`, `--forward-range`) belong to
-each lighthouse and are not replicated, so give replicas the same values.
+What happens when they are apart:
 
-### Policies
+- Each lighthouse hands out addresses from its own part of every network's pool, so joins
+  on both sides do not collide. Should they ever collide, the lighthouses move the newer
+  record to a free address and agree on the result.
+- An invite counts its uses per lighthouse. Two lighthouses can together hand out more joins
+  than the invite allows, by at most one per lighthouse.
+- For the same record changed on both sides, the newer change wins. A device registered under
+  one name on both sides keeps the newer registration.
+- Deleting something on one side deletes it everywhere once they meet again, even if the other
+  side still shows it.
+
+Settings given on the command line (`--dns-domain`, `--relay-limit-*`, `--forward-range`)
+belong to each lighthouse and are not replicated, so give both the same values.
+`lighthouse remove <key>` on either side evicts a lighthouse from the pair; add it again to
+let it back in.
+
+## Policies
 
 ```sh
 # Only let members accept SSH and ping. Everything a member opens itself still works.
@@ -234,9 +246,8 @@ a dedicated short-lived network and delete the whole network afterwards.
   invite's host resolves. `RUST_LOG=debug ig-node run` shows the reason.
 - No interface created: on Linux check `CAP_NET_ADMIN`; on Windows check `wintun.dll` and
   Administrator rights.
-- `ig expose` fails with `the primary lighthouse is unreachable`: the forward was requested
-  through a replica while the primary is down. Ephemeral forwards are not persisted and wait
-  for the primary.
+- `lighthouse list` shows a peer `down`: check TCP 7777 between the two lighthouses in both
+  directions; each one dials the other. Nodes keep working in the meantime.
 - A forward does not answer: check that `nft list table ip ig_forwards` on the lighthouse
   lists the port, that the service on the node listens on the overlay address, and that the
   network policy allows the port from the lighthouse's overlay address.

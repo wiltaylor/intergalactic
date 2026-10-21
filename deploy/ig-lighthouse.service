@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 # Replace lighthouse.example.com with the public DNS name or IP of this VPS, and
 # --name with the name members will see (lh.<network>.<domain>).
-# A replica adds: --replica-of primary.example.com:7777 --primary-key <key>
+# A second lighthouse runs the same unit with its own --public-host and --name;
+# register each on the other with `ig-lighthouse lighthouse add`.
 # A coordination-only lighthouse without a TUN device adds: --no-overlay
 ExecStart=/usr/local/bin/ig-lighthouse serve --listen [::]:7777 --public-host lighthouse.example.com --name lh --dns-domain ig.internal
 Restart=on-failure

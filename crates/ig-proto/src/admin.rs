@@ -117,8 +117,7 @@ pub struct LighthouseSummary {
     pub host: String,
     pub port: u16,
     pub key: NodeId,
-    pub primary: bool,
-    /// For replicas as seen from the primary: is the replication link up.
+    /// This lighthouse itself, or a peer whose link is up right now.
     pub connected: bool,
 }
 
@@ -158,7 +157,7 @@ pub struct LighthouseInfo {
     pub nodes_online: usize,
     pub uptime_secs: u64,
     pub dns_domain: String,
-    /// `primary` or `replica of <host:port>`.
+    /// Peering summary, e.g. `2 lighthouses, 1 linked`.
     pub role: String,
     /// This lighthouse's overlay addresses, one per network, if it runs the overlay.
     pub overlay: Vec<(String, String)>,

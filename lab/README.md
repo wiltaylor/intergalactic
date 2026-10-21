@@ -30,7 +30,7 @@ vmlab up                          # pulls the published templates on first use
 vmlab script scripts/linux.ws     # lighthouse, networks, invites, two nodes
 vmlab script scripts/windows.ws   # service install, join, DNS, traffic, restart
 vmlab script scripts/forward.ws   # public forwards through the lighthouse into the overlay
-vmlab script scripts/replica.ws   # second lighthouse, primary down and back
+vmlab script scripts/peers.ws     # second lighthouse as a peer, one down, partition
 vmlab script scripts/gateway.ws   # gateway devices and failover
 vmlab script scripts/gateway-more.ws  # IPv6 devices, Windows gateway
 vmlab down
@@ -56,11 +56,15 @@ chosen public port; an admin permanent forward with target `self:22` serves brav
 banner; stopping alpha's daemon removes its ephemeral forwards and keeps the permanent one;
 `network expose game --deny` makes `ig expose` fail in that network.
 
-`replica.ws` (after `forward.ws`) starts `lh2` with `--replica-of` and registers it on `lh`:
-online nodes learn `lh2` and connect to it; a new invite names both; `lh` is killed and ping
-between alpha and bravo keeps working; bravo restarts and finds its peers through `lh2`
-alone; a join through `lh2` is refused with `the primary lighthouse is unreachable`; `ig
-expose --lighthouse lh2` publishes a port on `lh2`; `lh` returns and joins work again.
+`peers.ws` (after `forward.ws`) starts `lh2` on its own and registers each lighthouse on the
+other: the stores merge, online nodes learn `lh2` and connect to it, a device added on `lh2`
+shows up on `lh` and resolves on alpha; `lh` is killed and alpha and bravo keep talking; bravo
+restarts and finds its peers through `lh2` alone; bravo joins `game` through `lh2` alone and
+gets an address from `lh2`'s slice; `network create` works on `lh2` alone; `ig expose
+--lighthouse lh2` publishes a port on `lh2`; `lh` returns, learns the join and the network, and
+a delete on `lh` reaches `lh2`; then the link between the two is cut with nftables while both
+stay up, devices are added on both sides including the same name on both, the link is restored,
+and both `device list` outputs are identical with exactly one copy of the duplicate.
 
 `gateway-more.ws` (after `gateway.ws`) adds IPv6 ULA addresses to the LAN and re-registers the
 device with `--ipv6`: the active Linux gateway gets an `ip6` nftables table, the device
@@ -137,6 +141,9 @@ Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by the
 - On Android, `attachTun` was called from the main thread outside the tokio runtime and
   the app crashed when the VPN came up. The mobile bindings now enter the runtime for
   every call that touches the engine.
+- The first peering design had a primary lighthouse and replicas that proxied joins to it, so a
+  dead primary blocked joins. Lighthouses are now equals with a mergeable store (versions,
+  tombstones, per-lighthouse address slices and invite counters).
 - The embedded lighthouse engine connected to its own lighthouse under two names
   (`127.0.0.1` and the public host) and the two sessions replaced each other in a loop.
   Lighthouse records are now merged by key and the engine connects through the public host.

@@ -1,6 +1,6 @@
 //! Lighthouse runtime: control sessions, UDP disco/relay, broadcasts and admin.
 
-use crate::store::{now_secs, InviteRecord, Store, StoreError};
+use crate::store::{now_secs, Store, StoreError};
 use ig_core::{Engine, EngineConfig, EngineEvent, NoProtector, TunDevice, TunScope};
 use ig_node::forward_os::ForwardRule;
 use ig_proto::admin::{
@@ -12,7 +12,7 @@ use ig_proto::control::{
     ClientHello, DeviceInfo, FromLighthouse, NetworkInfo, PeerInfo, ServerHello, ToLighthouse,
 };
 use ig_proto::noise::NoiseStream;
-use ig_proto::replication::{FromPrimary, ToPrimary};
+use ig_proto::replication::Gossip;
 use ig_proto::tunnel::{ForwardInfo, ForwardKind, ForwardProto};
 use ig_proto::udp::{bind_dual_stack, canonical, reachable, to_wire};
 use ig_proto::{disco, Invite, Keypair, NetworkId, NodeId, RelayLimit, PROTOCOL_VERSION};
@@ -56,16 +56,8 @@ pub struct LighthouseConfig {
     pub forward_range: (u16, u16),
     /// This lighthouse's name; also its hostname and DNS label as a member.
     pub name: String,
-    pub role: Role,
     /// How this lighthouse joins the overlay as a member.
     pub overlay: Overlay,
-}
-
-#[derive(Clone, Debug)]
-pub enum Role {
-    Primary,
-    /// Replicate the store from this primary and proxy writes to it.
-    Replica(LighthouseRef),
 }
 
 /// Builds a TUN device for one network (tests and embedders).
@@ -94,12 +86,17 @@ impl std::fmt::Debug for Overlay {
     }
 }
 
-/// Primary side: one connected replica.
+/// One live connection to another lighthouse, inbound or outbound.
 #[derive(Clone)]
-pub struct ReplicaLink {
-    tx: mpsc::Sender<FromPrimary>,
+struct PeerLink {
+    node: NodeId,
+    /// Wake the writer: send our current state.
+    kick: Arc<tokio::sync::Notify>,
     abort: Arc<tokio::sync::Notify>,
 }
+
+/// Peer links idle for this long are closed (pings go every 15 s).
+const PEER_IDLE: Duration = Duration::from_secs(45);
 
 /// Ephemeral forward held in memory for the life of the node's session.
 #[derive(Clone, Debug)]
@@ -117,8 +114,6 @@ const MAX_EPHEMERAL_PER_NODE: usize = 8;
 
 struct Session {
     node: NodeId,
-    hostname: String,
-    os: String,
     token: [u8; 32],
     tx: mpsc::Sender<FromLighthouse>,
     local_endpoints: RwLock<Vec<SocketAddr>>,
@@ -144,10 +139,9 @@ pub struct Inner {
     /// hop between equally good gateways on every state push.
     active_gateways: Mutex<HashMap<(NetworkId, String), NodeId>>,
     ephemeral: Mutex<Vec<Ephemeral>>,
-    /// Primary side: replication links to registered replicas.
-    replicas: RwLock<HashMap<NodeId, ReplicaLink>>,
-    /// Replica side: link to the primary while it is up.
-    primary_link: Mutex<Option<mpsc::Sender<ToPrimary>>>,
+    /// Live links to other lighthouses, by link id.
+    peers: RwLock<HashMap<u64, PeerLink>>,
+    next_link: Mutex<u64>,
     /// Embedded node engine (overlay membership) and its TUNs.
     engine: Mutex<Option<Engine>>,
     tuns: Mutex<HashMap<NetworkId, TunEntry>>,
@@ -170,8 +164,8 @@ pub struct Lighthouse {
 impl Lighthouse {
     pub async fn start(config: LighthouseConfig) -> anyhow::Result<Lighthouse> {
         let mut store = match &config.state_path {
-            Some(p) => Store::load(p)?,
-            None => Store::default(),
+            Some(p) => Store::load(p, config.keypair.public)?,
+            None => Store::new(config.keypair.public),
         };
         let tcp = TcpListener::bind(config.listen).await?;
         let tcp_addr = tcp.local_addr()?;
@@ -180,19 +174,17 @@ impl Lighthouse {
             // Port 0 means "whatever we bound": make invites and the self record agree.
             config.public_port = tcp_addr.port();
         }
-        if matches!(config.role, Role::Primary) {
-            // The primary is a member of every network it serves.
-            let changed = store.ensure_lighthouse(crate::store::LighthouseRecord {
-                key: config.keypair.public,
-                name: config.name.clone(),
-                host: config.public_host.clone(),
-                port: config.public_port,
-                primary: true,
-            });
-            if changed {
-                if let Some(p) = &config.state_path {
-                    store.save(p)?;
-                }
+        // A lighthouse is a member of every network it serves.
+        let changed = store.ensure_lighthouse(crate::store::LighthouseRecord {
+            key: config.keypair.public,
+            name: config.name.clone(),
+            host: config.public_host.clone(),
+            port: config.public_port,
+            version: Default::default(),
+        });
+        if changed {
+            if let Some(p) = &config.state_path {
+                store.save(p)?;
             }
         }
         let (udp, dual_stack) = bind_dual_stack(config.listen.ip(), tcp_addr.port())?;
@@ -206,8 +198,8 @@ impl Lighthouse {
             dual_stack,
             active_gateways: Mutex::new(HashMap::new()),
             ephemeral: Mutex::new(Vec::new()),
-            replicas: RwLock::new(HashMap::new()),
-            primary_link: Mutex::new(None),
+            peers: RwLock::new(HashMap::new()),
+            next_link: Mutex::new(1),
             engine: Mutex::new(None),
             tuns: Mutex::new(HashMap::new()),
             rules: Mutex::new(Vec::new()),
@@ -223,18 +215,13 @@ impl Lighthouse {
         let t4 = tokio::spawn(housekeeping(inner.clone()));
         let t5 = tokio::spawn(reap_idle_sessions(inner.clone()));
         inner.tasks.lock().extend([t1, t2, t3, t4, t5]);
-        if let Role::Replica(primary) = &inner.config.role {
-            let t = tokio::spawn(crate::replication::run_replica(
-                inner.clone(),
-                primary.clone(),
-            ));
-            inner.tasks.lock().push(t);
-        }
+        let t6 = tokio::spawn(crate::replication::run_peers(inner.clone()));
+        inner.tasks.lock().push(t6);
         if !matches!(inner.config.overlay, Overlay::Off) {
             inner.start_engine(tcp_addr.port()).await?;
         }
         inner.reconcile_forwards();
-        tracing::info!(addr = %tcp_addr, dual_stack, key = %inner.config.keypair.public, name = %inner.config.name, role = ?inner.config.role, overlay = ?inner.config.overlay, dns_domain = %inner.config.dns_domain, "lighthouse listening");
+        tracing::info!(addr = %tcp_addr, dual_stack, key = %inner.config.keypair.public, name = %inner.config.name, overlay = ?inner.config.overlay, dns_domain = %inner.config.dns_domain, "lighthouse listening");
         Ok(Lighthouse { inner, tcp_addr })
     }
 
@@ -268,14 +255,8 @@ impl Lighthouse {
         if matches!(self.inner.config.overlay, Overlay::Kernel) {
             ig_node::forward_os::remove();
         }
-        // Close replication links so replicas notice at once.
-        let links: Vec<ReplicaLink> = self
-            .inner
-            .replicas
-            .write()
-            .drain()
-            .map(|(_, l)| l)
-            .collect();
+        // Close peer links so the other lighthouses notice at once.
+        let links: Vec<PeerLink> = self.inner.peers.write().drain().map(|(_, l)| l).collect();
         for l in links {
             l.abort.notify_one();
         }
@@ -372,18 +353,16 @@ impl Buckets {
 }
 
 impl Inner {
-    fn is_primary(&self) -> bool {
-        matches!(self.config.role, Role::Primary)
+    /// Registered lighthouses, for the peer dialer.
+    pub fn lighthouse_records(&self) -> Vec<crate::store::LighthouseRecord> {
+        self.store.lock().lighthouses.values().cloned().collect()
     }
 
-    fn primary_key(&self) -> NodeId {
-        match &self.config.role {
-            Role::Primary => self.config.keypair.public,
-            Role::Replica(p) => p.key,
-        }
+    fn peer_linked(&self, key: &NodeId) -> bool {
+        self.peers.read().values().any(|l| l.node == *key)
     }
 
-    /// Lighthouse list for `NetworkInfo`: primary first.
+    /// Lighthouse list for `NetworkInfo`, by name.
     fn lighthouse_refs(&self, store: &Store) -> Vec<LighthouseRef> {
         let mut v: Vec<LighthouseRef> = store
             .lighthouses_ordered()
@@ -507,51 +486,95 @@ impl Inner {
         }
     }
 
-    // ---- replication ----------------------------------------------------------
+    // ---- peering -------------------------------------------------------------
 
-    pub fn primary_link_up(&self, tx: mpsc::Sender<ToPrimary>) {
-        *self.primary_link.lock() = Some(tx);
+    fn add_peer_link(&self, link: PeerLink) -> u64 {
+        let id = {
+            let mut n = self.next_link.lock();
+            let id = *n;
+            *n += 1;
+            id
+        };
+        self.peers.write().insert(id, link);
+        id
     }
 
-    pub fn primary_link_lost(&self) {
-        *self.primary_link.lock() = None;
+    fn remove_peer_link(&self, id: u64) {
+        self.peers.write().remove(&id);
     }
 
-    pub async fn proxy_to_primary(&self, msg: ToPrimary) -> bool {
-        let link = self.primary_link.lock().clone();
-        match link {
-            Some(tx) => tx.send(msg).await.is_ok(),
-            None => false,
+    /// Ask every peer link to send our state.
+    fn gossip_all(&self) {
+        for l in self.peers.read().values() {
+            l.kick.notify_one();
         }
     }
 
-    /// Replica: adopt the primary's store.
-    pub fn apply_snapshot(&self, json: &[u8]) -> anyhow::Result<()> {
+    pub fn store_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&*self.store.lock()).unwrap_or_default()
+    }
+
+    /// Fold a peer's store into ours. Changes are persisted, pushed to our
+    /// sessions and sent back out to every peer.
+    pub fn merge_remote(&self, json: &[u8]) -> anyhow::Result<()> {
         let incoming: Store = serde_json::from_slice(json)?;
-        let ids: Vec<NetworkId> = incoming.networks.keys().copied().collect();
-        {
+        let (outcome, lost) = {
             let mut store = self.store.lock();
-            *store = incoming;
-            self.persist_local(&store);
+            let before: HashMap<NetworkId, Vec<NodeId>> = store
+                .networks
+                .values()
+                .map(|n| (n.id, n.members.keys().copied().collect()))
+                .collect();
+            let mut outcome = store.merge(&incoming);
+            if store.ensure_lighthouse(self.self_record()) {
+                outcome.changed = true;
+            }
+            if outcome.changed {
+                self.persist(&store);
+            }
+            // Members that vanished: tell them if they are connected to us.
+            let mut lost: Vec<(NodeId, NetworkId)> = Vec::new();
+            for (id, members) in before {
+                for m in members {
+                    if !store
+                        .networks
+                        .get(&id)
+                        .is_some_and(|n| n.members.contains_key(&m))
+                    {
+                        lost.push((m, id));
+                    }
+                }
+            }
+            (outcome, lost)
+        };
+        if !outcome.changed {
+            return Ok(());
         }
-        tracing::debug!(networks = ids.len(), "snapshot applied");
-        self.mark_dirty(ids);
+        tracing::info!(
+            networks = outcome.networks.len(),
+            "merged state from a peer lighthouse"
+        );
+        for (node, network) in lost {
+            self.send_to(
+                &node,
+                FromLighthouse::Removed {
+                    network,
+                    reason: "removed on another lighthouse".into(),
+                },
+            );
+        }
+        self.mark_dirty(outcome.networks);
         self.reconcile_forwards();
         Ok(())
     }
 
-    fn push_snapshot(&self, store: &Store) {
-        let replicas: Vec<ReplicaLink> = self.replicas.read().values().cloned().collect();
-        if replicas.is_empty() {
-            return;
-        }
-        let Ok(json) = serde_json::to_vec(store) else {
-            return;
-        };
-        for l in replicas {
-            let _ = l.tx.try_send(FromPrimary::Snapshot {
-                store_json: json.clone(),
-            });
+    fn self_record(&self) -> crate::store::LighthouseRecord {
+        crate::store::LighthouseRecord {
+            key: self.config.keypair.public,
+            name: self.config.name.clone(),
+            host: self.config.public_host.clone(),
+            port: self.config.public_port,
+            version: Default::default(),
         }
     }
 
@@ -763,12 +786,11 @@ impl Inner {
 
     /// Every forward, permanent and ephemeral, as the node-facing record.
     fn all_forwards(&self, store: &Store) -> Vec<ForwardInfo> {
-        let primary = self.primary_key();
         let mut v: Vec<ForwardInfo> = store
             .forwards
             .values()
             .map(|f| {
-                let lh = f.lighthouse.unwrap_or(primary);
+                let lh = f.lighthouse;
                 ForwardInfo {
                     id: f.id.clone(),
                     network: f.network,
@@ -851,7 +873,7 @@ impl Inner {
             || store.forwards.values().any(|f| {
                 f.public_port == port
                     && f.proto == proto
-                    && f.lighthouse.unwrap_or(self.primary_key()) == self.config.keypair.public
+                    && f.lighthouse == self.config.keypair.public
             })
             || self
                 .ephemeral
@@ -882,9 +904,7 @@ impl Inner {
 
     fn persist(&self, store: &Store) {
         self.persist_local(store);
-        if self.is_primary() {
-            self.push_snapshot(store);
-        }
+        self.gossip_all();
     }
 
     fn mark_dirty(&self, nets: impl IntoIterator<Item = NetworkId>) {
@@ -1015,34 +1035,6 @@ impl Inner {
     fn handle_control(self: &Arc<Self>, session: &Arc<Session>, msg: ToLighthouse) {
         let node = session.node;
         *session.last_seen.lock() = Instant::now();
-        if !self.is_primary() {
-            // Only the primary writes the store. Joins and leaves are proxied; the
-            // reply comes back over the replication link and is relayed to the node.
-            if matches!(msg, ToLighthouse::Join { .. } | ToLighthouse::Leave { .. }) {
-                let me = self.clone();
-                let s = session.clone();
-                tokio::spawn(async move {
-                    let proxied = ToPrimary::Proxy {
-                        node,
-                        hostname: s.hostname.clone(),
-                        os: s.os.clone(),
-                        msg: msg.clone(),
-                    };
-                    if !me.proxy_to_primary(proxied).await {
-                        let reply = match msg {
-                            ToLighthouse::Join { network, .. } => FromLighthouse::JoinFailed {
-                                network,
-                                reason: "the primary lighthouse is unreachable; joins wait until it is back".into(),
-                            },
-                            ToLighthouse::Leave { network } => FromLighthouse::Left { network },
-                            _ => return,
-                        };
-                        let _ = s.tx.try_send(reply);
-                    }
-                });
-                return;
-            }
-        }
         match msg {
             ToLighthouse::Join { network, token } => {
                 let reply = self.apply_join(node, network, token);
@@ -1240,23 +1232,6 @@ impl Inner {
     }
 
     fn admin_inner(&self, req: AdminRequest) -> anyhow::Result<AdminResponse> {
-        let read_only = matches!(
-            req,
-            AdminRequest::Info
-                | AdminRequest::NetworkList
-                | AdminRequest::InviteList { .. }
-                | AdminRequest::NodeList { .. }
-                | AdminRequest::DeviceList { .. }
-                | AdminRequest::ForwardList
-                | AdminRequest::LighthouseList
-        );
-        if let (Role::Replica(p), false) = (&self.config.role, read_only) {
-            anyhow::bail!(
-                "this lighthouse is a replica; run admin changes on the primary at {}:{}",
-                p.host,
-                p.port
-            );
-        }
         match req {
             AdminRequest::LighthouseAdd {
                 name,
@@ -1273,7 +1248,7 @@ impl Inner {
                     name,
                     host,
                     port,
-                    primary: false,
+                    version: Default::default(),
                 })?;
                 self.persist(&store);
                 let ids: Vec<NetworkId> = store.networks.keys().copied().collect();
@@ -1290,16 +1265,31 @@ impl Inner {
             }
             AdminRequest::LighthouseRemove { key } => {
                 if key == self.config.keypair.public {
-                    anyhow::bail!("cannot remove the primary itself");
+                    anyhow::bail!("cannot remove this lighthouse from itself; run the command on another lighthouse");
                 }
                 let mut store = self.store.lock();
                 store.remove_lighthouse(&key)?;
                 self.persist(&store);
                 let ids: Vec<NetworkId> = store.networks.keys().copied().collect();
                 drop(store);
-                if let Some(l) = self.replicas.write().remove(&key) {
-                    l.abort.notify_one();
+                // Tell the peer first, then drop the links.
+                let links: Vec<PeerLink> = self
+                    .peers
+                    .read()
+                    .values()
+                    .filter(|l| l.node == key)
+                    .cloned()
+                    .collect();
+                for l in links {
+                    l.kick.notify_one();
                 }
+                let me = self.clone_links_for(key);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    for l in me {
+                        l.abort.notify_one();
+                    }
+                });
                 self.mark_dirty(ids);
                 Ok(AdminResponse::Ok)
             }
@@ -1313,9 +1303,18 @@ impl Inner {
                     nodes_online: self.sessions.read().len(),
                     uptime_secs: self.started.elapsed().as_secs(),
                     dns_domain: self.config.dns_domain.clone(),
-                    role: match &self.config.role {
-                        Role::Primary => "primary".into(),
-                        Role::Replica(p) => format!("replica of {}:{}", p.host, p.port),
+                    role: {
+                        let total = store.lighthouses.len();
+                        let linked = store
+                            .lighthouses
+                            .keys()
+                            .filter(|k| **k != self.config.keypair.public && self.peer_linked(k))
+                            .count();
+                        if total <= 1 {
+                            "standalone".into()
+                        } else {
+                            format!("{total} lighthouses, {linked} peer link(s) up")
+                        }
                     },
                     overlay: self
                         .engine
@@ -1347,7 +1346,7 @@ impl Inner {
             AdminRequest::NetworkDelete { network } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                let net = store.networks.remove(&id).expect("resolved");
+                let net = store.delete_network(id).expect("resolved");
                 self.persist(&store);
                 drop(store);
                 self.buckets.lock().forget(id);
@@ -1365,7 +1364,7 @@ impl Inner {
             AdminRequest::NetworkSetPolicy { network, policy } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                store.networks.get_mut(&id).expect("resolved").policy = policy;
+                store.set_policy(id, policy)?;
                 self.persist(&store);
                 drop(store);
                 self.mark_dirty([id]);
@@ -1374,7 +1373,7 @@ impl Inner {
             AdminRequest::NetworkSetRelayLimit { network, limit } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                store.networks.get_mut(&id).expect("resolved").relay_limit = limit;
+                store.set_relay_limit(id, limit)?;
                 self.persist(&store);
                 drop(store);
                 self.buckets.lock().forget(id);
@@ -1394,20 +1393,20 @@ impl Inner {
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect();
-                let net = store.networks.get_mut(&id).expect("resolved");
-                net.invites.push(InviteRecord {
-                    id: invite_id.clone(),
+                store.create_invite(
+                    id,
+                    &invite_id,
                     label,
-                    token_hash: Invite::token_hash(&token),
-                    uses_left: uses.max(1),
-                    expires_at: now_secs() + ttl_secs.max(60),
-                });
+                    Invite::token_hash(&token),
+                    uses.max(1),
+                    now_secs() + ttl_secs.max(60),
+                )?;
                 let invite = Invite {
                     host: self.config.public_host.clone(),
                     port: self.config.public_port,
                     lighthouse: self.config.keypair.public,
                     network: id,
-                    network_name: net.name.clone(),
+                    network_name: store.networks[&id].name.clone(),
                     token,
                     extra_lighthouses: self
                         .lighthouse_refs(&store)
@@ -1426,11 +1425,11 @@ impl Inner {
                 let id = store.resolve(&network)?;
                 let list = store.networks[&id]
                     .invites
-                    .iter()
+                    .values()
                     .map(|i| InviteSummary {
                         id: i.id.clone(),
                         label: i.label.clone(),
-                        uses_left: i.uses_left,
+                        uses_left: i.uses_left(),
                         expires_at: i.expires_at,
                     })
                     .collect();
@@ -1439,12 +1438,7 @@ impl Inner {
             AdminRequest::InviteRevoke { network, invite_id } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                let net = store.networks.get_mut(&id).expect("resolved");
-                let before = net.invites.len();
-                net.invites.retain(|i| i.id != invite_id);
-                if net.invites.len() == before {
-                    return Err(StoreError::NoSuchInvite(invite_id).into());
-                }
+                store.revoke_invite(id, &invite_id)?;
                 self.persist(&store);
                 Ok(AdminResponse::Ok)
             }
@@ -1542,7 +1536,7 @@ impl Inner {
                 Self::validate_target(&target)?;
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                let publisher = lighthouse.unwrap_or(self.primary_key());
+                let publisher = lighthouse.unwrap_or(self.config.keypair.public);
                 if !store.lighthouses.contains_key(&publisher) {
                     anyhow::bail!("unknown lighthouse {}", publisher.short());
                 }
@@ -1556,9 +1550,7 @@ impl Inner {
                     anyhow::bail!("public port must be 80, 443 or 1024 and above");
                 }
                 let taken = store.forwards.values().any(|f| {
-                    f.public_port == public_port
-                        && f.proto == proto
-                        && f.lighthouse.unwrap_or(self.primary_key()) == publisher
+                    f.public_port == public_port && f.proto == proto && f.lighthouse == publisher
                 });
                 if taken
                     || (publisher == self.config.keypair.public
@@ -1567,20 +1559,18 @@ impl Inner {
                     anyhow::bail!("public port {public_port}/{proto} is taken on that lighthouse");
                 }
                 let fid = Self::forward_id();
-                store.forwards.insert(
-                    fid.clone(),
-                    crate::store::ForwardRecord {
-                        id: fid.clone(),
-                        network: id,
-                        node,
-                        proto,
-                        public_port,
-                        target,
-                        label,
-                        lighthouse: Some(publisher),
-                        created_at: now_secs(),
-                    },
-                );
+                store.add_forward(crate::store::ForwardRecord {
+                    id: fid.clone(),
+                    network: id,
+                    node,
+                    proto,
+                    public_port,
+                    target,
+                    label,
+                    lighthouse: publisher,
+                    created_at: now_secs(),
+                    version: Default::default(),
+                });
                 self.persist(&store);
                 let list = self
                     .forward_summaries(&store)
@@ -1598,7 +1588,7 @@ impl Inner {
             }
             AdminRequest::ForwardRemove { id } => {
                 let mut store = self.store.lock();
-                let net = match store.forwards.remove(&id) {
+                let net = match store.remove_forward(&id) {
                     Some(f) => {
                         self.persist(&store);
                         f.network
@@ -1621,11 +1611,7 @@ impl Inner {
             AdminRequest::NetworkSetExposes { network, allowed } => {
                 let mut store = self.store.lock();
                 let id = store.resolve(&network)?;
-                store
-                    .networks
-                    .get_mut(&id)
-                    .expect("resolved")
-                    .exposes_allowed = allowed;
+                store.set_exposes_allowed(id, allowed)?;
                 self.persist(&store);
                 drop(store);
                 self.mark_dirty([id]);
@@ -1712,20 +1698,25 @@ impl Inner {
     }
 
     fn lighthouse_summaries(&self, store: &Store) -> Vec<ig_proto::admin::LighthouseSummary> {
-        let replicas = self.replicas.read();
         store
             .lighthouses_ordered()
             .into_iter()
             .map(|l| ig_proto::admin::LighthouseSummary {
-                connected: l.key == self.config.keypair.public
-                    || replicas.contains_key(&l.key)
-                    || (l.key == self.primary_key() && self.primary_link.lock().is_some()),
+                connected: l.key == self.config.keypair.public || self.peer_linked(&l.key),
                 name: l.name,
                 host: l.host,
                 port: l.port,
                 key: l.key,
-                primary: l.primary,
             })
+            .collect()
+    }
+
+    fn clone_links_for(&self, key: NodeId) -> Vec<PeerLink> {
+        self.peers
+            .read()
+            .values()
+            .filter(|l| l.node == key)
+            .cloned()
             .collect()
     }
 
@@ -1792,14 +1783,12 @@ async fn handle_connection(
         anyhow::bail!("node speaks protocol v{}", hello.version);
     }
     let node = noise.remote();
-    if hello.replica {
-        return handle_replica(inner, noise, node).await;
+    if hello.peer {
+        return peer_session(inner, noise, node).await;
     }
     let (tx, mut rx) = mpsc::channel::<FromLighthouse>(256);
     let session = Arc::new(Session {
         node,
-        hostname: hello.hostname.clone(),
-        os: hello.os.clone(),
         token,
         tx,
         local_endpoints: RwLock::new(Vec::new()),
@@ -1882,38 +1871,41 @@ async fn handle_connection(
     result
 }
 
-/// A registered replica: stream snapshots to it and serve its proxied writes.
-async fn handle_replica(
+/// One link to another lighthouse, whichever side dialled. Both sides send
+/// their state on connect and whenever it changes, and merge what they get.
+pub async fn peer_session(
     inner: Arc<Inner>,
     noise: NoiseStream<TcpStream>,
     node: NodeId,
 ) -> anyhow::Result<()> {
-    if !inner.is_primary() {
-        anyhow::bail!("replication link to a replica");
-    }
     let known = inner.store.lock().lighthouses.contains_key(&node);
     if !known {
         anyhow::bail!(
-            "replica {} is not registered (ig-lighthouse lighthouse add ...)",
+            "lighthouse {} is not registered here (ig-lighthouse lighthouse add ...)",
             node.short()
         );
     }
-    let (tx, mut rx) = mpsc::channel::<FromPrimary>(64);
+    let kick = Arc::new(tokio::sync::Notify::new());
     let abort = Arc::new(tokio::sync::Notify::new());
-    let link = ReplicaLink {
-        tx: tx.clone(),
+    let link_id = inner.add_peer_link(PeerLink {
+        node,
+        kick: kick.clone(),
         abort: abort.clone(),
-    };
-    if let Some(old) = inner.replicas.write().insert(node, link) {
-        old.abort.notify_one();
-    }
-    tracing::info!(replica = %node.short(), "replica connected");
-    {
-        let store = inner.store.lock();
-        let json = serde_json::to_vec(&*store)?;
-        let _ = tx.try_send(FromPrimary::Snapshot { store_json: json });
-    }
+    });
+    let name = inner.lighthouse_name(&inner.store.lock(), &node);
+    tracing::info!(lighthouse = %name, "peer link up");
+    inner.mark_dirty(
+        inner
+            .store
+            .lock()
+            .networks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+
     let (mut noise_tx, mut noise_rx) = noise.into_parts();
+    let (tx, mut rx) = mpsc::channel::<Gossip>(16);
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             if noise_tx.send(&m).await.is_err() {
@@ -1921,43 +1913,37 @@ async fn handle_replica(
             }
         }
     });
+    let _ = tx
+        .send(Gossip::State {
+            store_json: inner.store_json(),
+        })
+        .await;
+    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    ping.tick().await;
+    let mut last_heard = Instant::now();
     let result: anyhow::Result<()> = async {
         loop {
-            let msg = tokio::select! {
+            tokio::select! {
                 _ = abort.notified() => break Ok(()),
-                m = noise_rx.recv::<ToPrimary>() => m?,
-            };
-            match msg {
-                ToPrimary::Ping => {
-                    let _ = tx.try_send(FromPrimary::Pong);
+                _ = kick.notified() => {
+                    let _ = tx.send(Gossip::State { store_json: inner.store_json() }).await;
                 }
-                ToPrimary::Proxy {
-                    node: for_node,
-                    hostname,
-                    os,
-                    msg,
-                } => {
-                    {
-                        let mut store = inner.store.lock();
-                        store.touch_node(for_node, &hostname, &os);
-                        let relabelled = store.refresh_labels(&for_node);
-                        drop(store);
-                        inner.mark_dirty(relabelled);
+                _ = ping.tick() => {
+                    if last_heard.elapsed() > PEER_IDLE {
+                        anyhow::bail!("peer silent for {:?}", last_heard.elapsed());
                     }
-                    let reply = match msg {
-                        ToLighthouse::Join { network, token } => {
-                            Some(inner.apply_join(for_node, network, token))
+                    let _ = tx.send(Gossip::Ping).await;
+                }
+                m = noise_rx.recv::<Gossip>() => {
+                    last_heard = Instant::now();
+                    match m? {
+                        Gossip::State { store_json } => {
+                            if let Err(e) = inner.merge_remote(&store_json) {
+                                tracing::warn!(lighthouse = %name, error = %e, "cannot merge peer state");
+                            }
                         }
-                        ToLighthouse::Leave { network } => {
-                            Some(inner.apply_leave(for_node, network))
-                        }
-                        _ => None,
-                    };
-                    if let Some(reply) = reply {
-                        let _ = tx.try_send(FromPrimary::ProxyReply {
-                            node: for_node,
-                            msg: reply,
-                        });
+                        Gossip::Ping => { let _ = tx.send(Gossip::Pong).await; }
+                        Gossip::Pong => {}
                     }
                 }
             }
@@ -1965,13 +1951,17 @@ async fn handle_replica(
     }
     .await;
     writer.abort();
-    {
-        let mut r = inner.replicas.write();
-        if r.get(&node).is_some_and(|cur| cur.tx.same_channel(&tx)) {
-            r.remove(&node);
-        }
-    }
-    tracing::info!(replica = %node.short(), "replica disconnected");
+    inner.remove_peer_link(link_id);
+    inner.mark_dirty(
+        inner
+            .store
+            .lock()
+            .networks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+    tracing::info!(lighthouse = %name, "peer link down");
     result
 }
 
