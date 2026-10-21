@@ -1,10 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Intergalactic</string>
-    <string name="invite_hint">Paste invite (ig1:…)</string>
+    <string name="invite_hint">Invite (ig1:…)</string>
     <string name="join">Join</string>
+    <string name="join_network">Join network</string>
+    <string name="scan_qr">Scan QR code</string>
+    <string name="scan_prompt">Point the camera at the invite QR code</string>
+    <string name="or_paste">or paste an invite</string>
+    <string name="paste">Paste</string>
+    <string name="cancel">Cancel</string>
+    <string name="leave">Leave</string>
+    <string name="leave_network">Leave %1$s?</string>
+    <string name="leave_network_detail">This phone drops its address in %1$s. You need a new invite to come back.</string>
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
+    <string name="tunnel_on">Connected</string>
+    <string name="tunnel_off">Tunnel off</string>
+    <string name="tunnel_starting">Connecting…</string>
+    <string name="no_networks">No networks yet. Tap Join network and scan an invite.</string>
+    <string name="no_peers">No peers in your networks yet.</string>
+    <string name="peers_online">%1$d of %2$d peers online</string>
+    <string name="networks">Networks</string>
+    <string name="peers">Peers</string>
     <string name="notification_channel">Intergalactic tunnel</string>
     <string name="notification_title">Intergalactic is connected</string>
+    <string name="notification_no_networks">No networks joined</string>
+    <string name="check_updates">Check for updates</string>
+    <string name="update_available">Update %1$s available</string>
+    <string name="update_detail">You run %1$s. The update installs over this app and keeps your networks.</string>
+    <string name="update_install">Install</string>
+    <string name="update_later">Later</string>
+    <string name="update_downloading">Downloading %1$s…</string>
+    <string name="update_allow">Allow Intergalactic to install updates in the settings page that opened, then tap Install again.</string>
+    <string name="update_none">You run the newest version (%1$s).</string>
+    <string name="update_failed">Update check failed: %1$s</string>
 </resources>

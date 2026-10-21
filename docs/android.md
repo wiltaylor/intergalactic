@@ -36,6 +36,38 @@ Verified: with NDK r27, cargo-ndk, Gradle 8.10.2 and JDK 21 the debug APK assemb
 `lab/android/run.sh` runs it on an API 35 x86_64 emulator against a lighthouse and a Linux
 node: VPN up, IPv4 and IPv6 traffic both ways, peer DNS inside the VPN.
 
+## Releases, signing and in-app updates
+
+CI builds the APK on every release (`.github/workflows/ci.yml`, job `build-android`) and
+attaches it as `intergalactic-<version>.apk`. The app checks the project's GitHub Releases
+when it opens (at most every six hours, or from the menu) and offers any newer version in a
+card; Install downloads the APK over the phone's normal connection and hands it to the
+package installer. Pre-releases count as updates, because the app itself ships as
+pre-releases for now. A local build is `0.0.0-dev`, so it always sees the newest release.
+
+Android only installs an update that is signed with the same key as the installed app, so
+every release is signed with one key that never enters the repository. It lives in four
+repository secrets: `ANDROID_KEYSTORE_BASE64` (the PKCS12 keystore, base64), `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS` and, if it differs from the store password, `ANDROID_KEY_PASSWORD`. Keep a
+backup of the keystore outside GitHub: a lost key means every phone must uninstall and
+reinstall. To sign a local release build with the same key:
+
+```sh
+export IG_ANDROID_KEYSTORE=~/.config/intergalactic/android-release.jks
+export IG_ANDROID_KEYSTORE_PASSWORD=... IG_ANDROID_KEY_ALIAS=intergalactic
+IG_VERSION=0.0.0-dev gradle assembleRelease      # app/build/outputs/apk/release/app-release.apk
+```
+
+`IG_VERSION` sets `versionName`; `versionCode` is derived from it so a stable release
+outranks its own pre-release. Debug builds use the debug key and cannot be updated in place
+by a release: uninstall them first.
+
+## Joining with a QR code
+
+`ig-lighthouse invite create dev --qr` prints the invite as a QR code in the terminal, and
+`ig invite show --qr <invite>` does the same for an existing invite (`--svg` writes an SVG for
+a web page). In the app, Join network, then Scan QR code.
+
 ## Automation
 
 The activity accepts an invite as an intent extra and can connect at once:

@@ -23,6 +23,7 @@ ig-lighthouse = { path = "crates/ig-lighthouse" }
 ig-node = { path = "crates/ig-node" }
 
 anyhow = "1"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 thiserror = "2"
 tokio = { version = "1.44", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs", "signal"] }
 tracing = "0.1"

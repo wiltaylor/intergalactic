@@ -129,7 +129,7 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
                 return START_NOT_STICKY
             }
             else -> {
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(NOTIFICATION_ID, buildNotification(statusText()))
                 val engine = EngineHolder.ensureStarted(this)
                 rebuild(engine.networks())
                 running = true
@@ -139,7 +139,32 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
     }
 
     override fun onNetworksChanged(networks: List<MobileNetwork>) {
-        if (running) rebuild(networks)
+        if (running) {
+            rebuild(networks)
+            updateNotification()
+        }
+    }
+
+    override fun onPeersChanged() {
+        if (running) updateNotification()
+    }
+
+    private var lastNotificationText: String? = null
+
+    /** Keep the status-bar entry current: networks and peers online. */
+    private fun updateNotification() {
+        val text = statusText()
+        if (text == lastNotificationText) return
+        lastNotificationText = text
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    private fun statusText(): String {
+        val status = runCatching { EngineHolder.engine?.status() }.getOrNull() ?: return getString(R.string.notification_no_networks)
+        if (status.networks.isEmpty()) return getString(R.string.notification_no_networks)
+        val nets = status.networks.joinToString(", ") { it.name }
+        val online = status.peers.count { it.online }
+        return "$nets · " + getString(R.string.peers_online, online, status.peers.size)
     }
 
     /** What the current interface was built from; a push that changes nothing here keeps it. */
@@ -232,7 +257,7 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
         stopSelf()
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(text: String): Notification {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             nm.createNotificationChannel(
@@ -242,11 +267,18 @@ class IgVpnService : VpnService(), EngineHolder.Listener {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
+        val stop = PendingIntent.getService(
+            this, 1, Intent(this, IgVpnService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
+        )
         val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
+        val disconnect = Notification.Action.Builder(null, getString(R.string.disconnect), stop).build()
         return b.setContentTitle(getString(R.string.notification_title))
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentIntent(open)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .addAction(disconnect)
             .build()
     }
 }

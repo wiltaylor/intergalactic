@@ -72,6 +72,28 @@ impl FromStr for Invite {
     }
 }
 
+/// The invite as a QR code drawn with Unicode half blocks, for a terminal.
+/// The Android app scans it to join.
+pub fn qr_terminal(invite: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(invite.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
+}
+
+/// The invite as an SVG QR code, for a web page or a document.
+pub fn qr_svg(invite: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(invite.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(320, 320)
+        .quiet_zone(true)
+        .build())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

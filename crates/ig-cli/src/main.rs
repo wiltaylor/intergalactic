@@ -59,7 +59,15 @@ enum Cmd {
 #[derive(Subcommand)]
 enum InviteCmd {
     /// Show what an invite contains.
-    Show { invite: String },
+    Show {
+        invite: String,
+        /// Also print the invite as a QR code for the Android app to scan.
+        #[arg(long)]
+        qr: bool,
+        /// Print only the QR code as an SVG document (for a web page or a printout).
+        #[arg(long, conflicts_with = "qr")]
+        svg: bool,
+    },
     /// Print the same invite with a different lighthouse host (and optional port),
     /// for a lighthouse that is reachable under another name from where you are.
     Rehost {
@@ -184,11 +192,25 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Invite { cmd } => match cmd {
-            InviteCmd::Show { invite } => {
+            InviteCmd::Show { invite, qr, svg } => {
                 let inv: ig_proto::Invite = invite.parse()?;
+                if svg {
+                    println!(
+                        "{}",
+                        ig_proto::invite::qr_svg(&invite).map_err(anyhow::Error::msg)?
+                    );
+                    return Ok(());
+                }
                 println!("lighthouse {}:{}", inv.host, inv.port);
                 println!("key        {}", inv.lighthouse);
                 println!("network    {} ({})", inv.network_name, inv.network);
+                if qr {
+                    println!();
+                    println!(
+                        "{}",
+                        ig_proto::invite::qr_terminal(&invite).map_err(anyhow::Error::msg)?
+                    );
+                }
                 Ok(())
             }
             InviteCmd::Rehost { invite, host, port } => {

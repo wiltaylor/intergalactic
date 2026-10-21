@@ -46,7 +46,8 @@ echo "app started; accepting the VPN consent dialog if it appears"
 tap_ok() {
   adb shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 || return 1
   local b
-  b=$(adb shell cat /sdcard/ui.xml | tr '>' '\n' | grep 'text="OK"' | grep -oE 'bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"' | head -1 | tr -dc '0-9,[]')
+  # The notification permission prompt ("Allow") comes first on Android 13+, then the VPN consent ("OK").
+  b=$(adb shell cat /sdcard/ui.xml | tr '>' '\n' | grep -E 'text="(OK|Allow)"' | grep -oE 'bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"' | head -1 | tr -dc '0-9,[]')
   [ -n "$b" ] || return 1
   local x1 y1 x2 y2
   IFS='[],' read -r _ x1 y1 _ x2 y2 _ <<< "$b"

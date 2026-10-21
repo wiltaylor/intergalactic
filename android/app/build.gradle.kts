@@ -3,6 +3,23 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// CI stamps the release version (IG_VERSION=0.2.0 or 0.2.0-alpha). A local build is
+// 0.0.0-dev, which every release outranks, so a dev install always sees an update.
+val igVersion: String = System.getenv("IG_VERSION") ?: "0.0.0-dev"
+
+fun versionCodeOf(v: String): Int {
+    val core = v.substringBefore('-')
+    val parts = core.split('.').map { it.toIntOrNull() ?: 0 } + listOf(0, 0, 0)
+    if (core == "0.0.0") return 1
+    // A stable release outranks its own pre-release: 0.2.1-alpha < 0.2.1.
+    val stable = if (v.contains('-')) 0 else 50
+    return parts[0] * 1_000_000 + parts[1] * 10_000 + parts[2] * 100 + stable
+}
+
+// Release signing comes from the environment (CI secrets or a local keystore);
+// see docs/android.md. Without it the release build is unsigned.
+val keystorePath: String? = System.getenv("IG_ANDROID_KEYSTORE")
+
 android {
     namespace = "dev.intergalactic.app"
     compileSdk = 35
@@ -11,18 +28,35 @@ android {
         applicationId = "dev.intergalactic.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = versionCodeOf(igVersion)
+        versionName = igVersion
         ndk {
             // Must match the targets built by build-rust.sh.
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+        // Where the in-app updater looks for new releases.
+        buildConfigField("String", "GITHUB_REPO", "\"wiltaylor/intergalactic\"")
+    }
+
+    signingConfigs {
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("IG_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("IG_ANDROID_KEY_ALIAS") ?: "intergalactic"
+                keyPassword = System.getenv("IG_ANDROID_KEY_PASSWORD") ?: System.getenv("IG_ANDROID_KEYSTORE_PASSWORD")
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePath != null) signingConfig = signingConfigs.getByName("release")
         }
+    }
+    buildFeatures {
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -47,4 +81,7 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("androidx.activity:activity-ktx:1.9.3")
+    // QR scanner for invites (camera, offline; no Play Services needed).
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

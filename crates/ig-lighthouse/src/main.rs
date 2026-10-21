@@ -223,6 +223,9 @@ enum InviteCmd {
         ttl: humantime::Duration,
         #[arg(long, default_value = "")]
         label: String,
+        /// Also print the invite as a QR code for the Android app to scan.
+        #[arg(long)]
+        qr: bool,
     },
     List {
         network: String,
@@ -379,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                 uses,
                 ttl,
                 label,
+                qr,
             } => {
                 let r = admin_socket::request(
                     &admin_sock,
@@ -394,6 +398,14 @@ async fn main() -> anyhow::Result<()> {
                     AdminResponse::Invite { invite, invite_id } => {
                         eprintln!("invite {invite_id} created. On the joining machine run:\n");
                         println!("ig join {invite}");
+                        if qr {
+                            println!("\nOr scan this in the Android app:\n");
+                            println!(
+                                "{}",
+                                ig_proto::invite::qr_terminal(&invite)
+                                    .map_err(anyhow::Error::msg)?
+                            );
+                        }
                         Ok(())
                     }
                     other => fail(other),
