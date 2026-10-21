@@ -65,4 +65,24 @@ Android Studio, which generates it.
    `VpnService.protect`.
 5. On membership changes the service re-establishes the interface and attaches the new fd.
 
+## DNS
+
+Android has no split DNS: once a VPN adds DNS servers, every query from every app goes to
+them. `addSearchDomain` only adds a suffix. So the in-engine responder must answer public
+names too, not only `*.ig.internal`.
+
+- The responder answers overlay names from its table. Unknown names under an overlay zone,
+  and reverse lookups inside an overlay range, get NXDOMAIN locally.
+- Every other name is forwarded. `IgVpnService` registers a `ConnectivityManager` callback
+  for networks with `NET_CAPABILITY_INTERNET` and `NET_CAPABILITY_NOT_VPN`, reads their
+  `LinkProperties.dnsServers` (Wi-Fi and Ethernet first, link-local addresses skipped) and
+  calls `setUpstreamDns` on every change and after each `establish()`.
+- The engine relays the raw query over a fresh UDP socket per query. It passes that socket
+  to `protectSocket`, so `VpnService.protect` routes it over the underlying network and the
+  query cannot loop back into the tunnel. Upstreams are tried in order with a 2 s timeout
+  each; at most 64 forwards are in flight, more are dropped. The answer is written into the
+  TUN with the responder address as source, exactly like a local answer.
+- Desktop nodes pass an empty `upstream_dns` list and behave as before, because their OS
+  resolver sends only overlay names to the responder.
+
 Long-press a network in the list to leave it.

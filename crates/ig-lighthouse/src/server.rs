@@ -414,6 +414,7 @@ impl Inner {
                 persistent_keepalive: Some(25),
                 relay_only: false,
                 gateway: false,
+                upstream_dns: Vec::new(),
             },
             Arc::new(NoProtector),
         )
@@ -704,6 +705,9 @@ impl Inner {
         if !net.exposes_allowed {
             anyhow::bail!("network `{}` does not allow ephemeral forwards", net.name);
         }
+        if Self::resolve_target(&store, network, &node, target).is_none() {
+            return Err(Self::target_error(target));
+        }
         let (lo, hi) = self.config.forward_range;
         if lo > hi {
             anyhow::bail!("this lighthouse does not hand out ephemeral ports");
@@ -822,24 +826,47 @@ impl Inner {
 
     /// Resolve a forward target (`self:PORT`, `<device>:PORT`, `<ip>:PORT`) to an
     /// overlay socket address for `node` in `network`.
+    ///
+    /// A literal address is accepted only when it is one of `node`'s own overlay
+    /// addresses in `network` or the overlay address of a device of `network`.
+    /// Any other address (another member, another network, a non-overlay host)
+    /// yields `None`, so a forward can never reach past the node's own network
+    /// isolation through the lighthouse's memberships.
     fn resolve_target(
         store: &Store,
         network: NetworkId,
         node: &NodeId,
         target: &str,
     ) -> Option<SocketAddr> {
+        use std::net::IpAddr;
         let (host, port) = target.rsplit_once(':')?;
         let host = host.trim_matches(['[', ']']);
         let port: u16 = port.parse().ok()?;
         let net = store.networks.get(&network)?;
-        let ip: std::net::IpAddr = if host == "self" {
-            std::net::IpAddr::V4(net.members.get(node)?.address)
-        } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let member = net.members.get(node)?;
+        let ip: IpAddr = if host == "self" {
+            IpAddr::V4(member.address)
+        } else if let Ok(ip) = host.parse::<IpAddr>() {
+            let own = ip == IpAddr::V4(member.address)
+                || member.address6.is_some_and(|a6| ip == IpAddr::V6(a6));
+            let device = net.devices.values().any(|d| {
+                ip == IpAddr::V4(d.address) || d.address6.is_some_and(|a6| ip == IpAddr::V6(a6))
+            });
+            if !(own || device) {
+                return None;
+            }
             ip
         } else {
-            std::net::IpAddr::V4(net.devices.get(host)?.address)
+            IpAddr::V4(net.devices.get(host)?.address)
         };
         Some(SocketAddr::new(ip, port))
+    }
+
+    /// Error for a target that does not resolve for the node in that network.
+    fn target_error(target: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "target `{target}` must be self:PORT, a device of this network, or this node's own overlay address"
+        )
     }
 
     fn reconcile_forwards(&self) {
@@ -1540,11 +1567,11 @@ impl Inner {
                 if !store.lighthouses.contains_key(&publisher) {
                     anyhow::bail!("unknown lighthouse {}", publisher.short());
                 }
-                if Self::resolve_target(&store, id, &node, &target).is_none() {
-                    anyhow::bail!("target `{target}` does not resolve in that network (use self:PORT or a device name)");
-                }
                 if !store.networks[&id].members.contains_key(&node) {
                     anyhow::bail!("node is not a member of that network");
+                }
+                if Self::resolve_target(&store, id, &node, &target).is_none() {
+                    return Err(Self::target_error(&target));
                 }
                 if public_port < 1024 && public_port != 80 && public_port != 443 {
                     anyhow::bail!("public port must be 80, 443 or 1024 and above");

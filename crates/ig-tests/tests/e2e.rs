@@ -111,6 +111,7 @@ async fn node_with_key(
             persistent_keepalive: Some(25),
             relay_only,
             gateway: false,
+            upstream_dns: Vec::new(),
         },
         Arc::new(NoProtector),
     )
@@ -703,6 +704,7 @@ async fn gateway_translates_device_traffic_and_fails_over() {
                 persistent_keepalive: Some(25),
                 relay_only: false,
                 gateway,
+                upstream_dns: Vec::new(),
             },
             Arc::new(NoProtector),
         )
@@ -834,6 +836,7 @@ async fn ipv6_devices_are_translated_too() {
                 persistent_keepalive: Some(25),
                 relay_only: false,
                 gateway,
+                upstream_dns: Vec::new(),
             },
             Arc::new(NoProtector),
         )
@@ -1305,6 +1308,303 @@ async fn two_lighthouses_merge_state_and_each_serves_alone() {
     alpha.engine.shutdown().await;
     bravo.engine.shutdown().await;
     charlie.engine.shutdown().await;
+    a2.shutdown().await;
+    b.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn forward_targets_stay_inside_the_callers_network() {
+    init_tracing();
+    let lh = lighthouse().await;
+    create_network(&lh, "dev", "10.95.0.0/24", Some("fd95::/64"));
+    create_network(&lh, "game", "10.94.0.0/24", Some("fd94::/64"));
+    let inv_dev = invite(&lh, "dev", 5);
+    let inv_game = invite(&lh, "game", 5);
+
+    // alpha is in both networks; bravo only in `game`.
+    let a = node("alpha", vec![], false).await;
+    let (ia_dev, _os_a_dev) = join_with_tun(&a, &inv_dev).await;
+    let (ia_game, _os_a_game) = join_with_tun(&a, &inv_game).await;
+    let b = node("bravo", vec![], false).await;
+    let (ib, _os_b) = join_with_tun(&b, &inv_game).await;
+    let tcp = ig_proto::tunnel::ForwardProto::Tcp;
+
+    // bravo cannot publish alpha's `dev` endpoint, over IPv4 or IPv6.
+    for target in [
+        format!("{}:22", v4(&ia_dev)),
+        format!("[{}]:22", v6(&ia_dev)),
+    ] {
+        let err = b
+            .engine
+            .expose(ib.id, tcp, None, target.clone(), String::new(), None)
+            .await
+            .expect_err("cross-network target must be refused");
+        assert!(
+            err.to_string().contains("own overlay address"),
+            "unexpected error for {target}: {err}"
+        );
+        assert!(lh.forward_rules().is_empty(), "no rule for {target}");
+    }
+    // Nor another member of its own network.
+    assert!(b
+        .engine
+        .expose(
+            ib.id,
+            tcp,
+            None,
+            format!("{}:22", v4(&ia_game)),
+            String::new(),
+            None,
+        )
+        .await
+        .is_err());
+    assert!(lh.forward_rules().is_empty());
+    assert!(b.engine.status().networks[0].info.forwards.is_empty());
+
+    // Its own literal addresses, `self` and a device of the network still work.
+    let f4 = b
+        .engine
+        .expose(
+            ib.id,
+            tcp,
+            None,
+            format!("{}:22", v4(&ib)),
+            String::new(),
+            None,
+        )
+        .await
+        .expect("own v4 address");
+    let f6 = b
+        .engine
+        .expose(
+            ib.id,
+            tcp,
+            None,
+            format!("[{}]:22", v6(&ib)),
+            String::new(),
+            None,
+        )
+        .await
+        .expect("own v6 address");
+    let fs = b
+        .engine
+        .expose(ib.id, tcp, None, "self:80".into(), String::new(), None)
+        .await
+        .expect("self");
+    let rules = lh.forward_rules();
+    assert_eq!(rules.len(), 3);
+    assert!(rules.iter().any(
+        |r| r.public_port == f4.public_port && r.dst == std::net::SocketAddr::new(v4(&ib), 22)
+    ));
+    assert!(rules.iter().any(
+        |r| r.public_port == f6.public_port && r.dst == std::net::SocketAddr::new(v6(&ib), 22)
+    ));
+    assert!(rules.iter().any(
+        |r| r.public_port == fs.public_port && r.dst == std::net::SocketAddr::new(v4(&ib), 80)
+    ));
+    assert!(matches!(
+        lh.admin(AdminRequest::DeviceAdd {
+            network: "game".into(),
+            name: "console".into(),
+            target: "192.0.2.7".parse().unwrap(),
+            target6: None,
+            gateways: vec![a.engine.node_id()],
+        }),
+        AdminResponse::Devices(_)
+    ));
+    let console = match lh.admin(AdminRequest::DeviceList {
+        network: "game".into(),
+    }) {
+        AdminResponse::Devices(d) => d[0].address,
+        other => panic!("{other:?}"),
+    };
+    b.engine
+        .expose(
+            ib.id,
+            tcp,
+            None,
+            format!("{console}:3074"),
+            String::new(),
+            None,
+        )
+        .await
+        .expect("device literal address");
+    assert_eq!(lh.forward_rules().len(), 4);
+
+    // The admin path applies the same check to permanent forwards.
+    let r = lh.admin(AdminRequest::ForwardAdd {
+        network: "game".into(),
+        node: b.engine.node_id(),
+        proto: tcp,
+        public_port: 30090,
+        target: format!("{}:22", v4(&ia_dev)),
+        label: "leak".into(),
+        lighthouse: None,
+    });
+    assert!(matches!(r, AdminResponse::Error { .. }), "{r:?}");
+    let r = lh.admin(AdminRequest::ForwardAdd {
+        network: "game".into(),
+        node: b.engine.node_id(),
+        proto: tcp,
+        public_port: 30090,
+        target: format!("[{}]:22", v6(&ia_dev)),
+        label: "leak6".into(),
+        lighthouse: None,
+    });
+    assert!(matches!(r, AdminResponse::Error { .. }), "{r:?}");
+    assert_eq!(lh.forward_rules().len(), 4);
+    assert!(matches!(
+        lh.admin(AdminRequest::ForwardList),
+        AdminResponse::Forwards(list) if list.iter().all(|f| f.info.label != "leak" && f.info.label != "leak6")
+    ));
+    let r = lh.admin(AdminRequest::ForwardAdd {
+        network: "game".into(),
+        node: b.engine.node_id(),
+        proto: tcp,
+        public_port: 30090,
+        target: format!("{}:22", v4(&ib)),
+        label: "ok".into(),
+        lighthouse: None,
+    });
+    assert!(matches!(r, AdminResponse::Forwards(_)), "{r:?}");
+    assert_eq!(lh.forward_rules().len(), 5);
+
+    a.engine.shutdown().await;
+    b.engine.shutdown().await;
+    lh.shutdown().await;
+}
+
+/// Relay-only members keep talking when the lighthouse that relays for them
+/// goes away, and again when it returns and the other one goes away. Nothing
+/// is restarted on the node side.
+#[tokio::test]
+async fn relay_only_members_fail_over_between_lighthouses() {
+    init_tracing();
+    let dir = std::env::temp_dir().join(format!("ig-relay-failover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut acfg, _) = lighthouse_config("lh-a");
+    acfg.state_path = Some(dir.join("a.json"));
+    let a_key = acfg.keypair.public;
+    let a = Lighthouse::start(acfg.clone()).await.unwrap();
+    let a_addr = a.local_addr();
+    let (mut bcfg, _) = lighthouse_config("lh-b");
+    bcfg.overlay = Overlay::Off;
+    let b_key = bcfg.keypair.public;
+    let b = Lighthouse::start(bcfg).await.unwrap();
+
+    let r = a.admin(AdminRequest::LighthouseAdd {
+        name: "lh-b".into(),
+        host: "127.0.0.1".into(),
+        port: b.local_addr().port(),
+        key: b_key,
+    });
+    assert!(matches!(r, AdminResponse::Lighthouses(_)), "{r:?}");
+    let r = b.admin(AdminRequest::LighthouseAdd {
+        name: "lh-a".into(),
+        host: "127.0.0.1".into(),
+        port: a_addr.port(),
+        key: a_key,
+    });
+    assert!(matches!(r, AdminResponse::Lighthouses(_)), "{r:?}");
+    let linked = |lh: &Lighthouse| matches!(lh.admin(AdminRequest::LighthouseList), AdminResponse::Lighthouses(l) if l.len() == 2 && l.iter().all(|x| x.connected));
+    wait_for("a linked to b", || linked(&a)).await;
+    wait_for("b linked to a", || linked(&b)).await;
+    create_network(&a, "dev", "10.99.4.0/24", None);
+    wait_for(
+        "b has the network",
+        || matches!(b.admin(AdminRequest::NetworkList), AdminResponse::Networks(n) if n.len() == 1),
+    )
+    .await;
+
+    // alpha joins through a, bravo through b; both can only be relayed.
+    let inv = invite(&a, "dev", 5);
+    assert_eq!(inv.extra_lighthouses.len(), 1);
+    let alpha = node("alpha", vec![], true).await;
+    let (ia, mut os_a) = join_with_tun(&alpha, &inv).await;
+    let mut inv_b = inv.clone();
+    inv_b.host = "127.0.0.1".into();
+    inv_b.port = b.local_addr().port();
+    inv_b.lighthouse = b_key;
+    inv_b.extra_lighthouses = vec![ig_proto::control::LighthouseRef {
+        host: "127.0.0.1".into(),
+        port: a_addr.port(),
+        key: a_key,
+        name: "lh-a".into(),
+    }];
+    let bravo = node("bravo", vec![], true).await;
+    let (ib, mut os_b) = join_with_tun(&bravo, &inv_b).await;
+    assert_ne!(ia.address, ib.address);
+    let lighthouses_up = |n: &Node| -> usize {
+        n.engine.status().networks[0]
+            .lighthouses
+            .iter()
+            .filter(|(_, up)| *up)
+            .count()
+    };
+    wait_for("both nodes see both lighthouses up", || {
+        lighthouses_up(&alpha) == 2 && lighthouses_up(&bravo) == 2
+    })
+    .await;
+    wait_for("peers", || {
+        alpha
+            .engine
+            .status()
+            .peers
+            .iter()
+            .any(|p| p.hostname == "bravo")
+            && bravo
+                .engine
+                .status()
+                .peers
+                .iter()
+                .any(|p| p.hostname == "alpha")
+    })
+    .await;
+    let pkt = build_udp(v4(&ia), 1, v4(&ib), 2, b"relayed");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+    wait_for("relay path reported", || {
+        first_member(&alpha.engine).path == PeerPath::Relay
+    })
+    .await;
+
+    // a goes down: the nodes keep their sessions and relay through b.
+    a.shutdown().await;
+    drop(a);
+    wait_for("both nodes see a down", || {
+        lighthouses_up(&alpha) == 1 && lighthouses_up(&bravo) == 1
+    })
+    .await;
+    let pkt = build_udp(v4(&ia), 3, v4(&ib), 4, b"via b");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+    let pkt = build_udp(v4(&ib), 5, v4(&ia), 6, b"via b, back");
+    assert_eq!(deliver(&os_b, &mut os_a, pkt.clone()).await, pkt);
+
+    // a returns with its old key and state. (It gets a new port: the old
+    // lighthouse's replication tasks keep its sockets open after shutdown.)
+    // The nodes learn the new address from b and traffic still flows.
+    let (mut acfg2, _) = lighthouse_config("lh-a");
+    acfg2.keypair = acfg.keypair.clone();
+    acfg2.state_path = acfg.state_path.clone();
+    let a2 = Lighthouse::start(acfg2).await.unwrap();
+    wait_for("a2 linked to b", || linked(&a2)).await;
+    let a2_port = a2.local_addr().port().to_string();
+    wait_for("nodes learned a2's address", || {
+        [&alpha, &bravo].iter().all(|n| {
+            n.engine.status().networks[0]
+                .lighthouses
+                .iter()
+                .any(|(hp, _)| hp.ends_with(&a2_port))
+        })
+    })
+    .await;
+    let pkt = build_udp(v4(&ia), 7, v4(&ib), 8, b"a is back");
+    assert_eq!(deliver(&os_a, &mut os_b, pkt.clone()).await, pkt);
+    let pkt = build_udp(v4(&ib), 9, v4(&ia), 10, b"a is back, reverse");
+    assert_eq!(deliver(&os_b, &mut os_a, pkt.clone()).await, pkt);
+
+    alpha.engine.shutdown().await;
+    bravo.engine.shutdown().await;
     a2.shutdown().await;
     b.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

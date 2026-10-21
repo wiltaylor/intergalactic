@@ -13,10 +13,24 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
+/// Dialers by peer key. Dropped (when `run_peers` is aborted on shutdown), it
+/// aborts every dialer, so no link outlives the lighthouse.
+#[derive(Default)]
+struct Dialers(HashMap<NodeId, (LighthouseRecord, JoinHandle<()>)>);
+
+impl Drop for Dialers {
+    fn drop(&mut self) {
+        for (_, (_, h)) in self.0.drain() {
+            h.abort();
+        }
+    }
+}
+
 /// Start and stop dialers as lighthouses are added, changed and removed.
 pub async fn run_peers(inner: Arc<Inner>) {
     let me = inner.config.keypair.public;
-    let mut dialers: HashMap<NodeId, (LighthouseRecord, JoinHandle<()>)> = HashMap::new();
+    let mut dialers = Dialers::default();
+    let dialers = &mut dialers.0;
     loop {
         let wanted: Vec<LighthouseRecord> = inner
             .lighthouse_records()

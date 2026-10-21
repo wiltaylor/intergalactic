@@ -1,10 +1,9 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ig_core::{Engine, EngineConfig, EngineEvent, Membership, NoProtector, NodeState, TunScope};
-use ig_node::dns_os::{self, DnsMode};
+use ig_node::dns_os::{self, DnsMode, DnsPlan};
 use ig_node::tun::OsTun;
 use ig_node::{ipc, paths};
-use ig_proto::control::NetworkInfo;
 use ig_proto::ipc::{IpcRequest, IpcResponse};
 use ig_proto::{Invite, Keypair, NetworkId};
 use std::collections::HashMap;
@@ -217,6 +216,7 @@ async fn run(
             persistent_keepalive: Some(25),
             relay_only: opts.relay_only,
             gateway: opts.gateway,
+            upstream_dns: Vec::new(),
         },
         Arc::new(NoProtector),
     )
@@ -227,7 +227,15 @@ async fn run(
 
     // Interfaces we created, by network. Reconciled on every membership change.
     let mut tuns: HashMap<NetworkId, (Membership, String)> = HashMap::new();
-    reconcile(&engine, &mut tuns, engine.memberships(), dns_mode);
+    // Resolver configuration applied last; None until the first reconcile.
+    let mut dns_plan: Option<DnsPlan> = None;
+    reconcile(
+        &engine,
+        &mut tuns,
+        engine.memberships(),
+        dns_mode,
+        &mut dns_plan,
+    );
     let mut gateway_prefixes = GatewayState::default();
     reconcile_gateway(&engine, opts.gateway, &mut gateway_prefixes);
     dns_os::apply_hosts(dns_mode, &engine.status());
@@ -255,7 +263,7 @@ async fn run(
                         if let Err(e) = st.save(&state_path) {
                             tracing::error!(error = %e, "failed to save state");
                         }
-                        reconcile(&engine, &mut tuns, list, dns_mode);
+                        reconcile(&engine, &mut tuns, list, dns_mode, &mut dns_plan);
                         dns_os::apply_hosts(dns_mode, &engine.status());
                         reconcile_gateway(&engine, opts.gateway, &mut gateway_prefixes);
                     }
@@ -340,12 +348,16 @@ struct GatewayState {
 }
 
 /// Create TUNs for new memberships, drop TUNs for memberships that went away,
-/// recreate TUNs whose addresses changed. Then point the resolver at them.
+/// recreate TUNs whose addresses changed. Then point the resolver at them:
+/// the desired DNS plan is derived from the interfaces that exist afterwards
+/// and applied when it differs from `dns_plan`, the plan applied last. So a
+/// removed network, a renamed network or a new DNS suffix all reach the OS.
 fn reconcile(
     engine: &Engine,
     tuns: &mut HashMap<NetworkId, (Membership, String)>,
     memberships: Vec<Membership>,
     dns_mode: DnsMode,
+    dns_plan: &mut Option<DnsPlan>,
 ) {
     let wanted: HashMap<NetworkId, Membership> =
         memberships.into_iter().map(|m| (m.network.id, m)).collect();
@@ -368,7 +380,6 @@ fn reconcile(
             ig_node::firewall::remove_interface(&name);
         }
     }
-    let mut changed = false;
     for (id, m) in wanted {
         if let Some((existing, _)) = tuns.get_mut(&id) {
             // Same addresses; refresh the stored copy (policy/DNS names may differ).
@@ -383,20 +394,16 @@ fn reconcile(
                     tracing::error!(error = %e, "attach failed");
                     continue;
                 }
-                dns_os::configure_interface(dns_mode, &name, &m.network);
                 ig_node::firewall::allow_interface(&name);
                 tuns.insert(id, (m, name));
-                changed = true;
             }
             Err(e) => {
                 tracing::error!(network = %m.network.name, error = %e, "cannot create tun device (need root/CAP_NET_ADMIN on Linux, wintun.dll + admin on Windows)");
             }
         }
     }
-    if changed || tuns.is_empty() {
-        let nets: Vec<NetworkInfo> = tuns.values().map(|(m, _)| m.network.clone()).collect();
-        dns_os::apply_windows_nrpt(dns_mode, &nets);
-    }
+    let next = DnsPlan::new(tuns.values().map(|(m, name)| (name.as_str(), &m.network)));
+    dns_os::apply_plan(dns_mode, dns_plan, next);
 }
 
 async fn handle_ipc(engine: &Engine, req: IpcRequest) -> IpcResponse {

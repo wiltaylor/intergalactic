@@ -76,8 +76,10 @@ from it through Windows NetNat.
 `windows.ws` checks: `ig-node service install` registers and starts the service as
 LocalSystem; the Wintun adapter carries both addresses; ping to a Linux peer over IPv4
 and IPv6; NRPT rules exist and `Resolve-DnsName` answers; the Linux peer reaches Windows
-by address and by name (the daemon adds a firewall rule for its interface); `service
-stop` then `service start`; the restarted node is reachable again within a second.
+by address and by name (the daemon adds a firewall rule for its interface); joining `game`
+adds its NRPT rule and leaving it again removes that rule while the shared `.ig.test` rule
+and short names keep working; `service stop` then `service start`; the restarted node is
+reachable again within a second.
 
 ## nat: two nodes behind two real NATs
 
@@ -118,8 +120,10 @@ cargo build --release -p ig-lighthouse -p ig-cli
 The script installs the debug APK, launches the activity with the invite as an intent
 extra (`--es invite ... --ez connect true`), accepts the VPN consent dialog, and then checks:
 `tun0` carries both addresses; ping from the emulator to the node over IPv4 and IPv6; the
-node's name resolves through the VPN's DNS server; the node pings the emulator and resolves
-its name; the lighthouse lists both members.
+node's name resolves through the VPN's DNS server; a public name (`github.com`) still
+resolves with the VPN up, through the engine's forwarder to the underlying network's
+resolver; the node pings the emulator and resolves its name; the lighthouse lists both
+members.
 
 ## Results on 2026-10-21
 
@@ -153,3 +157,7 @@ Windows Server 2025 templates, Android 35 emulator). Bugs found and fixed by the
 - Two devices with the same physical address on one gateway got the same reverse mapping,
   so replies carried the wrong overlay source. A physical address is now unique per network
   and the reverse lookup is scoped to the network of the reply's destination.
+- A code review (see the commit "fix: ...review findings") found five more: forward targets could
+  name another network's member; relay-only peers kept a dead lighthouse as relay; forward DNAT
+  matched any destination on the port; Android lost public DNS with the VPN up; Windows NRPT
+  rules were not rebuilt after leaving a network. All five are fixed and covered by the labs above.

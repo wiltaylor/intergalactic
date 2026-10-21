@@ -6,6 +6,7 @@ use ig_proto::ipc::PeerPath;
 use ig_proto::{NetworkId, NodeId};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,9 +22,29 @@ pub const MAX_CANDIDATES: usize = 16;
 /// one so they can relay through the right place without consulting the engine.
 pub struct RelayPoint {
     pub addr: crate::state::LighthouseAddr,
+    /// Where the lighthouse last answered on UDP. Kept across reconnects so
+    /// late relayed packets are still recognised; see `live_addr` for sending.
     pub udp_addr: parking_lot::RwLock<Option<SocketAddr>>,
+    /// True while the control session to this lighthouse is up.
+    pub connected: AtomicBool,
     /// Command channel of the control task, used to request hole punches.
     pub cmd: tokio::sync::mpsc::Sender<crate::control::ControlCmd>,
+}
+
+impl RelayPoint {
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// UDP address to relay through, only while the control session is up. A
+    /// lighthouse that dropped its control channel is not sent traffic.
+    pub fn live_addr(&self) -> Option<SocketAddr> {
+        if self.is_connected() {
+            *self.udp_addr.read()
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Peer {
@@ -45,7 +66,9 @@ pub struct Peer {
     pub last_relay_rx: Option<Instant>,
     pub last_tx: Option<Instant>,
     pub last_punch: Option<Instant>,
-    /// Lighthouse that can relay for this peer and forward punch requests.
+    /// Lighthouse that relays for this peer and forwards punch requests. The
+    /// engine re-selects it when this lighthouse disconnects and another
+    /// lighthouse of a shared network is up (`Inner::relay_for`).
     pub relay: Option<Arc<RelayPoint>>,
     /// Network through which the relay lighthouse knows the peer.
     pub relay_network: Option<NetworkId>,

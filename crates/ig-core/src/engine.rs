@@ -4,7 +4,7 @@ use crate::control::{self, ControlCmd, LighthouseHandle};
 use crate::dns::DnsTable;
 use crate::filter::PeerFilter;
 use crate::packet;
-use crate::peer::Peer;
+use crate::peer::{Peer, RelayPoint};
 use crate::state::{LighthouseAddr, Membership};
 use crate::tun::{TunDevice, TunScope};
 use boringtun::noise::errors::WireGuardError;
@@ -60,6 +60,11 @@ pub struct EngineConfig {
     pub relay_only: bool,
     /// Offer to act as a gateway for devices registered on this host's LANs.
     pub gateway: bool,
+    /// Resolvers for names outside the overlay zones. Empty (the default on
+    /// desktop) means such queries get NXDOMAIN. Android sets the underlying
+    /// network's servers here because its resolver cannot split DNS; see
+    /// [`Engine::set_upstream_dns`].
+    pub upstream_dns: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +150,8 @@ pub struct Inner {
     udp_port: u16,
     /// Peer and own names for the in-engine DNS responder.
     dns: RwLock<DnsTable>,
+    /// Relays non-overlay queries to upstream resolvers (Android split DNS).
+    dns_forwarder: crate::dns::Forwarder,
     keepalive: Option<u16>,
     relay_only: bool,
     pub gateway: bool,
@@ -219,6 +226,7 @@ impl Engine {
             dual_stack,
             udp_port,
             dns: RwLock::new(DnsTable::new()),
+            dns_forwarder: crate::dns::Forwarder::new(config.upstream_dns, protector.clone()),
             keepalive: config.persistent_keepalive,
             relay_only: config.relay_only,
             gateway: config.gateway,
@@ -496,6 +504,13 @@ impl Engine {
     }
 
     /// Tell every lighthouse our local addresses may have changed.
+    /// Replace the upstream resolvers used for names outside the overlay
+    /// zones. Takes effect for the next query; in-flight forwards finish
+    /// against the old list. Pass an empty list to answer NXDOMAIN again.
+    pub fn set_upstream_dns(&self, upstreams: Vec<SocketAddr>) {
+        self.inner.dns_forwarder.set_upstreams(upstreams);
+    }
+
     pub fn refresh_endpoints(&self) {
         for h in self.inner.lighthouses.lock().values() {
             let _ = h.cmd.try_send(ControlCmd::RefreshEndpoints);
@@ -745,6 +760,10 @@ impl Inner {
             .collect();
         for n in &nets {
             table.add_zone(&n.dns_domain);
+            table.add_range(n.cidr.into());
+            if let Some(c6) = n.cidr6 {
+                table.add_range(c6.into());
+            }
             if !n.dns_name.is_empty() {
                 table.add(
                     &n.dns_name,
@@ -988,9 +1007,13 @@ impl Inner {
             }
             p.addresses.insert(info.id, addrs);
             p.dns_names.insert(info.id, pi.dns_name.clone());
+            // The lighthouse that relays for the peer is also the one whose view
+            // of its endpoints we trust. Adopt this one when none is chosen yet
+            // or when the chosen one is down.
             let primary = match &p.relay {
-                Some(r) => r.addr == h.addr,
-                None => {
+                Some(r) if r.addr.key == h.addr.key => true,
+                Some(r) if r.is_connected() => false,
+                _ => {
                     p.relay = Some(h.relay.clone());
                     p.relay_network = Some(info.id);
                     true
@@ -1053,14 +1076,86 @@ impl Inner {
         self.emit(EngineEvent::PeersChanged);
     }
 
-    pub fn mark_lighthouse_peers_offline(&self, lh: &LighthouseAddr) {
+    /// The control session to `lh` ended. Peers relayed through it move to
+    /// another connected lighthouse of a shared network; peers with no other
+    /// lighthouse are shown offline until one comes back.
+    pub fn lighthouse_lost(&self, lh: &LighthouseAddr) {
         let t = self.peers.read();
         for p in t.by_id.values() {
             let mut p = p.lock();
-            if p.relay.as_ref().is_some_and(|r| r.addr == *lh) {
-                p.online = false;
+            if !p.relay.as_ref().is_some_and(|r| r.addr.key == lh.key) {
+                continue;
+            }
+            match self.pick_relay(&p) {
+                Some((rp, net)) => {
+                    tracing::info!(
+                        peer = %p.hostname, from = %lh, to = %rp.addr,
+                        "relay lighthouse lost, moving to another"
+                    );
+                    p.relay = Some(rp);
+                    p.relay_network = Some(net);
+                }
+                None => p.online = false,
             }
         }
+    }
+
+    /// Networks shared by the peer and the lighthouse with key `key`, i.e. the
+    /// networks through which that lighthouse knows the peer.
+    fn shared_networks(&self, p: &Peer, key: &NodeId) -> Vec<NetworkId> {
+        let nets = self.networks.read();
+        let mut v: Vec<NetworkId> = p
+            .addresses
+            .keys()
+            .filter(|n| {
+                nets.get(n)
+                    .is_some_and(|e| e.membership.lighthouses().iter().any(|l| l.key == *key))
+            })
+            .copied()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A connected lighthouse that can relay for `p`, with the network through
+    /// which it knows the peer. Lock order: `networks`, then `lighthouses`.
+    fn pick_relay(&self, p: &Peer) -> Option<(Arc<RelayPoint>, NetworkId)> {
+        let nets = self.networks.read();
+        let lhs = self.lighthouses.lock();
+        let mut shared: Vec<&NetworkId> = p.addresses.keys().collect();
+        shared.sort();
+        for net in shared {
+            let Some(entry) = nets.get(net) else { continue };
+            for l in entry.membership.lighthouses() {
+                let live = lhs
+                    .values()
+                    .find(|h| h.addr.key == l.key)
+                    .filter(|h| h.relay.live_addr().is_some());
+                if let Some(h) = live {
+                    return Some((h.relay.clone(), *net));
+                }
+            }
+        }
+        None
+    }
+
+    /// The relay to send through for `p` right now: the chosen lighthouse while
+    /// it is connected and still shares `relay_network` with the peer, else a
+    /// fresh pick that becomes the new choice. None when no lighthouse is up.
+    fn relay_for(&self, p: &mut Peer) -> Option<(SocketAddr, Arc<RelayPoint>, NetworkId)> {
+        if let (Some(rp), Some(net)) = (&p.relay, p.relay_network) {
+            if let Some(addr) = rp.live_addr() {
+                if self.shared_networks(p, &rp.addr.key).contains(&net) {
+                    return Some((addr, rp.clone(), net));
+                }
+            }
+        }
+        let (rp, net) = self.pick_relay(p)?;
+        let addr = rp.live_addr()?;
+        tracing::info!(peer = %p.hostname, lighthouse = %rp.addr, "relaying through another lighthouse");
+        p.relay = Some(rp.clone());
+        p.relay_network = Some(net);
+        Some((addr, rp, net))
     }
 
     /// A peer asked (through the lighthouse) that we send towards it now.
@@ -1097,20 +1192,20 @@ impl Inner {
             self.udp_send(b, d);
             return;
         }
-        let relay_addr = p.relay.as_ref().and_then(|r| *r.udp_addr.read());
-        if let (Some(r), Some(net)) = (relay_addr, p.relay_network) {
-            self.udp_send(&disco::encode_relay(&net, &p.id, b), r);
+        let relay = self.relay_for(p);
+        if let Some((addr, _, net)) = &relay {
+            self.udp_send(&disco::encode_relay(net, &p.id, b), *addr);
         }
         if self.relay_only {
             return;
         }
-        if p.may_punch(now) || relay_addr.is_none() {
+        if p.may_punch(now) || relay.is_none() {
             for c in &p.candidates {
                 self.udp_send(b, *c);
             }
-            if let (Some(rp), Some(net)) = (&p.relay, p.relay_network) {
+            if let Some((_, rp, net)) = &relay {
                 let _ = rp.cmd.try_send(ControlCmd::Punch {
-                    network: net,
+                    network: *net,
                     target: p.id,
                 });
             }
@@ -1121,7 +1216,13 @@ impl Inner {
     fn reply(&self, p: &mut Peer, b: &[u8], from: SocketAddr, via_relay: bool) {
         p.last_tx = Some(Instant::now());
         if via_relay {
-            if let Some(net) = p.relay_network {
+            // `from` is a lighthouse; name the peer in a network it knows the
+            // peer through, which may differ from our chosen relay's.
+            let net = self
+                .is_lighthouse_udp(from)
+                .and_then(|h| self.shared_networks(p, &h.addr.key).first().copied())
+                .or(p.relay_network);
+            if let Some(net) = net {
                 self.udp_send(&disco::encode_relay(&net, &p.id, b), from);
             }
         } else {
@@ -1171,11 +1272,23 @@ impl Inner {
             return;
         }
         if self.is_dns_server(&dst) {
-            let reply = crate::dns::reply_packet(&self.dns.read(), pkt);
-            if let Some(reply) = reply {
-                if let Err(e) = dev.send(&reply) {
-                    tracing::trace!(error = %e, "dns reply write failed");
+            use crate::dns::DnsAction;
+            let can_forward = self.dns_forwarder.has_upstreams();
+            match crate::dns::handle_packet(&self.dns.read(), pkt, can_forward) {
+                DnsAction::Reply(reply) => {
+                    if let Err(e) = dev.send(&reply) {
+                        tracing::trace!(error = %e, "dns reply write failed");
+                    }
                 }
+                DnsAction::Forward(req) => {
+                    let dev = dev.clone();
+                    self.dns_forwarder.forward(req, move |reply| {
+                        if let Err(e) = dev.send(&reply) {
+                            tracing::trace!(error = %e, "forwarded dns reply write failed");
+                        }
+                    });
+                }
+                DnsAction::Ignore => {}
             }
             return;
         }
@@ -1432,7 +1545,7 @@ impl Inner {
                         self.udp_send(&b, c);
                     }
                 }
-                if let (Some(rp), Some(net)) = (&p.relay, p.relay_network) {
+                if let Some((_, rp, net)) = self.relay_for(&mut p) {
                     let _ = rp.cmd.try_send(ControlCmd::Punch {
                         network: net,
                         target: p.id,

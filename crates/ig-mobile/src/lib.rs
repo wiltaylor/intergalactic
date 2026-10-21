@@ -11,6 +11,7 @@ use ig_core::{Engine, EngineConfig, EngineEvent, NodeState, SocketProtector};
 use ig_proto::ipc::PeerPath;
 use ig_proto::Invite;
 use ig_proto::Keypair;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -156,6 +157,9 @@ impl MobileEngine {
             persistent_keepalive: None,
             relay_only: false,
             gateway: false,
+            // The app supplies the underlying network's resolvers through
+            // `set_upstream_dns` once the VPN is up.
+            upstream_dns: Vec::new(),
         };
         let protector = Arc::new(Protector(callbacks.clone()));
         let (engine, mut events) = rt.block_on(Engine::start(config, protector)).map_err(err)?;
@@ -240,6 +244,17 @@ impl MobileEngine {
         self.engine.refresh_endpoints();
     }
 
+    /// Resolvers for names outside the overlay. Android sends every query to
+    /// the in-tunnel responder, so the engine forwards non-overlay names to
+    /// these over a protected socket. Pass the underlying network's
+    /// `LinkProperties.dnsServers` as "ip" or "ip:port" (port 53 by default);
+    /// entries that do not parse are skipped. Call again whenever the
+    /// underlying network changes. An empty list turns forwarding off.
+    pub fn set_upstream_dns(&self, servers: Vec<String>) {
+        let list: Vec<SocketAddr> = servers.iter().filter_map(|s| parse_upstream(s)).collect();
+        self.engine.set_upstream_dns(list);
+    }
+
     pub fn networks(&self) -> Vec<MobileNetwork> {
         let st = self.engine.status();
         st.networks
@@ -306,6 +321,20 @@ impl MobileEngine {
     pub fn shutdown(&self) {
         self.rt.block_on(self.engine.shutdown());
     }
+}
+
+/// "1.1.1.1", "1.1.1.1:53", "2606:4700::1111", "[2606:4700::1111]:53" or
+/// "fe80::1%wlan0" (the scope is dropped) -> socket address, port 53 by default.
+fn parse_upstream(s: &str) -> Option<SocketAddr> {
+    let s = s.trim();
+    let s = s.split_once('%').map(|(a, _)| a).unwrap_or(s);
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    s.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, 53))
 }
 
 fn policy_summary(p: &ig_proto::Policy) -> String {

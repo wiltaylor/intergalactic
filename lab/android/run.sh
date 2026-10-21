@@ -15,7 +15,7 @@ AVD="${IG_AVD:-ig}"
 pkill -x ig-lighthouse || true
 sleep 0.5
 rm -rf .lh .lh.sock; mkdir -p .lh
-RUST_LOG=info "$LH_BIN" --state-dir .lh --admin-socket .lh.sock serve --listen "0.0.0.0:$PORT" --public-host "$HOST_IP" --dns-domain ig.test > .lh/lighthouse.log 2>&1 &
+RUST_LOG=info "$LH_BIN" --state-dir .lh --admin-socket .lh.sock serve --listen "0.0.0.0:$PORT" --public-host "$HOST_IP" --dns-domain ig.test --no-overlay > .lh/lighthouse.log 2>&1 &
 sleep 1
 ADMIN="$LH_BIN --state-dir .lh --admin-socket .lh.sock"
 $ADMIN network create dev 10.90.0.0/24 --ipv6 fd42:9a:1::/64 > /dev/null
@@ -52,21 +52,30 @@ tap_ok() {
   IFS='[],' read -r _ x1 y1 _ x2 y2 _ <<< "$b"
   adb shell input tap $(( (x1 + x2) / 2 )) $(( (y1 + y2) / 2 ))
 }
+# The VPN interface is whichever tunN Android hands out.
 for i in $(seq 1 30); do
-  if adb shell ip -br addr show tun0 2>/dev/null | grep -q 10.90.0; then break; fi
+  if adb shell ip -br addr 2>/dev/null | grep '^tun' | grep -q 10.90.0; then break; fi
   tap_ok || true
   sleep 2
 done
-adb shell ip -br addr show tun0
+adb shell ip -br addr | grep '^tun' | grep 10.90.0
+# Addresses are allocated by the lighthouse (it is a member itself): read them.
+NODE_IP=$(vmlab exec alpha -- sh -c "ig networks | grep '^dev ' | tr -s ' ' | cut -d' ' -f2 | cut -d/ -f1" | tr -d '\r\n')
+NODE_IP6=$(vmlab exec alpha -- sh -c "ig networks | grep '^dev ' | tr -s ' ' | cut -d' ' -f3 | cut -d/ -f1" | tr -d '\r\n')
+EMU_IP=$(adb shell ip -br addr | grep '^tun' | grep -o '10\.90\.0\.[0-9]*' | head -1)
+echo "node $NODE_IP $NODE_IP6, emulator $EMU_IP"
 echo "--- emulator -> node ---"
 # The first packets trigger the WireGuard handshake; allow a few seconds.
-for i in $(seq 1 20); do adb shell ping -c 1 -W 2 10.90.0.2 > /dev/null 2>&1 && break; sleep 1; done
-adb shell ping -c 3 -W 3 10.90.0.2
-adb shell ping6 -c 3 -W 3 fd42:9a:1::2 || adb shell ping -6 -c 3 fd42:9a:1::2
+for i in $(seq 1 20); do adb shell ping -c 1 -W 2 "$NODE_IP" > /dev/null 2>&1 && break; sleep 1; done
+adb shell ping -c 3 -W 3 "$NODE_IP"
+adb shell ping6 -c 3 -W 3 "$NODE_IP6" || adb shell ping -6 -c 3 "$NODE_IP6"
 echo "--- emulator DNS ---"
 adb shell ping -c 2 -W 3 alpha.dev.ig.test
+# Public names keep resolving with the VPN up: the engine forwards them to the
+# underlying network's resolver over a protected socket.
+adb shell ping -c 1 -W 5 github.com
 echo "--- node -> emulator ---"
-vmlab exec alpha -- sh -c 'ig peers; ping -c 3 -W 3 10.90.0.3; resolvectl query 10.90.0.3'
+vmlab exec alpha -- sh -c "ig peers; ping -c 3 -W 3 $EMU_IP; resolvectl query $EMU_IP"
 echo "--- lighthouse ---"
 $ADMIN node list
 echo "--- app log ---"

@@ -59,7 +59,6 @@ pub struct LighthouseHandle {
     pub addr: LighthouseAddr,
     pub relay: Arc<RelayPoint>,
     pub cmd: mpsc::Sender<ControlCmd>,
-    pub connected: AtomicBool,
     pub session_token: RwLock<Option<[u8; 32]>>,
     pub reflexive: RwLock<Option<SocketAddr>>,
     pub last_error: Mutex<Option<String>>,
@@ -68,7 +67,11 @@ pub struct LighthouseHandle {
 
 impl LighthouseHandle {
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.relay.is_connected()
+    }
+
+    fn set_connected(&self, up: bool) {
+        self.relay.connected.store(up, Ordering::Relaxed);
     }
 }
 
@@ -77,13 +80,13 @@ pub fn spawn(inner: Arc<Inner>, addr: LighthouseAddr) -> Arc<LighthouseHandle> {
     let relay = Arc::new(RelayPoint {
         addr: addr.clone(),
         udp_addr: RwLock::new(None),
+        connected: AtomicBool::new(false),
         cmd: tx.clone(),
     });
     let handle = Arc::new(LighthouseHandle {
         addr,
         relay,
         cmd: tx,
-        connected: AtomicBool::new(false),
         session_token: RwLock::new(None),
         reflexive: RwLock::new(None),
         last_error: Mutex::new(None),
@@ -136,7 +139,7 @@ async fn run(inner: Arc<Inner>, h: Arc<LighthouseHandle>, mut rx: mpsc::Receiver
         };
         backoff = Duration::from_secs(1);
         *h.last_error.lock() = None;
-        h.connected.store(true, Ordering::Relaxed);
+        h.set_connected(true);
         inner.emit(crate::EngineEvent::LighthouseStatus {
             lighthouse: h.addr.clone(),
             connected: true,
@@ -144,13 +147,13 @@ async fn run(inner: Arc<Inner>, h: Arc<LighthouseHandle>, mut rx: mpsc::Receiver
         tracing::info!(lighthouse = %h.addr, "control channel up");
 
         let outcome = session_loop(&inner, &h, session, &mut rx, std::mem::take(&mut queued)).await;
-        h.connected.store(false, Ordering::Relaxed);
+        h.set_connected(false);
         *h.session_token.write() = None;
         inner.emit(crate::EngineEvent::LighthouseStatus {
             lighthouse: h.addr.clone(),
             connected: false,
         });
-        inner.mark_lighthouse_peers_offline(&h.addr);
+        inner.lighthouse_lost(&h.addr);
         match outcome {
             SessionEnd::Shutdown => return,
             SessionEnd::Lost(e) => {

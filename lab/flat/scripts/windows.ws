@@ -104,6 +104,20 @@ fn setup(lab: Lab) -> Result[unit, string] {
     if !dns.contains("10.90.0.3") { return Err("Windows did not resolve alpha.dev.ig.test: " + dns) }
     must_ps(lab, win, "exit [int](-not (Test-Connection -Count 1 -Quiet alpha.dev.ig.test))")?
 
+    lab.log("join a second network, leave it again: NRPT must follow")
+    let game_inv = must(lab, lh, "cat /root/invite-game.txt")?
+    must_ps(lab, win, "C:\\ig\\ig.exe join " + game_inv)?
+    wait_ps(lab, win, "exit [int](-not ((Get-DnsClientNrptRule | Where-Object Comment -eq intergalactic | Where-Object Namespace -eq '.game.ig.test') -ne $null))", 20)?
+    must_ps(lab, win, "C:\\ig\\ig.exe leave game")?
+    wait_ps(lab, win, "exit [int]((Get-DnsClientNrptRule | Where-Object Comment -eq intergalactic | Where-Object Namespace -eq '.game.ig.test') -ne $null)", 20)?
+    let nrpt2 = must_ps(lab, win, "Get-DnsClientNrptRule | Where-Object Comment -eq intergalactic | Format-Table -AutoSize Namespace,NameServers | Out-String -Width 200")?
+    lab.log(nrpt2)
+    if nrpt2.contains("10.91.0.1") { return Err("NRPT still names the game DNS server after leaving: " + nrpt2) }
+    if !nrpt2.contains(".ig.test") { return Err("the shared .ig.test rule is gone after leaving game: " + nrpt2) }
+    let dns2 = must_ps(lab, win, "(Resolve-DnsName alpha.ig.test -Type A).IPAddress")?
+    if !dns2.contains("10.90.0.3") { return Err("short name alpha.ig.test stopped resolving after leaving game: " + dns2) }
+    lab.log("NRPT rebuilt without the game server; alpha.ig.test -> " + dns2.trim())
+
     lab.log("traffic from alpha to Windows (10.90.0.5) and by name")
     must(lab, alpha, "ping -c 2 -W 3 10.90.0.5")?
     let q = must(lab, alpha, "resolvectl query win.dev.ig.test")?
