@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.jpg" alt="Intergalactic" width="760">
+</p>
+
 # Intergalactic
 
 Intergalactic is a self-hosted overlay network, in the spirit of Tailscale, written in Rust.
