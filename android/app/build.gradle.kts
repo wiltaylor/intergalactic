@@ -17,8 +17,10 @@ fun versionCodeOf(v: String): Int {
 }
 
 // Release signing comes from the environment (CI secrets or a local keystore);
-// see docs/android.md. Without it the release build is unsigned.
-val keystorePath: String? = System.getenv("IG_ANDROID_KEYSTORE")
+// see docs/android.md. Without it the release build is unsigned. An empty
+// variable (an unset CI secret) counts as unset.
+fun env(name: String): String? = System.getenv(name)?.takeIf { it.isNotEmpty() }
+val keystorePath: String? = env("IG_ANDROID_KEYSTORE")
 
 android {
     namespace = "dev.intergalactic.app"
@@ -42,9 +44,9 @@ android {
         if (keystorePath != null) {
             create("release") {
                 storeFile = file(keystorePath)
-                storePassword = System.getenv("IG_ANDROID_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("IG_ANDROID_KEY_ALIAS") ?: "intergalactic"
-                keyPassword = System.getenv("IG_ANDROID_KEY_PASSWORD") ?: System.getenv("IG_ANDROID_KEYSTORE_PASSWORD")
+                storePassword = env("IG_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = env("IG_ANDROID_KEY_ALIAS") ?: "intergalactic"
+                keyPassword = env("IG_ANDROID_KEY_PASSWORD") ?: env("IG_ANDROID_KEYSTORE_PASSWORD")
             }
         }
     }
@@ -57,6 +59,10 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+    packaging {
+        // JNA loads the native library from the extracted file (extractNativeLibs=true).
+        jniLibs.useLegacyPackaging = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
