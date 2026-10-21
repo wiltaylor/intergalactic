@@ -202,7 +202,20 @@ async fn connect(inner: &Arc<Inner>, h: &LighthouseHandle) -> anyhow::Result<Ses
         NoiseStream::connect(tcp, &inner.keypair.private.0, &h.addr.key, &hello),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
+    .map_err(|_| anyhow::anyhow!("handshake timed out"))?
+    .map_err(|e| match &e {
+        // A lighthouse that cannot decrypt our first message (its key is not
+        // the one in the invite) drops the connection, which reads as EOF.
+        ig_proto::noise::NoiseError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            anyhow::anyhow!(
+                "the lighthouse closed the handshake: its key does not match this invite (was it reinstalled or re-keyed?). Leave the network and join with a new invite"
+            )
+        }
+        ig_proto::noise::NoiseError::Noise(_) => anyhow::anyhow!(
+            "handshake failed: the lighthouse key does not match this invite. Leave the network and join with a new invite"
+        ),
+        _ => anyhow::anyhow!("{e}"),
+    })?;
     if server_hello.version != PROTOCOL_VERSION {
         anyhow::bail!(
             "lighthouse speaks protocol v{}, we speak v{}",
