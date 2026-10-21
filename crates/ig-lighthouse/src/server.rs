@@ -147,6 +147,8 @@ pub struct Inner {
     tuns: Mutex<HashMap<NetworkId, TunEntry>>,
     /// Forward NAT rules this lighthouse currently publishes.
     rules: Mutex<Vec<ForwardRule>>,
+    /// Host resolver settings applied last for our overlay interfaces (kernel overlay only).
+    dns_plan: Mutex<Option<ig_node::dns_os::DnsPlan>>,
     /// Relay token buckets: per (network, node) and per network.
     buckets: Mutex<Buckets>,
     dirty: Mutex<HashSet<NetworkId>>,
@@ -203,6 +205,7 @@ impl Lighthouse {
             engine: Mutex::new(None),
             tuns: Mutex::new(HashMap::new()),
             rules: Mutex::new(Vec::new()),
+            dns_plan: Mutex::new(None),
             buckets: Mutex::new(Buckets::default()),
             dirty: Mutex::new(HashSet::new()),
             dirty_notify: tokio::sync::Notify::new(),
@@ -254,6 +257,10 @@ impl Lighthouse {
         }
         if matches!(self.inner.config.overlay, Overlay::Kernel) {
             ig_node::forward_os::remove();
+            let mode = ig_node::dns_os::resolve_mode(ig_node::dns_os::DnsMode::Auto);
+            if mode == ig_node::dns_os::DnsMode::System {
+                ig_node::dns_os::cleanup(mode);
+            }
         }
         // Close peer links so the other lighthouses notice at once.
         let links: Vec<PeerLink> = self.inner.peers.write().drain().map(|(_, l)| l).collect();
@@ -495,6 +502,20 @@ impl Inner {
                 Err(e) => {
                     tracing::error!(network = %info.name, error = %e, "cannot create tun on the lighthouse")
                 }
+            }
+        }
+        // The engine answers peer names inside each interface; tell the host
+        // resolver, exactly as the node daemon does, so the lighthouse machine
+        // resolves its peers too. The plan is re-applied only when it changes.
+        if matches!(self.config.overlay, Overlay::Kernel) {
+            let names: Vec<(String, &NetworkInfo)> = tuns
+                .values()
+                .map(|(info, dev)| (dev.name(), info))
+                .collect();
+            let plan = ig_node::dns_os::DnsPlan::new(names.iter().map(|(n, i)| (n.as_str(), *i)));
+            let mode = ig_node::dns_os::resolve_mode(ig_node::dns_os::DnsMode::Auto);
+            if mode == ig_node::dns_os::DnsMode::System {
+                ig_node::dns_os::apply_plan(mode, &mut self.dns_plan.lock(), plan);
             }
         }
     }
